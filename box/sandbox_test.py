@@ -343,10 +343,30 @@ class TestHermetic(unittest.TestCase):
 
             self.assertFalse(launch.sandbox.isolate_network)
             self.assertIn((Path("/run"), Path("/run"), True, False), _bind_specs(launch))
+            resolv = sandbox._resolv_conf()
             self.assertIn(
-                (Path("/etc/resolv.conf"), Path("/etc/resolv.conf"), True, True),
+                (Path(resolv.source), Path("/etc/resolv.conf"), True, resolv.nofollow),
                 _bind_specs(launch),
             )
+
+    def test_resolv_conf_is_bound_as_a_link_only_into_run(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as scratch:
+            root = Path(scratch)
+            (root / "real").write_text("nameserver 192.0.2.1\n")
+            (root / "stub").symlink_to("/run/systemd/resolve/stub-resolv.conf")
+            (root / "static").symlink_to(root / "real")
+            expected = {
+                "real": (root / "real", True),
+                "stub": (root / "stub", True),
+                "static": ((root / "real").resolve(), False),
+            }
+            for name, (source, nofollow) in expected.items():
+                with self.subTest(name):
+                    bind = sandbox._resolv_conf(str(root / name))
+                    self.assertEqual(
+                        (Path(bind.source), Path(bind.target), bind.readonly, bind.nofollow),
+                        (source, Path("/etc/resolv.conf"), True, nofollow),
+                    )
 
     def test_builds_get_fakeroot_semantics(self) -> None:
         with _project() as (_, tools):

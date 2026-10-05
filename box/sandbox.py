@@ -271,6 +271,20 @@ def _tty() -> str | None:
         return None
 
 
+def _resolv_conf(source: str = "/etc/resolv.conf") -> Bind:
+    """The host resolver configuration, bound at /etc/resolv.conf where the host /run is shared.
+
+    A link into /run (systemd-resolved's stub) is bound as a link, so it follows the host's rewrites.
+    Any other link, such as NixOS's /etc/static or an FHS environment's /.host-etc, would dangle in the
+    box, so the file it resolves to is bound instead.
+    """
+    if os.path.islink(source):
+        target = os.path.normpath(os.path.join(os.path.dirname(source), os.readlink(source)))
+        if not target.startswith("/run/"):
+            return Bind(os.path.realpath(source), "/etc/resolv.conf", readonly=True)
+    return Bind(source, "/etc/resolv.conf", readonly=True, nofollow=True)
+
+
 def _which(command: str, path: str) -> str | None:
     if "/" in command:
         candidates = [command]
@@ -373,25 +387,11 @@ def _launch(args: Options) -> Launch:
     if args.relaxed:
         # Resolve through the host /run while keeping the tools tree's /etc.
         if os.path.exists("/etc/resolv.conf"):
-            filesystems.append(
-                Bind(
-                    "/etc/resolv.conf",
-                    "/etc/resolv.conf",
-                    readonly=True,
-                    nofollow=True,
-                )
-            )
+            filesystems.append(_resolv_conf())
         chdir = chdir or os.getcwd()
     elif args.network:
         # Preserve box CA trust but use the host resolver and its /run target.
-        filesystems.append(
-            Bind(
-                "/etc/resolv.conf",
-                "/etc/resolv.conf",
-                readonly=True,
-                nofollow=True,
-            )
-        )
+        filesystems.append(_resolv_conf())
         filesystems.append(Bind("/run", "/run", readonly=True))
 
     return Launch(
