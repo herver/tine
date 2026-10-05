@@ -199,8 +199,9 @@ def _signing_keys(ctx: AnalysisContext) -> dict[str, Artifact | None]:
     if ctx.attrs.package_system[PackageSystemInfo].verify != None and not ctx.attrs.signing_keys:
         fail("repository '{}' declares no signing_keys, and its package system verifies signatures".format(rid))
     for fingerprint in ctx.attrs.signing_keys:
-        if len(fingerprint) != 40 or not _contains_only(fingerprint, "0123456789ABCDEF"):
-            fail("repository '{}': signing key {!r} is not an upper-case 40 hex digit fingerprint".format(rid, fingerprint))
+        # 40 hex digits for an OpenPGP v4 key, 64 for a v6 one (e.g. RHEL's ML-DSA+Ed448 release key 4).
+        if len(fingerprint) not in (40, 64) or not _contains_only(fingerprint, "0123456789ABCDEF"):
+            fail("repository '{}': signing key {!r} is not an upper-case 40 or 64 hex digit fingerprint".format(rid, fingerprint))
     # The files are globbed by declared fingerprint, so each one's name is a declared key.
     files = {file.basename.removesuffix(SIGNING_KEY_SUFFIX): file for file in ctx.attrs.signing_key_files}
     return {fingerprint: files.get(fingerprint) for fingerprint in ctx.attrs.signing_keys}
