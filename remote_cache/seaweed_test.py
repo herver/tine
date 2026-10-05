@@ -36,6 +36,15 @@ class TestSeaweedInterop(unittest.TestCase):
             secure=False,
         )
         cls.reader = bucket.Reader(weed.read_url)
+        cls.prefixed = bucket.S3Writer(
+            endpoint=weed.s3_endpoint,
+            bucket=weed.bucket,
+            access_key="unchecked",
+            secret_key="unchecked",
+            secure=False,
+            prefix="team/cache",
+        )
+        cls.signed = bucket.S3Reader(cls.prefixed)
 
     def test_a_pointer_written_over_s3_reads_over_http(self) -> None:
         key = "ac/" + "a" * 64
@@ -59,3 +68,22 @@ class TestSeaweedInterop(unittest.TestCase):
         self.writer.put(key, b"shared")
         self.assertTrue(self.writer.refresh(key))
         self.assertEqual(self.reader.get(key), b"shared")
+
+    def test_a_prefixed_write_lands_under_the_prefix(self) -> None:
+        key = "ac/" + "d" * 64
+        self.prefixed.put(key, b"x")
+        self.assertEqual(self.reader.get("team/cache/" + key), b"x")
+        self.assertIsNone(self.reader.get(key))
+
+    def test_a_signed_read_sees_the_prefix_and_a_miss_is_none(self) -> None:
+        key = "ac/" + "f" * 64
+        self.prefixed.put(key, b"signed")
+        self.assertEqual(self.signed.get(key), b"signed")
+        self.assertIsNone(self.signed.get("ac/" + "9" * 64))
+
+    def test_a_prefixed_refresh(self) -> None:
+        key = "bundle/" + "8" * 64
+        self.assertFalse(self.prefixed.refresh(key))
+        self.prefixed.put(key, b"shared")
+        self.assertTrue(self.prefixed.refresh(key))
+        self.assertEqual(self.signed.get(key), b"shared")

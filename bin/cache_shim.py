@@ -12,6 +12,7 @@ serves the configured store yet, and asks a running one what it is doing. The sh
 import hashlib
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -56,6 +57,8 @@ KEYS = frozenset(
         "s3_endpoint",
         "s3_insecure",
         "s3_key_file",
+        "s3_prefix",
+        "s3_signed_reads",
         "signing_certificate",
         "signing_key",
         "store_size",
@@ -68,16 +71,19 @@ KEYS = frozenset(
 class CacheSettings:
     """The shared cache a project builds against, as `[cache]` in its settings describes it.
 
-    A reader names `read_url` and either `authority` or `unsigned`. A builder adds the S3 bucket it
-    writes to and the key it signs with. The rest has a default, the shim's where it has one.
+    A reader names `read_url`, or a builder sets `s3_signed_reads`, and either `authority` or
+    `unsigned`. A builder adds the S3 bucket it writes to and the key it signs with. The rest has a
+    default, the shim's where it has one.
     """
 
-    read_url: str
+    read_url: str | None
     authorities: tuple[Path, ...]
     s3_endpoint: str | None
     s3_bucket: str | None
     s3_key_file: Path | None
     s3_insecure: bool
+    s3_prefix: str | None
+    s3_signed_reads: bool
     signing_key: Path | None
     signing_certificate: Path | None
     object_lifetime: int | None
@@ -151,8 +157,17 @@ def settings(config: Mapping[str, object], root: Path, source: str) -> CacheSett
         fail(f"[{SECTION}] in {source} has unsupported keys: {', '.join(extra)}")
 
     read_url = _string(table, "read_url", source)
-    if read_url is None:
-        fail(f"[{SECTION}] in {source} needs read_url, where the bucket is read from")
+    s3_signed_reads = _bool(table, "s3_signed_reads", False, source)
+    if read_url is None and not s3_signed_reads:
+        fail(
+            f"[{SECTION}] in {source} needs read_url, where the bucket is read from,"
+            " or s3_signed_reads = true"
+        )
+    if read_url is not None and s3_signed_reads:
+        fail(
+            f"[{SECTION}] read_url in {source} conflicts with s3_signed_reads,"
+            " which reads through the S3 API"
+        )
     authorities = _paths(table, "authority", root, source)
     unsigned = _bool(table, "unsigned", False, source)
     if bool(authorities) == unsigned:
@@ -168,8 +183,15 @@ def settings(config: Mapping[str, object], root: Path, source: str) -> CacheSett
         fail(f"[{SECTION}] s3_endpoint in {source} must be a host, without a scheme or a path")
     s3_key_file = _optional_path(table, "s3_key_file", root, source)
     s3_insecure = _bool(table, "s3_insecure", False, source)
+    s3_prefix = _string(table, "s3_prefix", source)
+    # Plain names keep the SigV4 canonical URI free of escaping.
+    if s3_prefix is not None and not re.fullmatch(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", s3_prefix):
+        fail(
+            f"[{SECTION}] s3_prefix in {source} must be '/'-separated names of letters, digits, '.', '_'"
+            " or '-', without a leading or trailing '/'"
+        )
     if s3_bucket is None:
-        for key in ("s3_endpoint", "s3_key_file", "s3_insecure"):
+        for key in ("s3_endpoint", "s3_key_file", "s3_insecure", "s3_prefix", "s3_signed_reads"):
             if key in table:
                 fail(f"[{SECTION}] {key} in {source} needs s3_bucket")
     elif s3_endpoint is None or s3_key_file is None:
@@ -203,6 +225,8 @@ def settings(config: Mapping[str, object], root: Path, source: str) -> CacheSett
         s3_bucket=s3_bucket,
         s3_key_file=s3_key_file,
         s3_insecure=s3_insecure,
+        s3_prefix=s3_prefix,
+        s3_signed_reads=s3_signed_reads,
         signing_key=signing_key,
         signing_certificate=signing_certificate,
         object_lifetime=object_lifetime,
@@ -218,7 +242,9 @@ def arguments(cache: CacheSettings) -> list[str]:
     Also what a running shim is recognised by: it reports its own arguments, and a shim started for
     other settings must not be shared, since it may sign as someone else or read another bucket.
     """
-    args: list[str] = ["--store", str(cache.dir), "--port", str(cache.port), "--read-url", cache.read_url]
+    args: list[str] = ["--store", str(cache.dir), "--port", str(cache.port)]
+    if cache.read_url is not None:
+        args += ["--read-url", cache.read_url]
     for authority in cache.authorities:
         args += ["--authority", str(authority)]
     if not cache.authorities:
@@ -227,6 +253,10 @@ def arguments(cache: CacheSettings) -> list[str]:
         assert cache.s3_endpoint is not None and cache.s3_key_file is not None
         args += ["--s3-bucket", cache.s3_bucket, "--s3-endpoint", cache.s3_endpoint]
         args += ["--s3-key-file", str(cache.s3_key_file)]
+        if cache.s3_prefix is not None:
+            args += ["--s3-prefix", cache.s3_prefix]
+        if cache.s3_signed_reads:
+            args.append("--s3-signed-reads")
         if cache.s3_insecure:
             args.append("--s3-insecure")
     if cache.signing_key is not None:

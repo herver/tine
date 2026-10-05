@@ -63,9 +63,8 @@ class Reader:
             left = self._resting_until - time.monotonic()
         if left > 0:
             raise urllib.error.URLError(f"{self.base_url} was unreachable, not asked again for {left:.0f}s")
-        url = f"{self.base_url}/{key}"
+        request = self._request(key)
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 declared = int(response.headers.get("Content-Length", 0))
                 # Cast, because urlopen is typed loosely enough to hand back anything. One byte past
@@ -90,7 +89,10 @@ class Reader:
             )
             raise urllib.error.URLError(getattr(error, "reason", error)) from None
         finally:
-            log.debug("GET %s", url)
+            log.debug("GET %s", request.full_url)
+
+    def _request(self, key: str) -> urllib.request.Request:
+        return urllib.request.Request(f"{self.base_url}/{key}", headers={"User-Agent": USER_AGENT})
 
     def describe(self) -> str:
         return self.base_url
@@ -112,8 +114,8 @@ class S3Writer(Writer):
     The only thing that needs a credential.
 
     Signed with hand-rolled SigV4: it's small and well documented, and avoids a ~120 MB python-boto3 SDK
-    (we need nothing else from it). The bucket is part of the path. Keys are `<prefix>/<hex>`, so
-    the canonical URI needs no escaping.
+    (we need nothing else from it). The bucket is part of the path. Keys are `<prefix>/<hex>`, under
+    an optional `prefix` of plain names, so the canonical URI needs no escaping.
     """
 
     def __init__(
@@ -124,13 +126,18 @@ class S3Writer(Writer):
         secret_key: str,
         region: str = "auto",
         secure: bool = True,
+        prefix: str = "",
     ) -> None:
         self.endpoint = endpoint
         self.bucket = bucket
         self.access_key = access_key
         self.secret_key = secret_key
         self.region = region
+        self.prefix = prefix
         self.base = f"{'https' if secure else 'http'}://{endpoint}/{bucket}"
+
+    def _object(self, key: str) -> str:
+        return f"{self.prefix}/{key}" if self.prefix else key
 
     def _signed(self, method: str, key: str, body: bytes, extra: dict[str, str]) -> urllib.request.Request:
         now = datetime.datetime.now(datetime.UTC)
@@ -143,7 +150,12 @@ class S3Writer(Writer):
         }
         signed = ";".join(sorted(headers))
         canonical = "\n".join(
-            [method, f"/{self.bucket}/{key}", "", *(f"{name}:{headers[name]}" for name in sorted(headers))]
+            [
+                method,
+                f"/{self.bucket}/{self._object(key)}",
+                "",
+                *(f"{name}:{headers[name]}" for name in sorted(headers)),
+            ]
         )
         canonical += f"\n\n{signed}\n{headers['x-amz-content-sha256']}"
         scope = f"{day}/{self.region}/s3/aws4_request"
@@ -157,13 +169,18 @@ class S3Writer(Writer):
             f"SignedHeaders={signed}, Signature={signature}"
         )
         del headers["host"]  # urllib sets it from the URL, and refuses to send it twice.
-        return urllib.request.Request(f"{self.base}/{key}", data=body, method=method, headers=headers)
+        return urllib.request.Request(
+            f"{self.base}/{self._object(key)}",
+            data=None if method == "GET" else body,
+            method=method,
+            headers=headers,
+        )
 
     @override
     def put(self, key: str, data: bytes) -> None:
         with urllib.request.urlopen(self._signed("PUT", key, data, {}), timeout=TIMEOUT):
             pass
-        log.info("PUT s3://%s/%s, %d bytes", self.bucket, key, len(data))
+        log.info("PUT s3://%s/%s, %d bytes", self.bucket, self._object(key), len(data))
 
     @override
     def refresh(self, key: str) -> bool:
@@ -175,7 +192,10 @@ class S3Writer(Writer):
         # it with a new date. R2 does the same, checked: Last-Modified moves, the ETag does not,
         # an absent source is a 404 rather than an empty object, and the Content-Type is dropped,
         # which costs nothing because `put` never set one.
-        copy = {"x-amz-copy-source": f"/{self.bucket}/{key}", "x-amz-metadata-directive": "REPLACE"}
+        copy = {
+            "x-amz-copy-source": f"/{self.bucket}/{self._object(key)}",
+            "x-amz-metadata-directive": "REPLACE",
+        }
         try:
             with urllib.request.urlopen(self._signed("PUT", key, b"", copy), timeout=TIMEOUT):
                 pass
@@ -188,7 +208,27 @@ class S3Writer(Writer):
 
     @override
     def describe(self) -> str:
+        if self.prefix:
+            return f"s3://{self.bucket}/{self.prefix} at {self.endpoint}"
         return f"s3://{self.bucket} at {self.endpoint}"
+
+
+class S3Reader(Reader):
+    """Reads a key with a SigV4-signed GET, for a bucket that is not public.
+
+    A missing key is a 404 to the key's owner, which keeps the miss/error distinction `Reader` rests on.
+    """
+
+    def __init__(self, writer: S3Writer, timeout: float = TIMEOUT, cooldown: float = COOLDOWN) -> None:
+        super().__init__(writer.base + (f"/{writer.prefix}" if writer.prefix else ""), timeout, cooldown)
+        self.writer = writer
+
+    @override
+    def _request(self, key: str) -> urllib.request.Request:
+        request = self.writer._signed("GET", key, b"", {})
+        # Unsigned, which SigV4 allows.
+        request.add_header("User-Agent", USER_AGENT)
+        return request
 
 
 @dataclass(frozen=True)

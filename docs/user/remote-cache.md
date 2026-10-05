@@ -45,6 +45,8 @@ checked out branch must not weaken a configured cache.
 | `s3_bucket`` | builder | results get uploaded to this bucket name |
 | `s3_endpoint` | builder | the bucket's S3 API end point; host name only, no scheme, path |
 | `s3_key_file` | builder | S3 write token: `<id> <secret>` |
+| `s3_prefix` | builder | key prefix every object is written and read under, e.g. `team/cache`; plain names only. Readers' `read_url` ends with it |
+| `s3_signed_reads` | builder | `true` to read through the S3 API with the write key instead of `read_url`, for a bucket that is not public |
 | `signing_key`, `signing_certificate` | builder | the leaf key and certificate, see [The keys](#the-keys) |
 | `object_lifetime` | builder | the bucket's age rule in days, which nothing signed may outlive |
 | `dir` | optional | the local store, `~/.cache/tine/cache` by default |

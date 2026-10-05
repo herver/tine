@@ -34,7 +34,7 @@ import bundle
 import reapi
 import signing
 import wire
-from bucket import Bucket, Reader, S3Writer, Writer
+from bucket import Bucket, Reader, S3Reader, S3Writer, Writer
 from status import ask, serving
 from store import Store
 
@@ -887,10 +887,12 @@ def serve(
 
 def configured_bucket(args: argparse.Namespace) -> Bucket | None:
     """The bucket the arguments describe, or None for a shim with nothing behind it."""
-    if args.read_url is None:
+    if args.read_url is None and not args.s3_signed_reads:
         # A builder reads too, and tine's settings validation already insists on it.
-        assert args.s3_bucket is None, "--s3-bucket without --read-url"
+        assert args.s3_bucket is None, "--s3-bucket without --read-url or --s3-signed-reads"
         return None
+    if args.s3_signed_reads and args.s3_bucket is None:
+        sys.exit("--s3-signed-reads needs --s3-bucket")
     writer = None
     if args.s3_bucket is not None:
         if args.s3_key_file is None or not args.s3_endpoint:
@@ -905,8 +907,10 @@ def configured_bucket(args: argparse.Namespace) -> Bucket | None:
             access_key=parts[0],
             secret_key=parts[1],
             secure=not args.s3_insecure,
+            prefix=args.s3_prefix,
         )
-    return Bucket(Reader(args.read_url), writer)
+    reader = S3Reader(writer) if writer is not None and args.s3_signed_reads else Reader(args.read_url)
+    return Bucket(reader, writer)
 
 
 def configured_trust(
@@ -990,6 +994,12 @@ def parser() -> argparse.ArgumentParser:
     parser.add_argument("--s3-endpoint", default="", help="S3 endpoint host, without a scheme")
     parser.add_argument("--s3-key-file", type=Path, help="one line, `<key id> <secret>`")
     parser.add_argument("--s3-insecure", action="store_true", help="talk plain HTTP to S3")
+    parser.add_argument("--s3-prefix", default="", help="key prefix every object is written and read under")
+    parser.add_argument(
+        "--s3-signed-reads",
+        action="store_true",
+        help="read through the S3 API with the write key, for a bucket that is not public",
+    )
     parser.add_argument("--store", type=Path, required=True, help="directory the local cache lives in")
     parser.add_argument(
         "--status",

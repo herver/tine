@@ -145,6 +145,19 @@ class TestSettings(SettingsCase):
         self.assertNotEqual(one.port, self.configured(reader(dir="two")).port)
         self.assertEqual(self.configured(reader(port=4242)).port, 4242)
 
+    def test_signed_reads_replace_the_url(self) -> None:
+        self.assertIsNone(self.configured(builder(self.root, read_url=None, s3_signed_reads=True)).read_url)
+        with self.assertRaisesRegex(SystemExit, "conflicts with s3_signed_reads"):
+            self.settings(builder(self.root, s3_signed_reads=True))
+        with self.assertRaisesRegex(SystemExit, "s3_signed_reads .* needs s3_bucket"):
+            self.settings(reader(s3_signed_reads=True, read_url=None))
+
+    def test_the_prefix_is_checked(self) -> None:
+        for prefix in ("/x", "x/", "a//b", "a b", ""):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(SystemExit, "s3_prefix"):
+                self.settings(builder(self.root, s3_prefix=prefix))
+        self.assertEqual(self.configured(builder(self.root, s3_prefix="team/cache")).s3_prefix, "team/cache")
+
     def test_values_are_checked_for_type(self) -> None:
         with self.assertRaisesRegex(SystemExit, "unsupported keys: bogus"):
             self.settings(reader(bogus=1))
@@ -179,6 +192,22 @@ class TestArguments(SettingsCase):
             "--signing-certificate", str(self.root.resolve() / "leaf.pem"),
             "--object-lifetime", "30",
             "--store-size", "5",
+        ])  # fmt: skip
+
+    def test_a_signed_prefixed_builder(self) -> None:
+        signed = {"read_url": None, "s3_signed_reads": True, "s3_prefix": "team/cache"}
+        cache = self.configured(builder(self.root, dir="store", port=4242, **signed))
+        self.assertEqual(cache_shim.arguments(cache), [
+            "--store", str(cache.dir),
+            "--port", "4242",
+            "--authority", str(self.root.resolve() / "ca.pem"),
+            "--s3-bucket", "results",
+            "--s3-endpoint", "s3.example",
+            "--s3-key-file", str(self.root.resolve() / "s3.key"),
+            "--s3-prefix", "team/cache",
+            "--s3-signed-reads",
+            "--signing-key", str(self.root.resolve() / "leaf.key"),
+            "--signing-certificate", str(self.root.resolve() / "leaf.pem"),
         ])  # fmt: skip
 
 
