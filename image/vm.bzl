@@ -3,35 +3,64 @@
 
 """Interactive virtual-machine image runners."""
 
-load("//box:runtime.bzl", "BoxInfo", "box_run")
+load("@prelude//platforms:defs.bzl", "host_configuration")
+load("//box:defs.bzl", "box")
 load("//distribution:defs.bzl", "distribution")
-load("//image_format:disk.bzl", "RepartInfo", "SIZE_PATTERN")
-load("//image_format:sysext.bzl", "SysextImageInfo")
+load(":ddi.bzl", "DdiInfo", "DiskConversionInfo", "SIZE_PATTERN")
+load(":extension.bzl", "ExtensionInfo", "check_portable", "ddi_image_name", "system_extension")
+
+# vmspawn takes the kernel command line as its own trailing arguments, and only the build knows the
+# one a direct kernel boot needs, as the UKI's carries the root hash. So the runner reads it from the
+# file at run time. Word splitting is harmless: vmspawn joins the arguments with spaces again. Globbing
+# is not, as a command line can carry patterns such as systemd.image_filter=usr=AOS_*.
+_CMDLINE_FILE_RUNNER = 'set -f; cmdline=$(cat "$1"); shift; exec systemd-vmspawn $cmdline "$@"'
+
+def _image(image: Dependency, image_format: str) -> Artifact:
+    if image_format == "raw":
+        disk = image[DdiInfo].disk
+        if disk == None:
+            fail("image_vm: {} is not a disk".format(image.label))
+        return disk
+
+    # The qcow is the intended VM format, and it has virtual_size; the raw doesn't.
+    qcow2 = image[DefaultInfo].sub_targets.get("qcow2")
+    if qcow2 == None:
+        fail("image_vm: {} is not a disk with a qcow2".format(image.label))
+    return qcow2[DiskConversionInfo].image
 
 def _image_vm_impl(ctx: AnalysisContext) -> list[Provider]:
-    disk = ctx.attrs.image[RepartInfo]
-    if disk.disk == None:
-        fail("image_vm: RepartInfo does not contain a composed disk")
-    run = cmd_args(
-        box_run(
-            box = ctx.attrs.box[BoxInfo],
-            exe = "systemd-vmspawn",
-            relaxed = True,
-        ),
+    if ctx.attrs.cmdline_file != None:
+        run = cmd_args(
+            box.run(box = ctx.attrs._box[box.Info], exe = "sh", relaxed = True),
+            "-c",
+            _CMDLINE_FILE_RUNNER,
+            "sh",
+            ctx.attrs.cmdline_file,
+        )
+    else:
+        run = cmd_args(box.run(box = ctx.attrs._box[box.Info], exe = "systemd-vmspawn", relaxed = True))
+
+    run.add(
         "--image",
-        disk.disk,
+        _image(ctx.attrs.image, ctx.attrs.image_format),
+        "--image-format={}".format(ctx.attrs.image_format),
         "--console=native",
+        # Necessary rather than a default: the image is a build output, which the guest must not write.
         "--ephemeral",
         "--kvm=yes",
         "--network-user-mode",
     )
 
+    if ctx.attrs.linux != None:
+        run.add(cmd_args(ctx.attrs.linux, format = "--linux={}"))
+    if ctx.attrs.initrd != None:
+        run.add(cmd_args(ctx.attrs.initrd, format = "--initrd={}"))
+
     if ctx.attrs.grow != None:
         if not regex_match(SIZE_PATTERN, ctx.attrs.grow):
             fail("image_vm: invalid grow size {!r}".format(ctx.attrs.grow))
 
-        # vmspawn grows the file itself, before the ephemeral overlay is stacked on top of it, so
-        # the guest sees the larger disk while its writes still go nowhere.
+        # vmspawn creates the ephemeral overlay at this size, and leaves the qcow2 alone.
         run.add("--grow-image={}".format(ctx.attrs.grow))
 
     if ctx.attrs.ram != None:
@@ -49,27 +78,39 @@ def _image_vm_impl(ctx: AnalysisContext) -> list[Provider]:
         # image's loader/keys/auto keys on first boot.
         run.add("--secure-boot=yes")
 
-    # Secure Boot brings one for the expected-PCR policy to be measured into, but an image needs a
-    # TPM whenever it seals anything to one, which a repart definition asking for Encrypt=tpm2 does
-    # on first boot, Secure Boot or not.
-    if ctx.attrs.secure_boot or ctx.attrs.tpm:
-        run.add("--tpm=yes")
+    # Unset, Secure Boot brings a TPM for the expected-PCR policy to be measured into. Always say
+    # which: left to itself, vmspawn attaches one whenever swtpm is installed, which the tools box does.
+    tpm = ctx.attrs.tpm if ctx.attrs.tpm != None else ctx.attrs.secure_boot
+    run.add("--tpm={}".format("yes" if tpm else "no"))
 
-    if ctx.attrs.sysexts:
-        # each DDI must be named after its extension.
-        extensions = {}
-        for dep in ctx.attrs.sysexts:
-            info = dep[SysextImageInfo]
-            if info.extension + ".raw" in extensions:
-                fail("image_vm: duplicate sysext {!r}".format(info.extension))
-            extensions[info.extension + ".raw"] = info.image
+    if ctx.attrs.coco != None:
+        run.add("--coco={}".format(ctx.attrs.coco))
+
+    directories = {}
+    for dep in ctx.attrs.extensions:
+        extension = system_extension("image_vm", dep)
+        for class_name, directory in (("sysext", "extensions"), ("confext", "confexts")):
+            if class_name in extension.classes:
+                directories.setdefault(directory, []).append(dep[DdiInfo].disk)
+    for dep in ctx.attrs.portables:
+        check_portable("image_vm", dep)
+        directories.setdefault("portables", []).append(dep[DdiInfo].disk)
+
+    for directory in sorted(directories):
+        files = {}
+        for disk in directories[directory]:
+            # The guest gets each DDI as <image name>.raw, so that systemd finds it by that name.
+            name = ddi_image_name(disk) + ".raw"
+            if name in files:
+                fail("image_vm: duplicate {} DDI {!r}".format(directory, name))
+            files[name] = disk
         run.add(
             cmd_args(
-                ctx.actions.copied_dir("extensions", extensions),
-                # can't use /run/extensions: vmspawn marks binds x-initrd.mount, so the initrd
-                # mounts them at /sysroot/<target>; switch-root then moves the initrd's own /run
-                # tmpfs onto the new root's /run, burying a mount on that directory.
-                format = "--bind={}:/var/lib/extensions",
+                ctx.actions.copied_dir(directory, files),
+                # The binds can't go below /run. vmspawn marks binds x-initrd.mount, so the initrd
+                # mounts them at /sysroot/<target>. switch-root then moves the /run tmpfs of the
+                # initrd onto /run of the new root, which hides a mount below /run.
+                format = "--bind={{}}:/var/lib/{}".format(directory),
             ),
         )
 
@@ -90,6 +131,9 @@ def _image_vm_impl(ctx: AnalysisContext) -> list[Provider]:
             fail("image_vm: invalid credential name {!r}".format(name))
         run.add("--set-credential={}:{}".format(name, ctx.attrs.credentials[name]))
 
+    # After everything tine passes, so that an option vmspawn takes the last value of overrides it.
+    run.add(ctx.attrs.vmspawn_args)
+
     # vmspawn takes extra kernel command line arguments as its own trailing arguments, and picks how
     # to deliver them from what it is booting: an SMBIOS OEM string each for the stub and the boot
     # loader for a UKI, `-append` for a bare kernel image. Handing it the arguments rather than the
@@ -108,11 +152,20 @@ _image_vm = rule(
             default = None,
             doc = "user to log in automatically without authentication",
         ),
-        "box": attrs.exec_dep(providers = [BoxInfo], doc = "execution environment supplying the VM stack"),
         "cmdline_extra": attrs.list(
             attrs.string(),
             default = [],
             doc = "kernel command line arguments appended to the ones the image boots with",
+        ),
+        "cmdline_file": attrs.option(
+            attrs.source(),
+            default = None,
+            doc = "file holding the kernel command line to boot `linux` with, such as a disk's `[boot][cmdline]`; `cmdline_extra` follows it",
+        ),
+        "coco": attrs.option(
+            attrs.string(),
+            default = None,
+            doc = 'confidential computing technology to run the guest with, as vmspawn\'s --coco=, e.g. "sev-snp" or "tdx"',
         ),
         "cpus": attrs.option(
             attrs.int(),
@@ -125,12 +178,37 @@ _image_vm = rule(
             default = {},
             doc = "non-secret system credentials passed to systemd-vmspawn",
         ),
+        "extensions": attrs.list(
+            attrs.dep(providers = [DdiInfo, ExtensionInfo]),
+            default = [],
+            doc = "extensions merged at boot, from /var/lib/extensions and /var/lib/confexts by class",
+        ),
         "grow": attrs.option(
             attrs.string(),
             default = None,
-            doc = 'size to grow the disk file to before booting, e.g. "8G"; the built image itself grows',
+            doc = 'size of the disk the guest sees, e.g. "8G", for more room than the virtual_size of the image',
         ),
-        "image": attrs.dep(providers = [RepartInfo], doc = "the raw disk image to boot ephemerally"),
+        "image": attrs.dep(providers = [DdiInfo], doc = "the disk image the guest boots from, ephemerally"),
+        "image_format": attrs.enum(
+            ["qcow2", "raw"],
+            default = "qcow2",
+            doc = "which encoding of `image` the guest gets, as vmspawn's --image-format=",
+        ),
+        "initrd": attrs.option(
+            attrs.source(),
+            default = None,
+            doc = "initrd for a direct kernel boot of `linux`, such as a disk's `[boot][initrd]`",
+        ),
+        "linux": attrs.option(
+            attrs.source(),
+            default = None,
+            doc = "kernel to boot directly rather than through the image's ESP, such as a disk's `[boot][kernel]`",
+        ),
+        "portables": attrs.list(
+            attrs.dep(providers = [DdiInfo]),
+            default = [],
+            doc = "portable service images and their extensions, exposed under /var/lib/portables",
+        ),
         "ram": attrs.option(
             attrs.string(),
             default = None,
@@ -140,18 +218,33 @@ _image_vm = rule(
             default = False,
             doc = "boot with Secure Boot capable firmware",
         ),
-        "sysexts": attrs.list(
-            attrs.dep(providers = [SysextImageInfo]),
+        "tpm": attrs.option(
+            attrs.bool(),
+            default = None,
+            doc = "whether to attach a software TPM; unset, the guest has one with `secure_boot` and none without",
+        ),
+        "vmspawn_args": attrs.list(
+            attrs.arg(),
             default = [],
-            doc = "sysext DDIs exposed to the guest under /var/lib/extensions",
+            doc = "further systemd-vmspawn options, after the ones tine passes, so they can override those vmspawn takes the last value of",
         ),
-        "tpm": attrs.bool(
-            default = False,
-            doc = "attach a software TPM, which Secure Boot implies",
-        ),
+        # The tools box of the image's release built the image and contains the VM stack. Booting the image
+        # in that box builds no other box.
+        "_box": distribution.TOOLS_BOX_ATTR,
     },
+    supports_incoming_transition = True,
 )
 
-def image_vm(name: str, distro: str | None = None, visibility: list[str] | None = None, **kwargs) -> None:
+def image_vm(
+    name: str,
+    distro: str | None = None,
+    visibility: list[str] | None = None,
+    target_compatible_with: list[str] | Select | None = None,
+    **kwargs,
+) -> None:
     """Declare one, compatible with the distributions its package serves."""
-    _image_vm(name = name, **(distribution.distributed(name, distro, visibility) | kwargs))
+
+    # The runner passes --kvm=yes to vmspawn, and KVM only runs guests of the host's architecture. A
+    # disk of another architecture therefore cannot boot, and the runner is incompatible with it.
+    compatible_with = ([] if target_compatible_with == None else target_compatible_with) + [host_configuration.cpu]
+    _image_vm(name = name, **(distribution.distributed(name, distro, visibility, compatible_with) | kwargs))

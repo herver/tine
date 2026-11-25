@@ -21,19 +21,20 @@ import shutil
 import sys
 from contextlib import ExitStack
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import specs
 from util import fail
 
 import alpm
-import rootfs
+import storage
 import transaction
+import uapi16
 from href import relative_href
 
 
 class SolveSpec(transaction.Spec):
     install: list[str]
+    install_files: list[str]
     lower: list[str]
     # Written by the neutral solve command, unread here: alpm prebuilds no repository metadata.
     cache: list[str]
@@ -100,25 +101,21 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     spec = specs.load(SolveSpec, args.spec, prog="plan")
-    if not spec["install"]:
-        fail("plan: a solve needs at least one install spec")
+    install = transaction.install_specs(spec["install"], spec["install_files"])
     repositories = load_repositories(spec)
+    if not install:
+        transaction.write(Path(args.out), [], repositories)
+        return
 
     with ExitStack() as stack:
-        scratch = Path(stack.enter_context(TemporaryDirectory(prefix="plan.")))
-        if spec["lower"]:
-            # An ephemeral upper keeps the lower stack unchanged while alpm writes into the root.
-            root = stack.enter_context(rootfs.rootfs("/installroot", lowers=spec["lower"]))
-        else:
-            root = scratch / "root"
-            root.mkdir()
+        root = stack.enter_context(storage.root(uapi16.Snapshot(spec["lower"]))).path
 
         dbpath = root / alpm.DBPATH
         stage(dbpath, repositories)
         solver = stack.enter_context(alpm.Alpm(root, dbpath, spec["arch"]))
         for repository in repositories:
             solver.register(repository.id)
-        resolved = solver.resolve(spec["install"])
+        resolved = solver.resolve(install)
 
     transaction.write(Path(args.out), resolved_packages(repositories, resolved), repositories)
 

@@ -6,41 +6,40 @@
 import argparse
 import json
 import os
-import platform
 import subprocess
 import sys
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, cast
 
-from util import buck_output, fail, nested_buck, write_if_changed
+from util import buck2_argv, buck_output, fail, write_if_changed
 
 
 def _bold(label: str) -> None:
     print(f"\033[1m{label}\033[0m", flush=True)
 
 
-def _run(cmd: list[str | Path], *, stderr: int | None = None) -> None:
+def _run(cmd: Sequence[str | Path], *, stderr: int | None = None) -> None:
     # Tools print their own diagnostics; propagate failures without a traceback.
     proc = subprocess.run(cmd, stderr=stderr)
     if proc.returncode != 0:
         raise SystemExit(proc.returncode)
 
 
-def _cell_root(buck: str, cell: str) -> Path:
-    return Path(buck_output(buck, "audit", "cell", cell, "--paths-only"))
+def _cell_root(cell: str) -> Path:
+    return Path(buck_output("audit", "cell", cell, "--paths-only"))
 
 
-def _starlark_srcs(buck: str) -> list[Path]:
+def _starlark_srcs() -> list[Path]:
     # Check every loaded in-tree Starlark file; ignore dead files, external cells, and JSON.
-    cells = cast(dict[str, str], json.loads(buck_output(buck, "audit", "cell", "--json")))
-    aliases = cast(dict[str, str], json.loads(buck_output(buck, "audit", "cell", "--json", "--aliases")))
+    cells = cast(dict[str, str], json.loads(buck_output("audit", "cell", "--json")))
+    aliases = cast(dict[str, str], json.loads(buck_output("audit", "cell", "--json", "--aliases")))
     roots = {path: name for name, path in sorted(cells.items()) if name not in ("none", "prelude")}
     universe = " + ".join(sorted(f"{name}//..." for name in roots.values()))
-    project = Path(buck_output(buck, "root", "--kind", "project"))
+    project = Path(buck_output("root", "--kind", "project"))
     files = sorted(
-        project / f for f in buck_output(buck, "uquery", f"allbuildfiles({universe})").splitlines() if f
+        project / f for f in buck_output("uquery", f"allbuildfiles({universe})").splitlines() if f
     )
     # Keep the tine cell's own files, plus those of any cell nested inside it. Reject by owning cell
     # rather than by path prefix, because nested `none`/`prelude` are not on disk, so a prefix test
@@ -70,14 +69,10 @@ def _starlark_srcs(buck: str) -> list[Path]:
     )
 
 
-def _orphan_tests(buck: str, cell: Path) -> list[Path]:
-    """Test files no box_python_test lists in `srcs`, which `buck test` would never run.
-
-    Each suite names its sources explicitly, so a new file beside the code is invisible until it is
-    added to one; nothing else would report that.
-    """
+def _orphan_tests(cell: Path) -> list[Path]:
+    """Find test files omitted from Python test suites."""
     targets = json.loads(
-        buck_output(buck, "uquery", "kind('box_python_test', tine//...)", "--output-attribute", "srcs")
+        buck_output("uquery", "kind('python_test', tine//...)", "--output-attribute", "srcs")
     )
     # A label in the root package renders as `cell///file`, which would resolve to an absolute path.
     claimed = {
@@ -87,30 +82,32 @@ def _orphan_tests(buck: str, cell: Path) -> list[Path]:
 
 
 def _universe() -> str:
-    """The query for everything a whole-cell run asks for on this host.
-
-    The catalog serves Arch for x86_64 only, so elsewhere every target reaching it fails to
-    configure, and Buck reports what depends on it as an error rather than a skip. So leave out the
-    Arch catalog, the per-distribution aliases that choose Arch, and what names the Arch box itself.
-    A new target reaching Arch some other way fails on such a host, which is how it gets added here.
-    """
-    if platform.machine() == "x86_64":
-        return "tine//..."
-    return (
-        r"tine//... - filter('\.arch$', tine//...) - filter('^tine//catalog:arch\.', tine//catalog:)"
-        " - rdeps(tine//..., tine//catalog:arch.rolling.box, 1)"
-    )
+    """The query for everything a whole-cell run asks for."""
+    return "tine//... + catalog//..."
 
 
-def _targets(buck: str) -> list[str]:
+def _default_release() -> str:
+    """The release that the catalog's `default.*` targets point to, after `tine.box`."""
+    query = ("uquery", "catalog//:default.release", "--output-attribute", "^actual$")
+    attributes = cast(dict[str, dict[str, str]], json.loads(buck_output(*query)))
+    actual = attributes["catalog//:default.release"]["actual"]
+    return actual.removeprefix("catalog//:").removesuffix(".release")
+
+
+def _targets(release: str | None = None) -> list[str]:
     """What `_universe()` matches, to hand to a command that takes no query.
 
     Named explicitly, a target incompatible by design (an image base without a chosen distribution, a
-    signing token without a configured token) is an error rather than a skip, so a command given these
-    needs `--skip-incompatible-targets`. That does not hide an Arch target the query missed: on a host
-    without Arch, that fails configuration rather than being incompatible.
+    signing token without a configured token, an Arch box on an arm64 host) is an error rather than a
+    skip, so a command given these needs `--skip-incompatible-targets`.
+
+    With `release`, only the compatible targets that reach no other release's repositories, as
+    tools/release.bxl selects them.
     """
-    return buck_output(buck, "uquery", _universe()).split()
+    if release is None:
+        return buck_output("uquery", _universe()).split()
+    bxl = ("bxl", "tine//tools/release.bxl:targets", "--", "--pattern", _universe(), "--release", release)
+    return buck_output(*bxl).split()
 
 
 def _starlark_fmt(args: argparse.Namespace, *arguments: str | Path) -> list[str | Path]:
@@ -127,27 +124,25 @@ def _fmt_diff(args: argparse.Namespace, src: Path) -> str:
 
 
 def _lint(args: argparse.Namespace) -> None:
-    cell = _cell_root(args.buck, "tine")
-    srcs = _starlark_srcs(args.buck)
+    cell = _cell_root("tine")
+    srcs = _starlark_srcs()
     _bold("test targets")
-    if orphans := _orphan_tests(args.buck, cell):
+    if orphans := _orphan_tests(cell):
         listing = "\n".join(f"  {p.relative_to(cell)}" for p in orphans)
-        fail(f"no box_python_test lists these, so they never run:\n{listing}")
+        fail(f"no python.test suite lists these, so they never run:\n{listing}")
     _bold("ruff")
     _run([args.ruff, "format", "--check", "--no-cache", cell])
     _run([args.ruff, "check", "--no-cache", cell])
     _bold("reuse")
     # Scoped by --root rather than by the cwd Buck runs this in, so a consuming project checks the
     # cell it declares and not whatever else sits beside it.
-    _run([args.buck, "-v", "0", "run", "tine//tools:reuse", "--", "--root", cell, "lint", "--lines"])
+    _run([*buck2_argv("-v", "0", "run", "tine//tools:reuse"), "--", "--root", cell, "lint", "--lines"])
     _bold("ty")
-    targets = buck_output(
-        args.buck, "uquery", f"attrfilter(labels, 'python-typecheck', {_universe()})"
-    ).split()
+    targets = buck_output("uquery", f"attrfilter(labels, 'python-typecheck', {_universe()})").split()
     if not targets:
         fail("ty: no generated type-check targets found")
     _require_manifests(cell, _ty_packages(targets))
-    _run([args.buck, "build", *targets])
+    _run(buck2_argv("build", *targets))
     _bold("starlark_fmt")
     # starlark_fmt has no check mode, so diff each file and fail on the first rewrite it would make.
     if diffs := [diff for src in srcs if (diff := _fmt_diff(args, src))]:
@@ -156,21 +151,20 @@ def _lint(args: argparse.Namespace) -> None:
     # Pass the files rather than the cell directory: standalone, the tine cell is the project root,
     # which Buck normalizes to an empty path and rejects.
     _bold("starlark lint")
-    _run([args.buck, "-v", "0", "starlark", "lint", "--console", "none", *srcs])
+    _run([*buck2_argv("-v", "0", "starlark", "lint", "--console", "none"), *srcs])
     _bold("starlark typecheck")
     # Typecheck errors use stdout; stderr is only the per-file event log. Unlike lint, typecheck
     # follows load() into data files and parses them as Starlark, which no TOML survives (a JSON
     # object happens to be a valid Starlark expression), so files with a TOML load stay out; the
     # probe also matches the `?format=toml` spelling.
     checkable = [f for f in srcs if 'toml"' not in f.read_text(encoding="utf-8")]
-    _run([args.buck, "-v", "0", "starlark", "typecheck", *checkable], stderr=subprocess.DEVNULL)
+    _run([*buck2_argv("-v", "0", "starlark", "typecheck"), *checkable], stderr=subprocess.DEVNULL)
     _bold("target graph")
     # Analysis, not a build: it reaches every rule a build would run, without producing anything.
     # Scoped to this cell, whose platform the parser knows how to detect; what a consuming project
     # declares is its own to check, with its own pattern.
     _run(
-        [
-            args.buck,
+        buck2_argv(
             "-v",
             "0",
             "bxl",
@@ -180,7 +174,7 @@ def _lint(args: argparse.Namespace) -> None:
             "--",
             "--pattern",
             _universe(),
-        ]
+        )
     )
 
 
@@ -189,21 +183,12 @@ def _check(args: argparse.Namespace) -> None:
     _bold("unit tests")
     # Building an example image is minutes where these are seconds. Everything that needs one is
     # labelled `image` and covered by `buck test tine//... --include image`, which is what CI runs.
-    _run([args.buck, "test", "--skip-incompatible-targets", *_targets(args.buck), "--exclude", "image"])
-
-
-def _print_universe(_args: argparse.Namespace) -> None:
-    print(_universe())
+    _run(buck2_argv("test", "--skip-incompatible-targets", *_targets(args.release), "--exclude", "image"))
 
 
 def _fmt(args: argparse.Namespace) -> None:
-    # Ask Buck everything before the formatters touch the tree. This runs under `buck run`, whose
-    # command stays active for as long as the binary does, and buck2 only recognizes a nested
-    # command as nested when it spawned the process itself, which it does for actions but not for
-    # run targets. A query issued after a write therefore needs a newer state than the command it
-    # is nested in and waits for it to finish: a deadlock rather than an error.
-    cell = _cell_root(args.buck, "tine")
-    srcs = _starlark_srcs(args.buck)
+    cell = _cell_root("tine")
+    srcs = _starlark_srcs()
     _bold("ruff")
     _run([args.ruff, "format", "--no-cache", cell])
     _run([args.ruff, "check", "--fix", "--no-cache", cell])
@@ -221,7 +206,7 @@ def _write_dot(path: Path, intra: dict[str, list[str]], rev: dict[str, list[str]
 
 def _scc(args: argparse.Namespace) -> None:
     # Graph derivation and cycle detection live in buck (rpm_branch); this only formats its output.
-    graph = buck_output(args.buck, "build", f"{args.branch}:_buildrequires_graph", "--out", "-")
+    graph = buck_output("build", f"{args.branch}:_buildrequires_graph", "--out", "-")
     data = cast(dict[str, Any], json.loads(graph))
     edge_caps = cast(dict[str, dict[str, list[str]]], data["edges"])
     components: dict[int, set[str]] = {}
@@ -374,32 +359,57 @@ def _ty_zed_files(cell: Path, targets: dict[str, dict[str, list[str]]]) -> None:
         write_if_changed(settings, marker + json.dumps(configuration, indent=2) + "\n")
 
 
-def _ty_environment(buck: str, cell: Path, package: Path, python: Path) -> dict[str, object]:
-    """Select pinned Python or the package's explicitly requested box-provided imports."""
+def _box_search_paths(layers: Sequence[Path]) -> list[Path]:
+    """The directories of a box's layers that contain third-party Python modules, top layer first.
+
+    ty reads one Python environment, and a box splits its packages over several layers. ty takes the
+    standard library from its own stubs, so the box only has to provide these search paths.
+    """
+    return [
+        directory
+        for layer in reversed(layers)
+        # Debian installs modules into dist-packages, and Fedora installs compiled ones under lib64.
+        for pattern in ("usr/lib*/python3*/site-packages", "usr/lib/python3/dist-packages")
+        for directory in sorted(layer.glob(pattern))
+    ]
+
+
+def _ty_environment(cell: Path, package: Path, python: Path) -> dict[str, object]:
+    """Select pinned Python and the package's explicitly requested box-provided imports."""
     manifest = cell / package / "pyproject.toml"
     config = tomllib.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
+    # The editor reads this from .buck, not the working directory of the Buck command.
+    environment: dict[str, object] = {"python": str(python.absolute())}
     box = config.get("tool", {}).get("tine", {}).get("ty", {}).get("box")
     if box is not None:
         if not isinstance(box, str) or not box.endswith(".box"):
             fail(f"{manifest}: tool.tine.ty.box must name a Buck box target")
         # Tests use boxes even for stdlib-only sources, so their runtime is not an editor requirement.
         # Build the explicitly chosen box only for the package whose server is starting.
-        outputs = buck_output(buck, "build", "--show-full-simple-output", box).splitlines()
-        if len(outputs) != 1:
-            fail(f"{manifest}: expected one box output for {box}, got {outputs}")
-        python = Path(outputs[0]) / "usr"
-    # The editor reads this from .buck, not the working directory of the Buck command.
-    return {"python": str(python.absolute())}
+        listing = Path(buck_output("build", "--show-full-simple-output", f"{box}[layers]"))
+        project = Path(buck_output("root", "--kind", "project"))
+        layers = [project / layer for layer in json.loads(listing.read_text(encoding="utf-8"))]
+        environment["extra-paths"] = [str(path) for path in _box_search_paths(layers)]
+    return environment
+
+
+def _ty_check(args: argparse.Namespace) -> None:
+    command = [args.ty, "check", "--project", args.project, "--python", args.python]
+    for path in _box_search_paths(args.layer):
+        command += ["--extra-search-path", str(path)]
+    if returncode := subprocess.run([*command, *args.files]).returncode:
+        sys.exit(returncode)
+    # ty reports through its exit status alone, so the output Buck tracks only says that it passed.
+    args.output.touch()
 
 
 def _ty(args: argparse.Namespace) -> None:
     package = Path(args.package)
     if package.is_absolute() or ".." in package.parts:
         fail("--package must be a directory relative to the tine cell")
-    cell = _cell_root(args.buck, "tine")
+    cell = _cell_root("tine")
     targets = json.loads(
         buck_output(
-            args.buck,
             "uquery",
             "attrfilter(labels, 'python-typecheck', tine//...)"
             " + kind('python_bootstrap_library', tine//...)",
@@ -408,8 +418,7 @@ def _ty(args: argparse.Namespace) -> None:
         )
     )
     roots = _ty_import_roots(cell, package, targets)
-    # Finish nested Buck commands before writing files, as in _fmt.
-    environment = _ty_environment(args.buck, cell, package, Path(args.python))
+    environment = _ty_environment(cell, package, Path(args.python))
     _ty_zed_files(cell, targets)
     manifest = cell / package / "pyproject.toml"
     config = _read_ty_config(cell / "ty.toml", manifest if manifest.is_file() else None)
@@ -431,34 +440,42 @@ def _ty(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--buck",
-        default=nested_buck(),
-        help="buck binary to nest (default: $BUCK2_BINARY, else PATH)",
-    )
     starlark = argparse.ArgumentParser(add_help=False)
     starlark.add_argument("--starlark-fmt", required=True)
     starlark.add_argument("--starlark-fmt-config", required=True, help="starlark_fmt --config tables")
     p = argparse.ArgumentParser(prog="dev")
     sub = p.add_subparsers(dest="command", required=True)
 
-    for name, func, help_text in (
-        ("lint", _lint, "run the source lints (fmt fixes)"),
-        ("check", _check, "run the source lints, then every unit-test suite"),
-    ):
-        verb = sub.add_parser(name, parents=[common, starlark], help=help_text)
-        verb.add_argument("--ruff", required=True)
-        verb.set_defaults(func=func)
+    only_release = argparse.ArgumentParser(add_help=False)
+    only_release.add_argument(
+        "--release",
+        help="leave out the targets of every other release of the catalog, such as debian.testing",
+    )
+
+    lint = sub.add_parser("lint", parents=[starlark], help="run the source lints (fmt fixes)")
+    lint.add_argument("--ruff", required=True)
+    lint.set_defaults(func=_lint)
+
+    check = sub.add_parser(
+        "check", parents=[starlark, only_release], help="run the source lints, then every unit-test suite"
+    )
+    check.add_argument("--ruff", required=True)
+    check.set_defaults(func=_check)
 
     universe = sub.add_parser("universe", help="print the query for what a whole-cell run asks for here")
-    universe.set_defaults(func=_print_universe)
+    universe.set_defaults(func=lambda _args: print(_universe()))
 
-    fmt = sub.add_parser("fmt", parents=[common, starlark], help="auto-format and auto-fix lints")
+    targets = sub.add_parser("targets", parents=[only_release], help="print the targets of a whole-cell run")
+    targets.set_defaults(func=lambda args: print(*_targets(args.release), sep="\n"))
+
+    release = sub.add_parser("release", help="print the release that the catalog's default boxes come from")
+    release.set_defaults(func=lambda _args: print(_default_release()))
+
+    fmt = sub.add_parser("fmt", parents=[starlark], help="auto-format and auto-fix lints")
     fmt.add_argument("--ruff", required=True)
     fmt.set_defaults(func=_fmt)
 
-    scc = sub.add_parser("scc", parents=[common], help="analyze a branch's BuildRequires cycles")
+    scc = sub.add_parser("scc", help="analyze a branch's BuildRequires cycles")
     scc.add_argument("branch", help="branch label, e.g. //packages/fedora/rawhide")
     scc.add_argument("--why", metavar="PKG", help="show one cycle member's edges and their reasons")
     scc.add_argument("--dot", type=Path, help="write the cycle subgraph as graphviz")
@@ -470,7 +487,16 @@ def main(argv: list[str] | None = None) -> None:
     ty_config.add_argument("--output", type=Path, required=True)
     ty_config.set_defaults(func=_ty_config)
 
-    ty = sub.add_parser("ty", parents=[common], help="run pinned ty in a package's Python environment")
+    ty_check = sub.add_parser("ty-check", help="type-check against the pinned Python and a box's layers")
+    ty_check.add_argument("--python", required=True, help="pinned standalone Python")
+    ty_check.add_argument("--ty", required=True)
+    ty_check.add_argument("--layer", type=Path, action="append", default=[], help="box layer, bottom first")
+    ty_check.add_argument("--output", type=Path, required=True)
+    ty_check.add_argument("--project", required=True, help="the isolated tree with its ty.toml")
+    ty_check.add_argument("files", nargs="+")
+    ty_check.set_defaults(func=_ty_check)
+
+    ty = sub.add_parser("ty", help="run pinned ty in a package's Python environment")
     ty.add_argument("--python", required=True, help="pinned standalone Python for stdlib-only packages")
     ty.add_argument("--ty", required=True)
     ty.add_argument("--package", default=".", help="Python source package relative to the tine cell")

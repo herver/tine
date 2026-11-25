@@ -29,7 +29,7 @@ SERVED: dict[tuple[str, str], str] = {}
 
 def pin(snapshot: str, name: str = "test.rolling", **snapshots: str) -> catalog.Pin:
     """A repository's pin as `_pinned_repositories` reads it, serving `snapshots` per architecture."""
-    target = f"tine//catalog:{name}.repository"
+    target = f"catalog//:{name}.repository"
     for architecture, served in snapshots.items():
         SERVED[(target, architecture)] = served
     return catalog.Pin(
@@ -137,20 +137,27 @@ class TestArmor(unittest.TestCase):
 class LockPaths(unittest.TestCase):
     def test_names_a_box_lock_by_box_and_architecture(self) -> None:
         self.assertEqual(
-            catalog._box_lock_path("tine//catalog:fedora.rawhide.box.lock.x86_64"),
+            catalog._box_lock_path("catalog//:fedora.rawhide.box.lock.x86_64"),
             Path("snapshot/box/fedora.rawhide.x86_64.json"),
         )
 
     def test_rejects_a_lock_target_of_something_that_is_no_box(self) -> None:
         with self.assertRaises(SystemExit) as raised:
-            catalog._box_lock_path("tine//catalog:fedora.rawhide.lock.x86_64")
+            catalog._box_lock_path("catalog//:fedora.rawhide.lock.x86_64")
         self.assertIn("is not a <name>.box.lock.<architecture> target", str(raised.exception))
 
     def test_names_a_repository_lock_by_repository_and_architecture(self) -> None:
         self.assertEqual(
-            catalog._repository_lock_path("tine//catalog:arch.rolling.core.repository", "x86_64"),
+            catalog._repository_lock_path("catalog//:arch.rolling.core.repository", "x86_64"),
             Path("snapshot/repo/arch.rolling.core.x86_64.json"),
         )
+
+    def test_names_a_go_releases_snapshot_by_target(self) -> None:
+        self.assertEqual(catalog._go_releases_path("catalog//:go.releases"), Path("snapshot/go/go.json"))
+
+    def test_rejects_a_go_releases_target_without_its_suffix(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "does not end with '.releases'"):
+            catalog._go_releases_path("catalog//:go")
 
 
 class NewestRpmrepoSnapshot(unittest.TestCase):
@@ -160,7 +167,7 @@ class NewestRpmrepoSnapshot(unittest.TestCase):
         patched = mock.patch.object(
             catalog,
             "_pinned_snapshot",
-            side_effect=lambda buck, pin, architecture: SERVED[(pin.target, architecture)],
+            side_effect=lambda pin, architecture: SERVED[(pin.target, architecture)],
         )
         patched.start()
         self.addCleanup(patched.stop)
@@ -174,7 +181,7 @@ class NewestRpmrepoSnapshot(unittest.TestCase):
     def test_moves_the_datestamp_and_keeps_the_placeholder(self) -> None:
         with self.enumerating("t9-x86_64-rolling-20260202"):
             newest = catalog._newest_rpmrepo_snapshot(
-                "buck", [pin("t9-$basearch-rolling-20260101", x86_64="t9-x86_64-rolling-20260101")]
+                [pin("t9-$basearch-rolling-20260101", x86_64="t9-x86_64-rolling-20260101")]
             )
         self.assertEqual(newest, "t9-$basearch-rolling-20260202")
 
@@ -182,7 +189,7 @@ class NewestRpmrepoSnapshot(unittest.TestCase):
         with self.enumerating(
             "t9-aarch64-rolling-20260202", "t9-x86_64-rolling-20260202"
         ) as newest_snapshot:
-            catalog._newest_rpmrepo_snapshot("buck", [two_architectures("t9-$basearch-rolling-20260101")])
+            catalog._newest_rpmrepo_snapshot([two_architectures("t9-$basearch-rolling-20260101")])
         self.assertEqual(
             [call.args[2] for call in newest_snapshot.call_args_list],
             ["t9-aarch64-rolling", "t9-x86_64-rolling"],
@@ -191,9 +198,7 @@ class NewestRpmrepoSnapshot(unittest.TestCase):
     def test_refuses_architectures_on_different_days(self) -> None:
         with self.enumerating("t9-aarch64-rolling-20260201", "t9-x86_64-rolling-20260202"):
             with self.assertRaises(SystemExit) as raised:
-                catalog._newest_rpmrepo_snapshot(
-                    "buck", [two_architectures("t9-$basearch-rolling-20260101")]
-                )
+                catalog._newest_rpmrepo_snapshot([two_architectures("t9-$basearch-rolling-20260101")])
         self.assertIn("one pin cannot advance to several snapshots", str(raised.exception))
         self.assertIn("(arm64) offers t9-aarch64-rolling-20260201", str(raised.exception))
 
@@ -202,13 +207,77 @@ class NewestRpmrepoSnapshot(unittest.TestCase):
         with self.enumerating("t9-x86_64-rolling-20260201", "t9-x86_64-rolling-20260202"):
             with self.assertRaises(SystemExit) as raised:
                 catalog._newest_rpmrepo_snapshot(
-                    "buck",
                     [
                         pin(shared, name="test.core", x86_64="t9-x86_64-rolling-20260101"),
                         pin(shared, name="test.extra", x86_64="t9-x86_64-rolling-20260101"),
-                    ],
+                    ]
                 )
         self.assertIn("one pin cannot advance to several snapshots", str(raised.exception))
+
+
+class Plan(unittest.TestCase):
+    def plan(self, boxes: list[str] | None, go: bool) -> tuple[list[str], list[str], list[str]]:
+        labelled = {
+            catalog.BOX_LOCK_LABEL: ["catalog//:fedora.box.lock.x86_64", "catalog//:arch.box.lock.x86_64"],
+            catalog.REMOTE_REPOSITORY_LABEL: ["catalog//:fedora.repository", "catalog//:arch.repository"],
+            catalog.GO_RELEASES_LABEL: ["catalog//:go.releases"],
+        }
+        with (
+            mock.patch.object(
+                catalog, "_targets_with_label", side_effect=lambda _catalog, label: labelled[label]
+            ),
+            mock.patch.object(
+                catalog, "_repositories_for_boxes", return_value=["catalog//:fedora.repository"]
+            ),
+            mock.patch.object(catalog, "_catalog_directory", return_value=Path("catalog")),
+        ):
+            _, snapshots, resolves, go_releases = catalog._plan("catalog//", boxes, go)
+        return snapshots, resolves, go_releases
+
+    def test_refreshes_everything_without_a_selection(self) -> None:
+        self.assertEqual(
+            self.plan(None, False),
+            (
+                ["catalog//:fedora.repository", "catalog//:arch.repository"],
+                ["catalog//:fedora.box.lock.x86_64", "catalog//:arch.box.lock.x86_64"],
+                ["catalog//:go.releases"],
+            ),
+        )
+
+    def test_selecting_boxes_leaves_out_go_releases(self) -> None:
+        self.assertEqual(
+            self.plan(["fedora.box"], False),
+            (["catalog//:fedora.repository"], ["catalog//:fedora.box.lock.x86_64"], []),
+        )
+
+    def test_go_alone_refreshes_only_go_releases(self) -> None:
+        self.assertEqual(self.plan(None, True), ([], [], ["catalog//:go.releases"]))
+
+    def test_go_with_boxes_refreshes_both(self) -> None:
+        self.assertEqual(
+            self.plan(["fedora.box"], True),
+            (
+                ["catalog//:fedora.repository"],
+                ["catalog//:fedora.box.lock.x86_64"],
+                ["catalog//:go.releases"],
+            ),
+        )
+
+
+class RegenerateGoReleases(unittest.TestCase):
+    def test_advances_the_snapshot_only_when_asked(self) -> None:
+        for advance, arguments in [(False, ()), (True, ("--advance",))]:
+            with (
+                self.subTest(advance=advance),
+                mock.patch.object(catalog, "_signing_keys", return_value=iter(())),
+                mock.patch.object(catalog, "_served_architectures", return_value={}),
+                mock.patch.object(catalog, "_run", return_value="{}\n") as run,
+            ):
+                regenerated = list(
+                    catalog._regenerate(Path("catalog"), [], [], ["catalog//:go.releases"], advance)
+                )
+                self.assertEqual(regenerated, [(Path("catalog/snapshot/go/go.json"), "{}\n")])
+                run.assert_called_once_with("catalog//:go.releases[snapshot]", *arguments)
 
 
 if __name__ == "__main__":

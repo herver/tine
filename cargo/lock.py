@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 import specs
-from util import fail
+from util import fail, named_files
 
 # Both spellings of the crates.io index. The sparse protocol replaced the git one, and locks written
 # before a project switched over keep the old string.
@@ -27,7 +27,7 @@ _GIT_REFERENCES = ("branch", "tag", "rev")
 class Spec(TypedDict):
     name: str
     out: str
-    sources: dict[str, str]
+    src: str
 
 
 def _packages(target: str, lock: dict[str, Any]) -> list[dict[str, Any]]:
@@ -88,55 +88,51 @@ def git_sources(target: str, lock: dict[str, Any]) -> dict[str, dict[str, str]]:
     return sources
 
 
-def _named(sources: dict[str, str], name: str) -> list[tuple[Path, Path]]:
-    """Find logical and materialized paths named `name`, including inside directory artifacts."""
-    found: dict[Path, Path] = {}
-    for short_path, artifact_path in sorted(sources.items()):
-        logical = Path(short_path)
-        artifact = Path(artifact_path)
-        if artifact.is_dir():
-            for directory, directories, files in artifact.walk():
-                directories.sort()
-                if name in files:
-                    path = directory / name
-                    found[logical / path.relative_to(artifact)] = path
-        elif logical.name == name:
-            found[logical] = artifact
-    return sorted(found.items())
+def _workspace_files(source: Path, name: str) -> list[Path]:
+    """Find files called `name` under `source`, leaving out cargo's target directories."""
+    # The build reads the source directory as it is on disk, so an ignored target/ is still in it.
+    # `cargo package` copies the crate's Cargo.toml and Cargo.lock into target/package/. If the lock
+    # search found that copy, the build would build the copy instead of the crate.
+    return [
+        path
+        for path in named_files(source, name)
+        if not any(
+            parent.name == "target" and (source / parent.parent / "Cargo.toml").is_file()
+            for parent in path.parents
+        )
+    ]
 
 
-def resolve_workspace(target: str, sources: dict[str, str]) -> dict[str, Any]:
+def resolve_workspace(target: str, source: Path) -> dict[str, Any]:
     """Return the workspace root and remote inputs resolved from its lock."""
-    locks = _named(sources, "Cargo.lock")
+    if not source.is_dir():
+        fail(f"cargo_package {target}: src must be a directory")
+    # Cargo only ever reads the lock at the workspace root, so one below another, a vendored project's
+    # say, cannot be the workspace.
+    found = _workspace_files(source, "Cargo.lock")
+    locks = [
+        lock for lock in found if not any(other.parent in lock.parents for other in found if other != lock)
+    ]
     if len(locks) > 1:
-        fail(
-            f"cargo_package {target}: srcs hold several Cargo.lock files: "
-            f"{[str(logical) for logical, _ in locks]}"
-        )
+        fail(f"cargo_package {target}: src holds several Cargo.lock files: {[str(path) for path in locks]}")
 
-    manifests = _named(sources, "Cargo.toml")
-    if locks:
-        root = locks[0][0].parent
-        manifests = [manifest for manifest in manifests if manifest[0].parent == root]
-    elif not manifests:
+    if not locks:
+        if not _workspace_files(source, "Cargo.toml"):
+            fail(
+                f"cargo_package {target}: src holds no Cargo.toml; by default the checkout is expected "
+                f"in the {target}/ directory, pass `src` when it lives elsewhere"
+            )
+        # Cargo refuses to create a missing lock under --locked. The build cannot drop --locked, because
+        # cargo would then write the lock into the sources, which are read-only during the build.
         fail(
-            f"cargo_package {target}: srcs hold no Cargo.toml; by default the checkout is expected "
-            f"in the {target}/ directory, pass `srcs` when it lives elsewhere"
+            f"cargo_package {target}: src holds no Cargo.lock; commit the lock that cargo writes, "
+            "or fetch a revision that contains one"
         )
-    elif len(manifests) == 1:
-        root = manifests[0][0].parent
-    else:
-        fail(
-            f"cargo_package {target}: srcs hold no Cargo.lock and {len(manifests)} Cargo.toml files; "
-            "commit the lock"
-        )
+    root = locks[0].parent
+    if not (source / root / "Cargo.toml").is_file():
+        fail(f"cargo_package {target}: src holds no Cargo.toml beside the Cargo.lock")
 
-    if not manifests:
-        fail(f"cargo_package {target}: srcs hold no Cargo.toml beside the Cargo.lock")
-
-    lock: dict[str, Any] = {"package": []}
-    if locks:
-        lock = tomllib.loads(locks[0][1].read_text(encoding="utf-8"))
+    lock = tomllib.loads((source / locks[0]).read_text(encoding="utf-8"))
     root_string = "" if root == Path(".") else str(root)
     return {
         "crates": crate_downloads(target, lock),
@@ -147,7 +143,7 @@ def resolve_workspace(target: str, sources: dict[str, str]) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> None:
     spec = specs.parse(Spec, "cargo-lock", argv)
-    workspace = resolve_workspace(spec["name"], spec["sources"])
+    workspace = resolve_workspace(spec["name"], Path(spec["src"]))
     Path(spec["out"]).write_text(json.dumps(workspace, sort_keys=True) + "\n", encoding="utf-8")
 
 

@@ -5,22 +5,24 @@
 
 load("@prelude//:rules.bzl", "git_fetch")
 load("//project:defs.bzl", "project")
+load("//project:source.bzl", "SourceTreeInfo")
 
 _MOUNT_TARGET_LABEL = "tine:mount-target"
 
 def _checkout_impl(ctx: AnalysisContext) -> list[Provider]:
-    # Keep a populated checkout as one directory source so files omitted by glob(), including dotfiles,
-    # remain live inputs, but hand consumers a copy of it: the source path is the checkout itself, which
-    # for a mount physically holds every tree the project ignores keep out of Buck's digest, so a consumer
-    # reading it would copy build output Buck never saw. `relative_symlinks` keeps an internal symlink
-    # pointing at its original relative target rather than back at the mount, so the copy survives a
-    # consumer relocating it. The empty artifact preserves the implicit-checkout target for archive packages.
-    tree = ctx.actions.copy_dir(ctx.attrs.out, ctx.attrs.src, relative_symlinks = True) if ctx.attrs.src else ctx.actions.symlinked_dir(ctx.attrs.out, {})
+    # `src` is a single directory source rather than a glob(). A glob() pattern matches a dotfile only if
+    # the pattern itself contains the dot, so a `**` glob would leave out tracked dotfiles.
+    # The output of a populated checkout is its directory in the project, and a consumer reads that
+    # directory as it is on disk. Archive packages depend on the implicit checkout target, so the output of
+    # an unpopulated checkout is an empty directory in buck-out.
+    name = ctx.label.name.removesuffix(".git")
+    tree = ctx.attrs.src if ctx.attrs.src else ctx.actions.symlinked_dir(name, {})
     return [
         DefaultInfo(
             default_output = tree,
             sub_targets = {path: [DefaultInfo(default_output = tree.project(path))] for path in ctx.attrs.sub_targets},
         ),
+        SourceTreeInfo(dev = False, path = tree, sources = None),
     ]
 
 _checkout = rule(
@@ -28,9 +30,23 @@ _checkout = rule(
     impl = _checkout_impl,
     attrs = {
         "labels": attrs.list(attrs.string(), default = [], doc = "labels used to query this target"),
-        "out": attrs.string(doc = "name of the fetched work tree"),
         "src": attrs.option(attrs.source(allow_directory = True), default = None, doc = "the populated checkout"),
         "sub_targets": attrs.list(attrs.string(), default = [], doc = "tree paths exposed as sub-targets"),
+    },
+)
+
+def _fetched_impl(ctx: AnalysisContext) -> list[Provider]:
+    info = ctx.attrs.fetch[DefaultInfo]
+    return [info, SourceTreeInfo(dev = False, path = info.default_outputs[0], sources = None)]
+
+# The prelude's git_fetch() provides only DefaultInfo. rpm.package() takes a source tree only from a target
+# that provides SourceTreeInfo, like a checkout does.
+_fetched = rule(
+    doc = "Expose a git_fetch() as a source tree.",
+    impl = _fetched_impl,
+    attrs = {
+        "fetch": attrs.dep(doc = "the git_fetch() target"),
+        "labels": attrs.list(attrs.string(), default = [], doc = "labels used to query this target"),
     },
 )
 
@@ -38,27 +54,21 @@ def fetch(name: str, repo: str, rev: str, sub_targets: list[str] = [], visibilit
     """Fetch `rev` unless this package contains a non-empty checkout named after the target."""
     directory = name.removesuffix(".git")
     labels = [_MOUNT_TARGET_LABEL] + labels
-    srcs = glob([directory + "/**"])
-    if srcs or project.is_dev(directory):
-        _checkout(
-            name = name,
-            labels = labels,
-            out = directory,
-            src = directory,
-            sub_targets = sub_targets,
-            visibility = visibility,
-        )
+    if project.populated(directory):
+        _checkout(name = name, labels = labels, src = directory, sub_targets = sub_targets, visibility = visibility, **kwargs)
     else:
-        git_fetch(name = name, repo = repo, rev = rev, sub_targets = sub_targets, visibility = visibility, labels = labels, **kwargs)
+        # `tine mount` finds checkout slots by the label. Only the public target has it, because tine maps
+        # the name of every labeled target to a directory.
+        git_fetch(name = name + ".fetch", repo = repo, rev = rev, sub_targets = sub_targets, **kwargs)
+        _fetched(name = name, fetch = ":" + name + ".fetch", labels = labels, visibility = visibility)
 
 def checkout(name: str, labels: list[str] = [], **kwargs) -> bool:
     """Expose the directory named after the target as a tree, empty until committed or mounted.
 
     Returns whether it currently holds anything.
     """
-    srcs = glob([name + "/**"])
-    populated = bool(srcs) or project.is_dev(name)
-    _checkout(name = name, labels = [_MOUNT_TARGET_LABEL] + labels, out = name, src = name if populated else None, **kwargs)
+    populated = project.populated(name)
+    _checkout(name = name, labels = [_MOUNT_TARGET_LABEL] + labels, src = name if populated else None, **kwargs)
     return populated
 
 git = struct(

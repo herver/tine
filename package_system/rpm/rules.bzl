@@ -3,18 +3,17 @@
 
 """RPM repositories and package-build rules."""
 
-load("//:specs.bzl", "spec_args")
-load("//box:runtime.bzl", "BoxInfo", "box_run")
-load("//git:defs.bzl", "git")
-load("//package:buildroot.bzl", "BuildrootInfo")
-load("//package:install.bzl", "install_packages")
-load("//package:manager.bzl", "PackageManagerInfo")
-load("//package:repository.bzl", "LocalPackageInfo", "RepositoryPin", "declare_remote_repository")
+load("//:specs.bzl", "specs")
+load("//box:defs.bzl", "box")
+load("//distribution:defs.bzl", "distribution")
+load("//package:build.bzl", "PACKAGE_BUILD_ATTRS", "package_build", "package_build_source")
+load("//package:buildroot.bzl", "BuildrootInfo", "package_buildroot", "recipe_snapshot")
+load("//package:packaging.bzl", "pinned_packaging")
+load("//package:repository.bzl", "RepositoryPin", "declare_remote_repository")
 load("//package:system.bzl", "PackageSystemInfo")
-load("//project:defs.bzl", "project")
+load("//project:source.bzl", "SourceTreeInfo")
 
 PACKAGE_SYSTEM = "@tine//package_system/rpm:package_system"
-_PRIVATE = "__tine"
 
 def rpm_remote_repository(
     name: str,
@@ -44,114 +43,124 @@ def rpm_remote_repository(
         **kwargs,
     )
 
+def _query_buildrequires(
+    actions: AnalysisActions,
+    query: RunInfo,
+    parse: dict[str, typing.Any],
+    source_tree: cmd_args | None,
+    lower: list[Artifact],
+) -> Artifact:
+    """Return a JSON list of the BuildRequires of the spec that `parse` describes and the layers `lower` lack."""
+    buildrequires = actions.declare_output("__tine/buildrequires.json")
+    actions.run(
+        cmd_args(
+            query,
+            specs.args(
+                actions,
+                "buildrequires.spec.json",
+                parse | {"lower": lower, "out": buildrequires.as_output(), "source_tree": source_tree},
+            ),
+        ),
+        # A dev build queries a source tree that changes with every edit, so no other build reuses the result.
+        allow_cache_upload = not parse["incremental"],
+        category = "rpm_buildrequires",
+    )
+    return buildrequires
+
 def _rpm_package_impl(ctx: AnalysisContext) -> list[Provider]:
     base_buildroot = ctx.attrs.buildroot[BuildrootInfo]
-    package_manager_dep = base_buildroot.package_manager
-    package_manager = package_manager_dep[PackageManagerInfo]
-    system = package_manager.package_system[PackageSystemInfo]
-    if system.build == None:
-        fail("rpm_package: package system {} builds no packages".format(package_manager.package_system.label))
+    tree = ctx.attrs.source_tree
+    if isinstance(tree, Dependency):
+        tree = tree[SourceTreeInfo]
+    elif tree != None:
+        tree = SourceTreeInfo(dev = False, path = tree, sources = None)
 
-    # Share the base buildroot; add package-specific BuildRequires as a delta.
-    buildroot = [base_buildroot.root]
-
-    if ctx.attrs.build_requires or ctx.attrs.buildroot_deps:
-        # Self-hosted package outputs outrank upstream while resolving the delta.
-        extra_packages = []
-        for dependency in ctx.attrs.buildroot_deps:
-            info = dependency[LocalPackageInfo]
-            if info.package_system.label != package_manager.package_system.label:
-                fail(
-                    "rpm_package: buildroot dependency {} uses package system {}, expected {}".format(
-                        dependency.label,
-                        info.package_system.label,
-                        package_manager.package_system.label,
-                    ),
-                )
-            extra_packages.append(info.packages)
-        buildroot = buildroot + [
-            install_packages(
-                ctx,
-                package_manager_dep,
-                ctx.attrs.build_requires,
-                stack = buildroot,
-                extra_packages = extra_packages,
-            )
-        ]
-
-    source_tree = ctx.attrs.source_tree
-    rpms = project.kept_dir(ctx.actions, "rpms")
-    build_dir = project.kept_dir(ctx.actions, _PRIVATE + "/build") if ctx.attrs.configured_dev else None
-    in_place_spec = ctx.attrs.in_place_spec if source_tree != None else None
+    # The macro checks `[tine] dev` for the checkout path that the label of the tree names. A build of a
+    # `project.source_tree()` reads the directory of the package of the tree instead. The tree checks
+    # `[tine] dev` for that directory.
+    configured_dev = ctx.attrs.configured_dev
+    if configured_dev == None:
+        configured_dev = tree != None and tree.dev
+    source_tree = specs.argument(tree.path) if tree != None else None
+    in_place_spec = ctx.attrs.in_place_spec if tree != None else None
     spec_file = ctx.attrs.spec
-    if source_tree != None and in_place_spec != None:
-        spec_file = source_tree.project(in_place_spec)
+    if in_place_spec != None:
+        # The drivers read an in-place spec from the source tree through `in_place_spec`.
+        spec_file = in_place_spec
+    pinned = None
+    if tree != None and ctx.attrs.in_place_packaging != None:
+        pin = ctx.attrs.in_place_packaging
+        if tree.sources != None and pin not in tree.sources:
+            fail("rpm_package: the source tree contains no in_place_packaging file {}".format(repr(pin)))
+        pinned = pinned_packaging(
+            ctx,
+            base_buildroot,
+            "git-core",
+            ctx.attrs._packaging,
+            tree.sources[pin] if tree.sources != None else tree.path.project(pin),
+            ctx.attrs.in_place_packaging_distro,
+        )
+        spec_file = pinned.project(ctx.attrs.package + ".spec")
     if spec_file == None:
         fail("rpm_package: a regular build requires a spec file")
+    sources = ctx.attrs.srcs
+    if pinned != None:
+        sources = [pinned]
+    elif in_place_spec != None:
+        # The build takes the Source and Patch files from the directory of the spec in the source tree.
+        sources = []
+    # The build and the BuildRequires query parse the spec with the same fields.
+    parse = {
+        "dist": ctx.attrs.dist,
+        "in_place_rpmbuild_options": ctx.attrs.in_place_rpmbuild_options if tree != None else [],
+        "in_place_spec": in_place_spec,
+        # package_build() keeps the build directory of a dev build, because rpm_package passes keep_build_dir.
+        "incremental": configured_dev,
+        "release": ctx.attrs.release,
+        "rpmbuild_options": ctx.attrs.rpmbuild_options,
+        "source_date_epoch": ctx.attrs.source_date_epoch,
+        "sources": sources,
+        "spec_file": spec_file,
+    }
 
-    # Each binary subpackage is a file in one output directory rather than an output of its own. The
-    # build then needs a single writable mount, and the rest of the project stays read-only.
-    subpackages = project.kept_dir(ctx.actions, _PRIVATE + "/subpackages")
-    sub_outputs = {s: subpackages.project(s + ".rpm") for s in ctx.attrs.subpackages}
+    stack = package_buildroot(ctx, "rpm_package", base_buildroot, ctx.attrs.build_requires, ctx.attrs.buildroot_packages)
 
-    build = cmd_args(
-        box_run(box = package_manager.box[BoxInfo], exe = system.build),
-        spec_args(
+    # rpm.branch() derives the buildroot_packages of an imported package from its recorded BuildRequires. A
+    # BuildRequires that only the spec has would install a package of the branch from the repositories, so
+    # an imported package always installs the recorded BuildRequires instead.
+    if not ctx.attrs.imported:
+        buildrequires = _query_buildrequires(
             ctx.actions,
-            "build.spec.json",
-            {
-                "build_dir": build_dir.as_output() if build_dir != None else None,
-                "dist": ctx.attrs.dist,
-                "in_place_rpmbuild_options": ctx.attrs.in_place_rpmbuild_options if source_tree != None else [],
-                # bottom..top: the base lowerdir, then this package's BuildRequires delta
-                "lower": buildroot,
-                "out": rpms.as_output(),
-                "release": ctx.attrs.release,
-                "rpmbuild_options": ctx.attrs.rpmbuild_options,
-                "source_date_epoch": ctx.attrs.source_date_epoch,
-                "source_tree": source_tree,
-                "sources": ctx.attrs.srcs if in_place_spec == None else [],
-                "spec_file": spec_file,
-                "subpackages": ctx.attrs.subpackages,
-                "subpackages_out": subpackages.as_output(),
-            },
-        ),
-    )
-    ctx.actions.run(build, category = "rpmbuild", allow_cache_upload = not ctx.attrs.configured_dev, no_outputs_cleanup = ctx.attrs.configured_dev)
+            box.run(box = base_buildroot.box[box.Info], exe = ctx.attrs._buildrequires),
+            parse,
+            source_tree,
+            stack,
+        )
+        stack = stack + [recipe_snapshot(ctx, "rpm_package", base_buildroot, stack, ctx.attrs.buildroot_packages, buildrequires)]
 
-    sub_targets = {s: [DefaultInfo(default_output = out)] for s, out in sub_outputs.items()}
-    sub_targets["buildroot"] = [DefaultInfo(default_outputs = buildroot)]
-    if build_dir != None:
-        sub_targets["build"] = [DefaultInfo(default_output = build_dir)]
-    return [
-        DefaultInfo(default_output = rpms, sub_targets = sub_targets),
-        LocalPackageInfo(
-            package_system = package_manager.package_system,
-            packages = rpms,
-        ),
-    ]
+    return package_build(
+        ctx,
+        owner = "rpm_package",
+        package_system = ctx.attrs._package_system,
+        base = base_buildroot,
+        stack = stack,
+        configured_dev = configured_dev,
+        keep_build_dir = True,
+        packages = "rpms",
+        subpackages = ctx.attrs.subpackages,
+        category = "rpmbuild",
+        spec = parse | {"source_tree": source_tree, "strict_subpackages": pinned == None},
+    )
 
 _rpm_package = rule(
     impl = _rpm_package_impl,
-    attrs = {
-        "build_requires": attrs.list(
-            attrs.string(),
-            default = [],
-            doc = "the package's BuildRequires, installed as a delta over the shared base buildroot",
-        ),
-        "buildroot": attrs.dep(
-            providers = [BuildrootInfo],
-            doc = "the shared base buildroot",
-        ),
-        "buildroot_deps": attrs.list(
-            attrs.dep(providers = [LocalPackageInfo]),
-            default = [],
-            doc = "our packages whose rpms overlay the buildroot (self-hosted BRs)",
-        ),
-        "configured_dev": attrs.bool(
-            doc = "whether project configuration selects this package for dev mode",
-        ),
+    attrs = PACKAGE_BUILD_ATTRS
+    | {
         "dist": attrs.string(default = ".aos"),
+        "imported": attrs.bool(
+            default = False,
+            doc = "whether build_requires are the BuildRequires that the importer recorded; the build then installs them without querying the spec",
+        ),
         "in_place_rpmbuild_options": attrs.list(
             attrs.string(),
             default = [],
@@ -171,45 +180,63 @@ _rpm_package = rule(
             default = [],
             doc = "extra rpmbuild CLI options (--with=..., --without=..., --define=...)",
         ),
-        "source_date_epoch": attrs.int(doc = "per-package SDE from the changelog"),
-        "source_tree": attrs.option(
-            attrs.source(allow_directory = True),
-            default = None,
-            doc = "a prepared tree built in place instead of running %prep",
-        ),
         "spec": attrs.option(attrs.source(), default = None, doc = "the rpm spec file (derived from `package` by the macro)"),
-        "srcs": attrs.list(attrs.source(), default = [], doc = "Source/Patch files"),
-        "subpackages": attrs.list(
-            attrs.string(),
-            doc = "declared binary subpackage names (the %package list)",
-        ),
+        "_buildrequires": attrs.exec_dep(providers = [RunInfo], default = "tine//package_system/rpm:buildrequires"),
+        "_package_system": attrs.dep(providers = [PackageSystemInfo], default = PACKAGE_SYSTEM),
     },
+    supports_incoming_transition = True,
 )
 
 def rpm_package(
     name: str,
     package: str,
+    source_date_epoch: int,
     spec: str | None = None,
     dev: bool | None = None,
+    in_place_packaging: str | None = None,
+    in_place_packaging_distro: str | Select | None = None,
     in_place_rpmbuild_options: list[str] | None = None,
     in_place_spec: str | None = None,
     source_tree: str | None = None,
+    distro: str | None = None,
+    visibility: list[str] | None = None,
+    target_compatible_with: list[str] | Select | None = None,
     **kwargs,
 ) -> None:
-    """Build an RPM from archives or a prepared Git tree, with a local checkout override."""
-    if source_tree == None:
-        source = name + ".source"
-        populated = git.checkout(name = source)
-        source_tree = ":" + source if populated else None
-    if spec == None and (source_tree == None or in_place_spec == None):
+    """Build an RPM from archives or a prepared Git tree, with a local checkout override.
+
+    `distro` names the distribution of the buildroot's release. The target is then incompatible with an
+    architecture that the release does not serve.
+    """
+    source_tree, configured_dev = package_build_source(
+        "rpm_package",
+        name,
+        source_tree,
+        dev,
+        "in_place_spec",
+        in_place_spec,
+        in_place_packaging,
+        in_place_packaging_distro,
+    )
+    if spec == None and (source_tree == None or (in_place_spec == None and in_place_packaging == None)):
         spec = package + ".spec"
+
+    # Without `distro`, distribution.distributed() would declare an alias for every release of the catalog,
+    # and each alias would build the package on the buildroot of one release for another one. An imported
+    # package names no distribution.
+    distributed = {"target_compatible_with": target_compatible_with, "visibility": visibility}
+    if distro != None:
+        distributed = distribution.distributed(name, distro, visibility, target_compatible_with)
     _rpm_package(
         name = name,
         package = package,
+        source_date_epoch = source_date_epoch,
         spec = spec,
-        configured_dev = project.is_dev(name, source = source_tree, override = dev),
+        configured_dev = configured_dev,
         source_tree = source_tree,
+        in_place_packaging = in_place_packaging,
+        in_place_packaging_distro = in_place_packaging_distro,
         in_place_rpmbuild_options = in_place_rpmbuild_options,
         in_place_spec = in_place_spec,
-        **kwargs,
+        **(distributed | kwargs),
     )

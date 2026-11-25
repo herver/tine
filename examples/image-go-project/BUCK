@@ -8,35 +8,38 @@ it builds. `hello/` plays that checkout.
 """
 
 load("@tine//box:defs.bzl", "box")
+load("@tine//distribution:defs.bzl", "distribution")
 load("@tine//git:defs.bzl", "git")
 load("@tine//go:defs.bzl", "go")
+load("@tine//http:defs.bzl", "http")
 load("@tine//image:defs.bzl", "image")
-load("@tine//package:defs.bzl", "package")
-
-# The build environment for our Go projects; it never reaches an image.
-box.new(
-    name = "go.box",
-    packages = [
-        # TLS trust for the module fetch from proxy.golang.org.
-        "ca-certificates",
-        "golang",
-    ],
-    release = "tine//catalog:fedora.rawhide.release",
-)
+load("//:tine.lock.json", _pins = "value")
 
 # A checked-out project needs no build file of its own: the sources default to the directory named
 # after the target, and the go.mod in them marks the module root.
 go.package(
     name = "hello",
-    box = ":go.box",
     packages = {"hello-cli": "./cmd/hello-cli"},
+    test_packages = ["./..."],
+)
+
+go.test(
+    name = "hello-test",
+    labels = ["image"],
+    package = ":hello",
 )
 
 # A project with no dependencies at all, which therefore commits no go.sum and fetches nothing.
 # Without `packages`, the module's only main package is built under the target's name.
 go.package(
     name = "nodeps",
-    box = ":go.box",
+    test_packages = ["./..."],
+)
+
+go.test(
+    name = "nodeps-test",
+    labels = ["image"],
+    package = ":nodeps",
 )
 
 # The local checkout must override this fetch, so its revision is deliberately a placeholder.
@@ -48,13 +51,11 @@ git.fetch(
 
 go.package(
     name = "renamed",
-    box = ":go.box",
     src = ":nodeps.git",
 )
 
 go.package(
     name = "multiple",
-    box = ":go.box",
     # Force the persistent-cache path for this test; real projects select dev mode with tine mount.
     dev = True,
     packages = {
@@ -64,37 +65,173 @@ go.package(
     src = "nodeps",
 )
 
+# Only the Fedora build box contains a C compiler, so a project that uses cgo adds gcc. Every go.package()
+# that adds the same packages to the same box builds in one shared layer.
+go.package(
+    name = "cgo",
+    buildroot_packages = [
+        "gcc",
+        "pkgconf",
+    ]
+    + distribution.select({
+        "arch": ["zlib"],
+        "debian": [
+            # gcc only recommends the C library headers, and the install skips recommended packages.
+            "libc6-dev",
+            "zlib1g-dev",
+        ],
+        "fedora": ["zlib-ng-compat-devel"],
+    }),
+)
+
+box.sh_test(
+    name = "cgo-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = '[[ "$("$1")" == 42 ]]',
+    args = ["$(location :cgo)"],
+)
+
+go.package(
+    name = "pie",
+    build_mode = "pie",
+    src = "nodeps",
+)
+
+# The ELF header stores the file type as a 16-bit value at offset 16. A PIE binary has type 3 (ET_DYN).
+# A binary linked at a fixed address has type 2 (ET_EXEC). The dev box contains no readelf, so the test reads
+# the value with od.
+box.sh_test(
+    name = "pie-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = '[[ $(od -An -tu2 -j16 -N2 "$1") -eq 3 ]]',
+    args = ["$(location :pie[pie])"],
+)
+
+# This checkout has a go.mod at its root and the server module in server/. The server's go.mod
+# replaces the module in api/ with that directory. The root module does not require the server.
+# Without `module_root`, the build selects the root module, which contains no Go package.
+go.package(
+    name = "siblings",
+    module_root = "server",
+)
+
+box.sh_test(
+    name = "module-root-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = '[[ "$("$1")" == "server using sibling api: "* ]]',
+    args = ["$(location :siblings)"],
+)
+
 box.sh_test(
     name = "packages-test",
     labels = ["image"],
     box = "@tine//tools:dev.box",
     script = 'for binary in "$@"; do [[ "$("$binary")" == "no dependencies here" ]]; done',
-    # $(exe) goes through RunInfo: a single binary is run as the target, any binary as its sub-target.
     args = [
-        "$(exe :nodeps)",
-        "$(exe :renamed)",
-        "$(exe :multiple[first])",
-        "$(exe :multiple[second])",
+        "$(location :nodeps)",
+        "$(location :renamed)",
+        "$(location :multiple[first])",
+        "$(location :multiple[second])",
     ],
 )
 
-package.manager(
-    name = "image.package-manager",
-    base = "tine//catalog:fedora.rawhide.package-manager",
+# go.package runs the toolchain's go inside the box, so Buck downloads the release for the box's
+# architecture.
+http.tool(
+    name = "go",
+    directory = True,
+    path = "bin/go",
+    spec = _pins["go"],
+)
+
+# The box contains no golang package, so the build fails unless go.package runs the toolchain's go.
+box.new(
+    name = "go-toolchain.box",
+    packages = ["ca-certificates"],
+    release = "catalog//:fedora.rawhide.release",
+)
+
+go.package(
+    name = "toolchain",
+    box = ":go-toolchain.box",
+    packages = {"hello-cli": "./cmd/hello-cli"},
+    src = "hello",
+    toolchain = ":go",
+)
+
+# `$(exe :go)` has to bring the whole unpacked release, because go finds its standard library through the
+# directory around bin/go.
+box.sh_test(
+    name = "go-run-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = '[[ "$("$1" version)" == "go version {} "* && -d "$("$1" env GOROOT)/src/runtime" ]]'.format(_pins["go"]["release"]),
+    args = ["$(exe :go)"],
+)
+
+# go writes the version of the toolchain that built a binary into the binary.
+box.sh_test(
+    name = "toolchain-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    test = "@tine//tests:contains.sh",
+    args = [
+        "$(location :toolchain[hello-cli])",
+        _pins["go"]["release"],
+    ],
+)
+
+go.package(
+    name = "go-version",
+    box = ":go-toolchain.box",
+    packages = {"hello-cli": "./cmd/hello-cli"},
+    src = "hello",
+    toolchain = "catalog//:go.releases",
+)
+
+# hello/.go-version names 1.26.8, and the catalog declares a newer Go 1.26 release. The test runs
+# `go version` from `:go`, a Go 1.27 release, to read the release that built the binary. That release is
+# a Go 1.26 release newer than 1.26.8 only if the build read the minor version from hello/.go-version and
+# used the release that the catalog declares for it.
+box.sh_test(
+    name = "go-version-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = 'release=": go1[.]26[.]([0-9]+)$"; [[ "$("$1" version "$2")" =~ $release ]] && (( BASH_REMATCH[1] > 8 ))',
+    args = [
+        "$(exe :go)",
+        "$(location :go-version[hello-cli])",
+    ],
+)
+
+# The go.mod replaces a module with a directory in the checkout, so the fetch reads the go.mod in
+# that directory too.
+go.package(
+    name = "local-replace",
+)
+
+box.sh_test(
+    name = "local-replace-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = '[[ "$("$1")" == "local replacement: "* ]]',
+    args = ["$(location :local-replace)"],
 )
 
 # `:demo[sbom][cyclonedx]` lists the Go modules each binary was built from, next to the image's
 # packages.
-image.rootfs_archive(
+image.archive(
     name = "demo",
-    package_manager = ":image.package-manager",
     # No runtime packages needed: neither project imports anything that pulls in cgo, so both
     # binaries are static. The filesystem skeleton still comes from its package, giving the
     # copies below their place to land.
     packages = ["filesystem"],
     ops = [
-        image.copy(":hello[hello-cli]", "/usr/bin/hello-cli"),
-        image.copy(":nodeps[nodeps]", "/usr/bin/nodeps"),
+        image.ops.copy(":hello[hello-cli]", "/usr/bin/hello-cli"),
+        image.ops.copy(":nodeps[nodeps]", "/usr/bin/nodeps"),
     ],
     format = "tar",
 )

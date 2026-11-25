@@ -4,15 +4,15 @@
 """Run one native package installation against the root its spec names.
 
 Every package system's installer answers the same request: a directory holding the exact package
-closure, and either a fresh root to fill, a delta to persist over a lower stack, or a root the
-caller has already mounted. Which of those it is, and how the root is mounted and captured, is
-the same work whichever system fills it, so it happens here and the driver is left with the
-transaction itself.
+closure, and either a snapshot to capture over lower snapshots, or a root the caller has already
+mounted. Every package system restores and captures the root the same way, so this module does it and
+the driver only runs the transaction.
 """
 
 import os
 import shutil
-from collections.abc import Callable, Iterator
+import tempfile
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict
@@ -21,9 +21,10 @@ import specs
 from util import fail
 
 import rootfs
+import storage
+import uapi16
 
 # A fixed install path avoids embedding Buck hashes and supports scriptlet chroots.
-BUILDROOT = "/buildroot"
 
 MINIMAL_NSSWITCH = """\
 passwd: files
@@ -61,18 +62,21 @@ class InstallSpec(TypedDict):
 
     arch: str
     packages_dir: str
-    # Either an output root, bound at /buildroot to install into, or a root the caller mounted.
-    target: str | None
+    # The install captures the snapshot store `snapshot` over the snapshot stores in `lower`. A
+    # `box.layer()` layer sets only `target`, because no other layer stacks on it. An image layer sets
+    # `installroot` to the root that it mounted instead.
+    snapshot: str | None
     installroot: str | None
     lower: list[str]
-    work: str | None
+    # Only a box install sets `target`, to the directory that the sandbox mounts.
+    target: str | None
     box_config: bool
     langs: list[str]
     docs: bool
 
 
 @contextmanager
-def fresh_machine_id(installroot: Path) -> Iterator[None]:
+def fresh_machine_id(installroot: Path) -> Generator[None]:
     """Leave a fresh root the marker systemd initializes on first boot, and an existing one be."""
     etc = installroot / "etc"
     etc.mkdir(parents=True, exist_ok=True)
@@ -90,11 +94,24 @@ def _configure_box(installroot: Path) -> None:
     """Materialize configuration needed before the box is ever booted."""
     factory_nsswitch = installroot / "usr/share/factory/etc/nsswitch.conf"
     nsswitch = installroot / "etc/nsswitch.conf"
-    if factory_nsswitch.is_file():
+    # authselect makes nsswitch.conf a symlink to the absolute path /etc/authselect/nsswitch.conf.
+    # The installer runs outside the root, so the symlink does not resolve and writing through it
+    # fails with ENOENT. authselect also stops applying profile updates once a file replaces the symlink.
+    if nsswitch.is_symlink():
+        pass
+    elif factory_nsswitch.is_file():
         shutil.copy2(factory_nsswitch, nsswitch)
     elif not nsswitch.is_file():
         # Minimal boxes need not install systemd's factory configuration.
         nsswitch.write_text(MINIMAL_NSSWITCH)
+
+    # Signing actions reach a PKCS#11 token through p11-kit's client module. Each distribution installs
+    # p11-kit-client.so in a different directory. p11-kit looks up a relative module name in its own
+    # module directory, so the relative name works in every box. Without P11_KIT_SERVER_ADDRESS, the
+    # client module provides no token.
+    modules = installroot / "etc/pkcs11/modules"
+    modules.mkdir(parents=True, exist_ok=True)
+    (modules / "p11-kit-client.module").write_text("module: p11-kit-client.so\n")
 
     # Create the mountpoint for the sandbox's resolver bind.
     resolv = installroot / "etc/resolv.conf"
@@ -113,19 +130,23 @@ def _normalize(installroot: Path, spec: InstallSpec) -> None:
     (installroot / "var/cache/ldconfig/aux-cache").unlink(missing_ok=True)
     # from systemd-udev's scriptlet, not meant for images (see systemd docs/BUILDING_IMAGES.md)
     (installroot / "var/lib/systemd/random-seed").unlink(missing_ok=True)
+    # Fedora's archlinux-keyring runs `pacman-key --init` in a scriptlet. The command generates a new
+    # private key on every install. A root that contains the keyring then differs between two builds,
+    # and every action that runs in the root misses the shared cache. tine's pacman drivers keep their
+    # keyring in a directory of their own.
+    shutil.rmtree(installroot / "etc/pacman.d/gnupg", ignore_errors=True)
     if spec["box_config"]:
         _configure_box(installroot)
 
 
 def run(
     prog: str,
-    install: Callable[[Path, Path, InstallSpec, bool], None],
+    install: Callable[[Path, Path, InstallSpec], None],
     argv: list[str] | None = None,
 ) -> None:
-    """Mount the root this invocation names and hand it to `install`.
+    """Install into the root this invocation names and capture the result.
 
-    The callback receives the closure directory, the root to install into, the spec, and whether
-    it is layering over packages a lower stack already carries.
+    The callback receives the closure directory, the root to install into and the spec.
     """
     spec = specs.parse(InstallSpec, prog, argv)
     os.environ.update(
@@ -144,36 +165,50 @@ def run(
 
     # An installer resolves its own paths against the root, so give it no relative ones.
     packages_dir = Path(spec["packages_dir"]).absolute()
-    layered = bool(spec["lower"])
+    lowers = spec["lower"]
 
     if spec["installroot"] is not None:
-        if spec["target"] is not None or layered or spec["work"] is not None:
-            fail(f"{prog}: installroot excludes target, lower, and work")
+        if spec["snapshot"] is not None or spec["target"] is not None or lowers:
+            fail(f"{prog}: installroot excludes snapshot, target and lower")
         installroot = Path(spec["installroot"]).absolute()
-        install(packages_dir, installroot, spec, layered)
+        install(packages_dir, installroot, spec)
         _normalize(installroot, spec)
         return
 
+    if spec["snapshot"] is not None:
+        _install_snapshot(prog, install, packages_dir, spec, Path(spec["snapshot"]))
+        return
     if spec["target"] is None:
-        fail(f"{prog}: one of target and installroot is required")
+        fail(f"{prog}: one of snapshot, target and installroot is required")
+    # No layer stacks on a `box.layer()` layer, so it only needs the directory that the sandbox mounts.
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as scratch:
+        _install_snapshot(prog, install, packages_dir, spec, Path(scratch) / "snapshot")
 
-    # Bind sources must exist.
-    target = Path(spec["target"]).absolute()
-    target.mkdir(parents=True, exist_ok=True)
 
-    if layered:
-        if spec["work"] is None:
-            fail(f"{prog}: lower needs a work overlay directory")
-        root = rootfs.rootfs(
-            BUILDROOT,
-            lowers=spec["lower"],
-            upperdir=target,
-            workdir=Path(spec["work"]).absolute(),
-            apivfs=True,
-        )
+def _install_snapshot(
+    prog: str,
+    install: Callable[[Path, Path, InstallSpec], None],
+    packages_dir: Path,
+    spec: InstallSpec,
+    out: Path,
+) -> None:
+    lowers = spec["lower"]
+    # The closure is empty when the lower snapshots contain every package of the layer, for example in the
+    # buildroot of a package whose spec needs nothing beyond the base root. The package manager then doesn't
+    # run, and the snapshot only repeats the manifest of the snapshot below it.
+    if lowers and not any(packages_dir.iterdir()):
+        (out / "blobs").mkdir(parents=True)
+        shutil.copyfile(Path(lowers[-1]) / uapi16.MANIFEST, out / uapi16.MANIFEST)
     else:
-        root = rootfs.rootfs(BUILDROOT, bind=target, capture_bind=True, apivfs=True)
+        with rootfs.snapshot_root(lowers, out=out, apivfs=True):
+            install(packages_dir, rootfs.BUILDROOT, spec)
+            _normalize(rootfs.BUILDROOT, spec)
 
-    with root:
-        install(packages_dir, Path(BUILDROOT), spec, layered)
-        _normalize(Path(BUILDROOT), spec)
+    if spec["target"] is None:
+        return
+    snapshot = uapi16.Snapshot([*lowers, out])
+    # The sandbox stacks the directories of a box's layers and decodes no whiteouts. A file that a
+    # layer deletes would still show up from the layer below.
+    if deleted := storage.delta(snapshot, len(lowers)):
+        fail(f"{prog}: a box layer cannot delete from the layers below it, but deletes {', '.join(deleted)}")
+    rootfs.write_buck_tree(snapshot, Path(spec["target"]))

@@ -11,8 +11,8 @@ the lock records, and each git dependency as a fetch of exactly the locked commi
 runs offline inside a box, and [`cargo-auditable`](https://crates.io/crates/cargo-auditable) writes the
 crate graph into each binary so the image's SBOM reports those crates beside its packages.
 
-`examples/image-rust-project` is a complete worked example: a builder box, two projects checked out
-beside it, and an image carrying the resulting binaries.
+`examples/image-rust-project` builds two projects checked out beside it and copies their binaries into
+an image.
 
 ## Declaring a build
 
@@ -22,57 +22,74 @@ load("@tine//cargo:defs.bzl", "cargo")
 cargo.package(
     name = "hello",
     binaries = ["hello-cli"],
-    box = ":rust.box",
 )
 ```
 
-- The project's own `Cargo.lock` is picked out of `srcs`; nothing declares it separately. A dynamic
+- The project's own `Cargo.lock` is picked out of `src`; nothing declares it separately. A dynamic
   action reads it once it has been built and declares the fetches it names from there, so the lock can be
   a source file or an artifact another target produced, and the rule takes the same shape either way.
-- `srcs` defaults to `glob(["<name>/**"], exclude = ["<name>/target/**"])`: the checkout is expected in a
-  directory named after the target. Pass `srcs` explicitly when it is called something else. Nothing needs
-  to be added inside the checkout, i.e. a pristine project clone works.
+- `src` defaults to `<name>`: the checkout is expected in a directory named after the target. Pass `src`
+  explicitly when it is called something else. Nothing needs to be added inside the checkout, i.e. a
+  pristine clone of a project that commits its `Cargo.lock` works.
 - Use [`git.fetch()`](git.md) for a project that is not committed to this repository, and pass its work
-  tree as the sole `srcs` entry.
-- At most one of the sources may be a `Cargo.lock`, and its directory is the workspace cargo builds in, so
-  a project vendoring another project's lock has to narrow `srcs`. A project that resolves nothing has no
-  lock to commit; then its sole `Cargo.toml` marks the root instead.
-- `binaries` names what to take out of `target/release`, and at least one is required: a crate that
-  produces no binary has nothing an image could install. These are cargo binary names, which need not
-  match the package. Each becomes a sub-target (`:hello[hello-cli]`), and together they are the target's
-  default outputs. A name that the build does not produce fails the action; only the private name
-  `__tine` is reserved by the rule.
-- `box` is the build environment, declared by the consumer because only the consumer knows what its
-  projects link against.
+  tree as `src`.
+- The outermost `Cargo.lock` in `src` marks the workspace cargo builds in; a lock below it, such as a
+  vendored project's, is never cargo's and is left alone. Two locks side by side name no single
+  workspace, so narrow `src` then.
+- `binaries` names what to take out of `target/<triple>/release`, and at least one is required: a crate that
+  produces no binary has nothing an image could install. These are cargo binary names, which need not match
+  the package. Each becomes a sub-target (`:hello[hello-cli]`), and together they are the target's default
+  outputs. A name that the build does not produce fails the action. A name that is empty, `.` or `..`,
+  contains a slash or a backslash, or is listed twice fails analysis. So does `box`, which names the
+  sub-target that opens the build box.
+- `box` is the build environment. It defaults to `tine//cargo:build.box`, described below.
 
-The binaries are ordinary artifacts, so an image installs one with an `image.copy()` operation:
+The binaries are ordinary artifacts, so an image installs one with an `image.ops.copy()` operation:
 
 ```Starlark
-image.rootfs_archive(
+image.archive(
     name = "demo",
     package_manager = ":image.package-manager",
     packages = ["glibc"],
-    ops = [image.copy(":hello[hello-cli]", "/usr/bin/hello-cli")],
+    ops = [image.ops.copy(":hello[hello-cli]", "/usr/bin/hello-cli")],
     format = "tar",
 )
 ```
 
-## What the builder box needs
+## The build box
+
+`tine//cargo:build.box` contains the distribution's Rust toolchain, `gcc` and `pkgconf`. It installs them
+from the release of the distribution that the binaries are built for, so a binary links against the C
+library of the image that installs it. Like an image, `cargo.package()` builds once for each distribution
+of its package, and `:hello.fedora` names the build for Fedora. See
+[Choosing a distribution](images.md#choosing-a-distribution).
+
+The box is a build environment. It never becomes part of an image.
+
+A crate that wraps a C library needs the library's development package. Add it with `buildroot_packages`:
 
 ```Starlark
-box.new(
-    name = "rust.box",
-    packages = ["cargo", "gcc", "python3", "rust"],
-    release = "tine//catalog:fedora.rawhide.release",
+cargo.package(
+    name = "hello",
+    binaries = ["hello-cli"],
+    buildroot_packages = ["openssl-devel"],
 )
 ```
 
-- `cargo` and `rust` are the toolchain, and `gcc` links. `python3` runs the in-box driver, because
-  tine's drivers execute through the box's own interpreter.
-- Add whatever the project links against. A crate wrapping a C library needs that library's `-devel`
-  package, and on Fedora anything using `pkg-config` also needs `rpm`, because `/usr/bin/pkg-config` is a
-  wrapper that shells out to `rpm --eval`.
-- The box is a build environment. It never becomes part of an image, and the toolchain is not shipped.
+The packages are installed in a layer on top of the box. Every `cargo.package()` that adds the same
+packages to the same box shares that layer. The names are the distribution's own. A project that builds
+for several families picks them with `distribution.select()`.
+
+The build fails when the box's packages and `buildroot_packages` together resolve to other packages than
+the box contains, such as another provider of a library. Then declare a box with all of the packages, and
+pass it as `box`.
+
+`buck run :hello[box]` opens a shell in the box that builds `:hello`, with its `buildroot_packages`
+installed.
+
+To build in a box of your own, pass it as `box`. Its packages need the toolchain, a linker and `python3`,
+which runs tine's driver inside the box. A crate that looks a library up with `pkg-config` also needs
+`pkgconf`, because the build runs `pkgconf` in place of `pkg-config`.
 
 ## Git dependencies
 
@@ -92,28 +109,34 @@ How the crates are pinned, fetched and vendored is described under "Rust source 
 
 - **A project is one cache unit, and reruns are incremental for a `tine mount`.** Any change to its sources
   reruns a single action for the whole project, but cargo's build directory survives between runs, so that
-  action recompiles only what changed. `buck2 clean` is what forces a build from scratch.
+  action recompiles only what changed. `buck clean` is what forces a build from scratch.
 - **A fetched or committed project keeps nothing between runs**. Its build directory never reaches the cache,
   only the final build targets.
 - **Only crates.io registry sources work.** Another registry is rejected with the package named, rather
   than guessed at. A `Cargo.lock` older than version 3 is rejected too: it records no per-package
   checksums.
-- **A project with dependencies must commit its `Cargo.lock`.** This is good practice for a binary crate
-  anyway, for ensuring reproducibility and moving surprise failures from unrelated PRs to
+- **A project must commit its `Cargo.lock`**, even when it has no dependencies. This is good practice for
+  a binary crate anyway, for ensuring reproducibility and moving surprise failures from unrelated PRs to
   dependabot/renovate ones. The build passes `--locked`, so a lock that no longer agrees with `Cargo.toml`
-  fails the build instead of quietly resolving something else. A manifest that declares no dependency
-  table at all needs no lock, because there is nothing to pin and nothing for cargo to resolve; declaring
-  one without committing the lock is refused, naming the table it found.
+  fails the build instead of quietly resolving something else. The build also reads a `Cargo.lock` that git
+  does not track. A local build then passes where a build from a fresh clone fails. For a project from
+  `git.fetch()`, fetch a revision that contains the lock.
 - **The checkout must live in the consuming repository.** A Buck package can only glob its own cell, so a
   project registered as a separate workspace cell would have to carry a build file.
-- **A checkout's own `.cargo/config.toml` is refused.** Cargo would read it ahead of the configuration the
-  build writes; keep it out of `srcs`.
-- **A local `cargo build` inside the checkout needs two things kept apart from Buck.** `target/` must stay
-  out of `srcs`, which the default glob already handles: everything in `srcs` is an action input, so a
-  build tree there would invalidate the cached build and be copied into the sandbox. It must also be added
-  to the `ignore` list in the cell's `.buckconfig` `[project]` section, next to `**/.git` and `**/buck-out`,
-  so that the Buck daemon's file watcher does not track it. Without that entry every local cargo run leaves
-  the daemon thousands of file change events to process before it can answer the next command.
+- **A checkout's own `.cargo/config.toml` is refused**, even one that `.gitignore` excludes. Cargo would read
+  it ahead of the configuration the build writes; keep it out of `src`. A `.cargo/config.toml` or a workspace
+  `Cargo.toml` elsewhere in the consuming repository does not affect the build.
+- **A build script cannot write beside its sources.** The build mounts the sources read-only, so a
+  `build.rs` that writes outside `OUT_DIR` fails with a read-only file system error (`EROFS`). Cargo's
+  documentation says that a build script should write only into `OUT_DIR`. The vendored crates.io
+  dependencies are read-only too, so update or patch a dependency whose build script writes into its
+  sources. A git dependency is checked out into a writable directory, so its build script can write
+  beside its sources.
+- **A local `cargo build` inside the checkout needs `target/` in `.gitignore`**. `tine init` writes it when
+  it creates the `.gitignore`. If your project already had a `.gitignore`, add `target/` yourself. Buck
+  reads every file that Git does not ignore as a source. While Git does not ignore `target/`,
+  `cargo.package()` fails and names the directory. The build skips an ignored `target/` when it looks
+  for the project's `Cargo.lock`.
 - **A cold daemon wants the network even when every crate is already cached**, because Buck asks the
   registry for sizes the lock does not record.
 - **Two projects sharing a crate download it twice.** Each project owns its downloads, and content-based

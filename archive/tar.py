@@ -3,52 +3,63 @@
 
 """Deterministic tar archives.
 
-Entries are written in sorted order with ownership normalized to uid/gid 0 and mtimes clamped to
-the build's epoch, so the same tree packs to the same bytes on any machine.
+Entries are written in manifest order with ownership normalized to uid/gid 0, so the same tree packs to
+the same bytes on any machine. pack_manifest() keeps the modification times of the objects, which the
+listing of the tree or the capture of the snapshot clamped to the build's epoch.
 """
 
-import os
 import tarfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-
-def _xattrs(path: Path) -> dict[str, str]:
-    """Encode Linux xattrs using the convention understood by GNU tar and star."""
-    headers = {}
-    for name in sorted(os.listxattr(path, follow_symlinks=False)):
-        if name.startswith(("user.overlay.", "trusted.overlay.")):
-            continue
-        value = os.getxattr(path, name, follow_symlinks=False)
-        headers["SCHILY.xattr." + name] = value.decode("utf-8", "surrogateescape")
-    return headers
+import uapi16
 
 
-def _reproducible(path: Path, epoch: int) -> Callable[[tarfile.TarInfo], tarfile.TarInfo]:
-    """Return a tar filter that normalizes ownership, mtimes, and extended attributes."""
-
-    def reset(info: tarfile.TarInfo) -> tarfile.TarInfo:
-        info.uid = info.gid = 0
-        info.uname = info.gname = ""
-        info.mtime = min(int(info.mtime), epoch)
-        info.pax_headers = dict(info.pax_headers) | _xattrs(path)
-        return info
-
-    return reset
+def pack_tree(tree: Path, out: Path, epoch: int) -> None:
+    """Pack a whole tree into `out`, with modification times clamped to `epoch`."""
+    objects = uapi16.tree_objects(tree, list(uapi16.entries(tree)), epoch=epoch)[1:]
+    pack_manifest(objects, lambda obj: tree / obj["name"], out)
 
 
-def pack_tree(tree: Path, out: Path, epoch: int) -> int:
-    """Pack a whole tree into `out`."""
-    tree = Path(tree)
-    count = 0
-    # Explicit sorted entries keep archive order stable.
+def pack_manifest(
+    objects: Sequence[uapi16.Object],
+    content: Callable[[uapi16.Object], Path],
+    out: Path,
+) -> None:
+    kinds = {
+        "reg": tarfile.REGTYPE,
+        "dir": tarfile.DIRTYPE,
+        "lnk": tarfile.SYMTYPE,
+        "chr": tarfile.CHRTYPE,
+        "blk": tarfile.BLKTYPE,
+        "fifo": tarfile.FIFOTYPE,
+    }
+    groups = uapi16.hardlink_groups(objects)
     with tarfile.open(out, "w", format=tarfile.PAX_FORMAT) as archive:
-        for path in sorted(tree.rglob("*")):
-            archive.add(
-                path,
-                arcname="./" + str(path.relative_to(tree)),
-                recursive=False,
-                filter=_reproducible(path, epoch),
-            )
-            count += 1
-    return count
+        for obj in objects:
+            kind = obj["type"]
+            info = tarfile.TarInfo("./" + obj["name"] if "name" in obj else ".")
+            info.type = kinds[kind]
+            info.mode = 0o777 if kind == "lnk" else obj["mode"]
+            headers: dict[str, str] = {}
+            ns = obj["mTimeNSec"]
+            info.mtime = ns // 10**9
+            if ns % 10**9:
+                headers["mtime"] = f"{ns // 10**9}.{ns % 10**9:09}"
+            info.devmajor, info.devminor = obj.get("major", 0), obj.get("minor", 0)
+            for name, value in obj.get("extendedAttributes", {}).get("user", {}).items():
+                data = uapi16.xattr_value(value)
+                headers["SCHILY.xattr.user." + name] = data.decode("utf-8", "surrogateescape")
+            info.pax_headers = headers
+            token = obj.get("inodeToken")
+            if token and groups[token][0] != obj["name"]:
+                info.type, info.linkname = tarfile.LNKTYPE, "./" + groups[token][0]
+            elif kind == "lnk":
+                info.linkname = uapi16.symlink_target(obj)
+            elif kind == "reg":
+                info.size = obj["size"]
+            if info.isreg():
+                with content(obj).open("rb") as stream:
+                    archive.addfile(info, stream)
+            else:
+                archive.addfile(info)

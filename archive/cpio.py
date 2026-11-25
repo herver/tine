@@ -10,11 +10,13 @@ different terminal format.
 import mmap
 import os
 import stat
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, Self
 
 import util
+
+import uapi16
 
 # What an archive is read from, spelled concretely because the reader slices it: an mmap and a
 # `bytes` both hand back `bytes`, where the `Buffer` protocol promises no indexing at all.
@@ -23,6 +25,7 @@ type Source = mmap.mmap | bytes
 MAGIC = b"070701"
 TRAILER = "TRAILER!!!"
 _HEADER = 110  # 6-byte magic + 13 * 8-hex fields
+_HEX_DIGITS = b"0123456789abcdefABCDEF"
 # Fixed alignment keeps bytes reproducible across filesystems.
 _BLOCK = 4096
 # A newc name is a full path, so the kernel's initramfs unpacker bounds the namesize field by
@@ -81,7 +84,12 @@ def read(source: Source, start: int = 0) -> Iterator[Entry]:
             raise ValueError(f"bad cpio magic at {off}: {source[off : off + 6]!r}")
         # 13 8-hex fields: ino, mode, uid, gid, nlink, mtime, filesize, devmajor, devminor,
         # rdevmajor, rdevminor, namesize, check.
-        f = [int(source[off + 6 + i * 8 : off + 6 + (i + 1) * 8], 16) for i in range(13)]
+        header = source[off + 6 : off + _HEADER]
+        # int() also accepts a sign, blanks and underscores. A negative filesize can point the next
+        # header offset back at this header, and the reader then loops forever.
+        if len(header) != _HEADER - 6 or header.strip(_HEX_DIGITS):
+            raise ValueError(f"bad cpio header at {off}: {header!r}")
+        f = [int(header[i * 8 : (i + 1) * 8], 16) for i in range(13)]
         ino, mode, nlink, filesize, devmajor, devminor, namesize = (
             f[0], f[1], f[4], f[6], f[7], f[8], f[11],
         )  # fmt: skip
@@ -139,13 +147,12 @@ def _extract(source: Source, dest: Path, src_fd: int, start: int) -> int:
         if fmt == 0o040000:  # directory
             # The mode a package ships a directory with is deliberately not applied: this runs once
             # per archive into one tree, and a later archive still has to write into a directory an
-            # earlier one declared unwritable. `rootfs.capture` settles directory modes once
-            # everything is in place.
+            # earlier one declared unwritable. The Buck tree of stage1 gives every directory mode 0755.
             target.mkdir(parents=True, exist_ok=True)
         elif fmt == 0o120000:  # symlink (last-writer-wins across multi-archive extracts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.unlink(missing_ok=True)
-            target.symlink_to(e.target.decode())
+            target.symlink_to(os.fsdecode(e.target))
         elif fmt == 0o100000:  # regular file
             _put_regular(target, e, src_fd)
         else:  # device/fifo/socket
@@ -157,10 +164,13 @@ def _extract(source: Source, dest: Path, src_fd: int, start: int) -> int:
                 _hardlink(link, target)
                 count += 1
     for links in pending.values():  # a fully-empty hardlink set has no content carrier
-        for target, mode in links:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"")
-            target.chmod(mode & 0o7777)
+        first, mode = links[0]
+        first.parent.mkdir(parents=True, exist_ok=True)
+        first.write_bytes(b"")
+        first.chmod(mode & 0o7777)
+        count += 1
+        for target, _ in links[1:]:
+            _hardlink(target, first)
             count += 1
     return count
 
@@ -191,6 +201,7 @@ class Writer:
         self._epoch = epoch
         self._pos = 0
         self._ino = 0
+        self._links: dict[int, tuple[int, int]] = {}
         # Alignment pads the name field, and the kernel's early cpio reader (lib/earlycpio.c) refuses
         # an entry whose name field exceeds its 18-byte name buffer, so an archive it reads before
         # unpacking anything, microcode, is written without.
@@ -215,8 +226,22 @@ class Writer:
         if pad := (-self._pos) % align:
             self._write(b"\x00" * pad)
 
-    def _header(self, name: str, mode: int, filesize: int, *, mtime: int, block_align: bool) -> None:
+    def _header(
+        self,
+        name: str,
+        mode: int,
+        filesize: int,
+        *,
+        mtime: int,
+        block_align: bool,
+        ino: int | None = None,
+        nlink: int = 1,
+        major: int = 0,
+        minor: int = 0,
+    ) -> None:
         self._ino += 1
+        if name == TRAILER:
+            name = "./" + name
         raw = name.encode()
         namesize = len(raw) + 1  # name + its NUL terminator
         if block_align:
@@ -225,21 +250,75 @@ class Writer:
             padded = _roundup(self._pos + _HEADER + namesize, _BLOCK) - (self._pos + _HEADER)
             if padded <= _PATH_MAX:
                 namesize = padded
-        fields = (self._ino, mode, 0, 0, 1, min(mtime, self._epoch), filesize, 0, 0, 0, 0, namesize, 0)
+        fields = (
+            self._ino if ino is None else ino,
+            mode,
+            0,
+            0,
+            nlink,
+            min(mtime, self._epoch),
+            filesize,
+            0,
+            0,
+            major,
+            minor,
+            namesize,
+            0,
+        )
         self._write(MAGIC + b"".join(b"%08x" % v for v in fields))
         self._write(raw + b"\x00" * (namesize - len(raw)))
         self._pad(4)
 
+    def _link(self, link: tuple[int, int] | None) -> tuple[int | None, int, int]:
+        if link is None:
+            return None, 1, 1
+        token, nlink = link
+        ino, remaining = self._links.get(token, (self._ino + 1, nlink))
+        self._links[token] = (ino, remaining - 1)
+        return ino, nlink, remaining
+
     def add_dir(self, name: str, *, mode: int, mtime: int) -> None:
         self._header(name, stat.S_IFDIR | (mode & 0o7777), 0, mtime=mtime, block_align=False)
 
-    def add_symlink(self, name: str, target: str, *, mtime: int) -> None:
-        data = target.encode()
-        self._header(name, stat.S_IFLNK | 0o777, len(data), mtime=mtime, block_align=False)
+    def add_symlink(
+        self, name: str, target: str, *, mtime: int, link: tuple[int, int] | None = None
+    ) -> None:
+        ino, nlink, _ = self._link(link)
+        data = os.fsencode(target)
+        self._header(
+            name, stat.S_IFLNK | 0o777, len(data), mtime=mtime, block_align=False, ino=ino, nlink=nlink
+        )
         self._write(data)
         self._pad(4)
 
-    def add_file(self, name: str, src: Path, *, mode: int, mtime: int) -> None:
+    def add_node(
+        self,
+        name: str,
+        *,
+        mode: int,
+        mtime: int,
+        major: int = 0,
+        minor: int = 0,
+        link: tuple[int, int] | None = None,
+    ) -> None:
+        ino, nlink, _ = self._link(link)
+        self._header(
+            name, mode, 0, mtime=mtime, block_align=False, major=major, minor=minor, ino=ino, nlink=nlink
+        )
+
+    def add_file(
+        self,
+        name: str,
+        src: Path,
+        *,
+        mode: int,
+        mtime: int,
+        link: tuple[int, int] | None = None,
+    ) -> None:
+        ino, nlink, remaining = self._link(link)
+        if remaining > 1:
+            self._header(name, stat.S_IFREG | mode, 0, mtime=mtime, block_align=False, ino=ino, nlink=nlink)
+            return
         fd = os.open(src, os.O_RDONLY)
         try:
             size = os.fstat(fd).st_size
@@ -249,6 +328,8 @@ class Writer:
                 size,
                 mtime=mtime,
                 block_align=self._block_align and size >= _BLOCK,
+                ino=ino,
+                nlink=nlink,
             )
             util.copy_range(self._fd, self._pos, fd, 0, size)
             self._pos += size
@@ -268,41 +349,56 @@ class Writer:
         self._fd = -1
 
 
-def _add(w: Writer, tree: Path, path: Path) -> bool:
-    """Add one path under `tree`; false for a type an initramfs has no use for."""
-    st = path.lstat()
-    name = str(path.relative_to(tree))
-    mode = stat.S_IMODE(st.st_mode)
-    mtime = int(st.st_mtime)
-    if stat.S_ISDIR(st.st_mode):
-        w.add_dir(name, mode=mode, mtime=mtime)
-    elif stat.S_ISLNK(st.st_mode):
-        w.add_symlink(name, os.readlink(path), mtime=mtime)
-    elif stat.S_ISREG(st.st_mode):
-        w.add_file(name, path, mode=mode, mtime=mtime)
-    else:
-        return False  # devices/fifos/sockets: unneeded in an initramfs (systemd mounts /dev)
-    return True
+def pack_tree(tree: Path, out: Path, epoch: int) -> None:
+    """Pack a whole tree into `out` without block alignment, which the kernel's early cpio reader needs."""
+    _pack_entries(tree, out, epoch, list(uapi16.entries(tree)), block_align=False)
 
 
-def pack_tree(tree: Path, out: Path, epoch: int, *, block_align: bool = True) -> int:
-    """Pack a whole tree into `out`."""
-    tree = Path(tree)
-    count = 0
-    with Writer(out, epoch, block_align=block_align) as w:
-        for path in sorted(tree.rglob("*")):
-            count += _add(w, tree, path)
-    return count
-
-
-def pack_paths(tree: Path, out: Path, epoch: int, paths: Iterable[str | PurePath]) -> int:
+def pack_paths(tree: Path, out: Path, epoch: int, paths: Iterable[str | PurePath]) -> None:
     """Pack exactly the given tree-relative paths into `out`.
 
     Sorting is what puts a directory before its contents, which the kernel's unpacker needs.
     """
-    tree = Path(tree)
-    count = 0
-    with Writer(out, epoch) as w:
-        for rel in sorted({PurePosixPath(path) for path in paths}):
-            count += _add(w, tree, tree / rel)
-    return count
+    names = sorted({PurePosixPath(path) for path in paths})
+    found = [uapi16.Entry(str(name), tree / name, (tree / name).lstat()) for name in names]
+    _pack_entries(tree, out, epoch, found)
+
+
+def _pack_entries(
+    tree: Path, out: Path, epoch: int, found: Sequence[uapi16.Entry], *, block_align: bool = True
+) -> None:
+    objects = uapi16.tree_objects(tree, found, epoch=epoch)[1:]
+    pack_manifest(objects, lambda obj: tree / obj["name"], out, epoch, block_align=block_align)
+
+
+def pack_manifest(
+    objects: Sequence[uapi16.Object],
+    content: Callable[[uapi16.Object], Path],
+    out: Path,
+    epoch: int,
+    *,
+    block_align: bool = True,
+) -> None:
+    groups = uapi16.hardlink_groups(objects)
+    kinds = {"fifo": stat.S_IFIFO, "chr": stat.S_IFCHR, "blk": stat.S_IFBLK, "sock": stat.S_IFSOCK}
+    with Writer(out, epoch, block_align=block_align) as w:
+        for obj in objects:
+            kind = obj["type"]
+            name, mtime = obj.get("name", "."), obj["mTimeNSec"] // 10**9
+            token = obj.get("inodeToken")
+            link = (token, len(groups[token])) if token else None
+            if kind == "reg":
+                w.add_file(name, content(obj), mode=obj["mode"], mtime=mtime, link=link)
+            elif kind == "dir":
+                w.add_dir(name, mode=obj["mode"], mtime=mtime)
+            elif kind == "lnk":
+                w.add_symlink(name, uapi16.symlink_target(obj), mtime=mtime, link=link)
+            else:
+                w.add_node(
+                    name,
+                    mode=kinds[kind] | obj["mode"],
+                    mtime=mtime,
+                    major=obj.get("major", 0),
+                    minor=obj.get("minor", 0),
+                    link=link,
+                )

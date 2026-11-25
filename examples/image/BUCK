@@ -3,7 +3,7 @@
 
 """Image construction smoke targets.
 
-Every image here is declared once and built for each distribution the PACKAGE file declares. What
+Every image here is declared once and built for each release in `catalog//:releases.bzl`. What
 varies is the package manager, chosen by a `select()` on the distribution constraint, and the
 package sets that manager resolves; the operations themselves are the same either way. No
 distribution is the default, so what a build names is one of the per-distribution aliases each
@@ -13,22 +13,17 @@ image rule declares for itself.
 load("@tine//box:defs.bzl", "box")
 load("@tine//distribution:defs.bzl", "distribution")
 load("@tine//image:defs.bzl", "image")
-load("@tine//package:defs.bzl", "package")
-load("@tine//platforms:architecture.bzl", "ARCHITECTURES", "architecture")
-load("@tine//python:defs.bzl", "box_python_binary")
+load("@tine//platform:architecture.bzl", "architecture")
+load("@tine//python:defs.bzl", "python")
 load("@tine//tests:defs.bzl", "tests")
 load(":expected.json", _expected = "value")
 
-# Everything a distribution decides is described in the PACKAGE file, which is the one place a
-# distribution is added; nothing below names one.
+# The catalog lists the releases in catalog//:releases.bzl. A release added there also gets images
+# here, and no target below names a release.
 DISTRIBUTIONS = distribution.for_package()
 
-# Consumer-owned solve context; project repositories can be added here. Which release it derives
-# from is the one thing a distribution decides for an image, so it is the only select below.
-package.manager(
-    name = "image.package-manager",
-    base = distribution.select({name: d["package_manager"] for name, d in DISTRIBUTIONS.items()}),
-)
+# A test that checks only the Fedora images builds for Fedora, so that it runs in a box of the Fedora release.
+_FEDORA = DISTRIBUTIONS["fedora"]["distribution"]
 
 # A build artifact a command names through $(location), chrooted or not.
 export_file(
@@ -57,26 +52,26 @@ export_file(
 )
 
 # Minimal install + ordered-ops demo. `:demo` is both the tar result and a logical image.
-image.rootfs_archive(
+image.archive(
     name = "demo",
-    package_manager = ":image.package-manager",
     packages = ["bash", "coreutils"]
     # Some extra coverage for distribution.select().
     + distribution.select({
+        "DEFAULT": [],
         "arch": ["archlinux-keyring"],
         "fedora": ["fedora-gpg-keys"],
     }),
     ops = [
-        image.run(["/usr/bin/mkdir", "-p", "/buildroot/etc/tine"]),
-        image.run(["/usr/bin/cp", "$(location :marker.txt)", "/buildroot/etc/tine/from-location"]),
-        # image.copy() takes a source directly, so it needs no $(location) around the label.
-        image.copy(":marker.txt", "/etc/tine/from-copy"),
+        image.ops.run(["/usr/bin/mkdir", "-p", "/buildroot/etc/tine"]),
+        image.ops.run(["/usr/bin/cp", "$(location :marker.txt)", "/buildroot/etc/tine/from-location"]),
+        # image.ops.copy() takes a source directly, so it needs no $(location) around the label.
+        image.ops.copy(":marker.txt", "/etc/tine/from-copy"),
         # A chrooted command runs with the image's own binaries. Buck's macro parser claims
         # `$(...)`, so the shell substitution is escaped.
-        image.run(["/usr/bin/bash", "-c", "echo built-by-\\$(echo tine) > /etc/tine/marker"], chroot = True),
+        image.ops.run(["/usr/bin/bash", "-c", "echo built-by-\\$(echo tine) > /etc/tine/marker"], chroot = True),
         # A repository-owned script, run inside the image. The project is mounted there, so
         # `$(location)` names the script and its data exactly as it would outside.
-        image.run(
+        image.ops.run(
             [
                 "/usr/bin/bash",
                 "$(location :configure.sh)",
@@ -86,31 +81,29 @@ image.rootfs_archive(
             chroot = True,
         ),
         # The same, in python, which this image does not install: the interpreter is Buck's own.
-        image.python(["$(location :configure.py)", "$(location :marker.txt)", "from-python-argument"], chroot = True),
+        image.ops.python(["$(location :configure.py)", "$(location :marker.txt)", "from-python-argument"], chroot = True),
         # Unchrooted, the same interpreter sees the image at /buildroot, like any box command.
-        image.python(["-c", "from pathlib import Path; Path('/buildroot/etc/tine/from-python-box').write_text('x\\n')"]),
+        image.ops.python(["-c", "from pathlib import Path; Path('/buildroot/etc/tine/from-python-box').write_text('x\\n')"]),
         # Ensure we don't leak the /tine sandbox mount into image builds
-        image.run(["/usr/bin/test", "!", "-d", "/tine"], chroot = True),
+        image.ops.run(["/usr/bin/test", "!", "-d", "/tine"], chroot = True),
     ],
     format = "tar",
 )
 
-# Base-only image exercising a single-component delta stack.
-image.rootfs_archive(
+# An image with a single layer.
+image.archive(
     name = "base",
-    package_manager = ":image.package-manager",
     packages = ["bash"],
     format = "tar",
 )
 
-# Chained images: the child adds one file and whiteouts another.
+# The child image adds one file and removes a file of its parent.
 image.layer(
     name = "chained-base",
-    package_manager = ":image.package-manager",
     packages = ["bash", "coreutils"],
     ops = [
-        image.write_file("/etc/tine/from-base-kept", "base"),
-        image.write_file("/etc/tine/from-base-gone", "base"),
+        image.ops.write_file("/etc/tine/from-base-kept", "base"),
+        image.ops.write_file("/etc/tine/from-base-gone", "base"),
     ],
 )
 
@@ -118,24 +111,23 @@ image.layer(
     name = "chained-child.layer",
     parent = ":chained-base",
     ops = [
-        image.write_file("/etc/tine/from-child", "child"),
-        image.remove("/etc/tine/from-base-gone"),
+        image.ops.write_file("/etc/tine/from-child", "child"),
+        image.ops.remove("/etc/tine/from-base-gone"),
     ],
 )
 
 image.archive(
     name = "chained",
-    image = ":chained-child.layer",
+    parent = ":chained-child.layer",
     format = "tar",
 )
 
-# Package installation and mutations sharing one physical delta.
+# One layer installs packages and runs commands.
 image.layer(
     name = "layered-install-base",
-    package_manager = ":image.package-manager",
     packages = ["bash"],
     ops = [
-        image.run(["/usr/bin/bash", "-c", "echo base > /etc/from-base-install"], chroot = True),
+        image.ops.run(["/usr/bin/bash", "-c", "echo base > /etc/from-base-install"], chroot = True),
     ],
 )
 
@@ -144,28 +136,28 @@ image.layer(
     parent = ":layered-install-base",
     packages = ["coreutils"],
     ops = [
-        image.run(["/usr/bin/bash", "-c", "ls /usr/bin/ls > /etc/from-child-install"], chroot = True),
+        image.ops.run(["/usr/bin/bash", "-c", "ls /usr/bin/ls > /etc/from-child-install"], chroot = True),
     ],
 )
 
 image.archive(
     name = "layered-install",
-    image = ":layered-install.layer",
+    parent = ":layered-install.layer",
     format = "tar",
 )
 
-# Round-trip an escaped name and an escaped whiteout through stored deltas.
+# The child layer removes a file with a backslash in its name, replaces a populated directory and
+# turns a directory into a file. replaced-test checks that the archive and the manifest of the child
+# contain only the child's view of these paths.
 image.layer(
-    name = "escaped-base",
-    package_manager = ":image.package-manager",
+    name = "replaced-base",
     packages = ["bash", "coreutils"],
     ops = [
-        image.mkdir("/etc/tine"),
-        image.run(
+        image.ops.run(
             [
                 "/usr/bin/bash",
                 "-c",
-                "echo kept > '/etc/tine/esc\\x2dkept'; echo gone > '/etc/tine/esc\\x2dgone'",
+                "mkdir -p /etc/tine/sub /etc/tine/dir; echo kept > '/etc/tine/esc\\x2dkept'; echo gone > '/etc/tine/esc\\x2dgone'; echo old > /etc/tine/sub/old; echo x > /etc/tine/dir/x",
             ],
             chroot = True,
         ),
@@ -173,15 +165,33 @@ image.layer(
 )
 
 image.layer(
-    name = "escaped-child.layer",
-    parent = ":escaped-base",
-    ops = [image.remove("/etc/tine/esc\\x2dgone")],
+    name = "replaced.layer",
+    parent = ":replaced-base",
+    ops = [
+        image.ops.remove("/etc/tine/esc\\x2dgone"),
+        image.ops.remove("/etc/tine/sub"),
+        image.ops.run(["/usr/bin/bash", "-c", "mkdir /etc/tine/sub; echo new > /etc/tine/sub/fresh"], chroot = True),
+        image.ops.remove("/etc/tine/dir"),
+        image.ops.write_file("/etc/tine/dir", "file"),
+    ],
 )
 
 image.archive(
-    name = "escaped",
-    image = ":escaped-child.layer",
+    name = "replaced",
+    parent = ":replaced.layer",
     format = "tar",
+)
+
+box.sh_test(
+    name = "replaced-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    test = "replaced-test.sh",
+    args = [
+        "$(location :replaced)",
+        "$(location :replaced.layer[manifest])",
+    ],
+    distro = _FEDORA,
 )
 
 # Bootable GPT image; `buck run :boot-demo-vm` starts it with the box's vmspawn stack.
@@ -189,9 +199,8 @@ image.archive(
 # The version stamps os-release, partition labels, and the UKI and disk file names. A product names
 # one here, or asks for a git-derived one with `version = "auto:1.4.2"`, which needs a build through
 # `bin/tine` (see "Image versioning" in images.md); this demo has nothing to version.
-image.bootable_disk(
+image.disk(
     name = "boot-demo",
-    package_manager = ":image.package-manager",
     definitions = image.DEFAULT_USR_VERITY_PARTITIONS,
     version = "unversioned",
     # The release names what a bootable system of its own family needs, so this stays symbolic.
@@ -203,10 +212,24 @@ image.bootable_disk(
     + architecture.select({
         "arm64": [],
         "x86_64": distribution.select({
+            "DEFAULT": [],
             "arch": ["amd-ucode", "intel-ucode"],
             "fedora": ["amd-ucode-firmware", "microcode_ctl"],
         }),
-    }),
+    })
+    # Only Arch's systemd package contains portablectl.
+    + distribution.select({"DEFAULT": ["systemd-container"], "arch": []}),
+    ops = [
+        # systemd-confext mounts /etc read-only by default. This image writes /etc at boot, and
+        # login fails with "PAM failure, aborting" once a confext is merged.
+        image.ops.write_file("/usr/lib/systemd/confext.conf.d/10-mutable.conf", "[ConfExt]\nMutable=ephemeral\n"),
+        # The ESP partition of the layout copies /boot of the image. The disk therefore contains
+        # this file on its ESP.
+        image.ops.copy(":demo[sbom][spdx]", "/boot/metadata/demo.spdx.json"),
+    ],
+    # systemd-stub only trusts unsigned addons on first use when the booted profile sets TOFU=. The first boot
+    # of a profile with the token records the addons for every profile with the token.
+    profile_fields = {"TOFU": "dev.tine.example"},
     profiles = [
         image.uki_profile(
             id = "debug",
@@ -214,17 +237,15 @@ image.bootable_disk(
             cmdline = ["debug", "systemd.log_level=debug", "systemd.journald.forward_to_console=1"],
         ),
     ],
-    # Arbitrary declared artifacts can be shipped through the ESP.
-    esp_files = {"/boot/metadata/demo.spdx.json": ":demo[sbom][spdx]"},
     # An absolute path names a BMP the image itself ships, here the one Arch's systemd package
     # installs; the other distributions ship no BMP and embed none.
-    splash = distribution.select({"arch": "/usr/share/systemd/bootctl/splash-arch.bmp"}, default = None),
+    splash = distribution.select({"DEFAULT": None, "arch": "/usr/share/systemd/bootctl/splash-arch.bmp"}),
     # A shipped appliance has no terminal to read a man page on.
     install_docs = False,
-    # Ship the disk with free space past its partitions, so an installed system can claim it without
-    # resizing the medium first. The space is sparse and this image boots from tmpfs, so nothing here
-    # consumes it; a real appliance creates a root partition in it on first boot.
-    output_size = "2G",
+    # Ship the qcow2 with free space past its partitions, so a VM booting it can claim it without
+    # resizing the disk first. This image boots from tmpfs, so nothing here consumes it; a real
+    # appliance creates a root partition in it on first boot.
+    virtual_size = "2G",
 )
 
 image.vm(
@@ -237,11 +258,9 @@ image.vm(
         "firstboot.locale": "C.UTF-8",
         "firstboot.timezone": "UTC",
     },
-    # The runner's box is independent of the image's, so every distribution boots under the
-    # same harness and the VM stack is built once rather than per release.
-    box = "tine//catalog:fedora.rawhide.box",
     image = ":boot-demo",
-    sysexts = [":demo-ext"],
+    extensions = [":demo-confext", ":demo-ext"],
+    portables = [":demo-portable", ":demo-portable-ext"],
 )
 
 # Boot smoke test: drives :boot-demo-vm's console over a pty (via the shared tine driver),
@@ -255,29 +274,258 @@ tests.vm_smoke(
         # build produced rather than the `/etc` symlink to it: a `/usr`-only disk boots with a
         # volatile root, and whether anything recreates that symlink is a property of the
         # distribution's own systemd rather than of the image.
-        distribution.select({name: "grep -q '^ID={}$' /usr/lib/os-release".format(d["os_release_id"]) for name, d in DISTRIBUTIONS.items()}),
+        # Each family's os-release ID is the family's name.
+        distribution.select({name: "grep -q '^ID={}$' /usr/lib/os-release".format(name) for name in distribution.FAMILIES}),
         "bootctl | grep -F 'Secure Boot: disabled (setup)'",
         # The build compiled the hardware database into /usr, which is read-only here, so a guest
         # that has it got it from the build rather than from a boot-time regeneration.
         "test -s /usr/lib/udev/hwdb.bin",
         # The runner's cmdline_extra reached the kernel the UKI booted.
         "grep -q tine.smoke=1 /proc/cmdline",
-        # The guest sees the disk at its output_size, and the partitions it boots from still
-        # occupy only the front of it.
-        "test $(blockdev --getsize64 /dev/vda) -eq 2147483648",
+        # The initrd carries networkd for IMDS, which is inert on a non-cloud VM.
+        '[ -z "$(journalctl -b -q _RUNTIME_SCOPE=initrd _SYSTEMD_UNIT=systemd-networkd.service)" ]',
+        # systemd-sysext and systemd-confext merged the extensions the runner binds in at boot.
+        "test -x /usr/bin/zsh",
+        "test -f /etc/tine/from-confext",
+        "touch /etc/tine/written-after-merge",
+        # portabled checks the extension-release files of demo-portable-ext against the os-release
+        # of demo-portable.
+        "portablectl attach --now --runtime --extension demo-portable-ext demo-portable",
+        "portablectl is-attached --extension demo-portable-ext demo-portable",
+        "systemctl is-active demo-portable.service",
+        # Without demo-portable-ext, demo-portable.service fails. This shows that the files came
+        # from the extension.
+        "portablectl detach --now --runtime --extension demo-portable-ext demo-portable",
+        "portablectl attach --runtime demo-portable",
+        "! systemctl start demo-portable.service",
     ],
 )
 
-# System-extension DDI extending :boot-demo: only the delta above the base lands in the
-# image, and its extension-release pins the base's ID/VERSION_ID. `boot-demo-vm` exposes
-# it under /var/lib/extensions.
-image.sysext_image(
+# The qcow2 and vmdk describe a disk of the image's virtual_size with the raw's content, while the raw stays
+# as small as its partitions.
+box.sh_test(
+    name = "virtual-size-test",
+    labels = ["image"],
+    box = "tine//distribution:tools.box",
+    script = """
+raw=$1
+shift
+test "$(stat -c %s "$raw")" -lt $((900 << 20))
+for disk in "$@"; do
+    test "$(qemu-img info --output=json "$disk" | python3 -c 'import json, sys; print(json.load(sys.stdin)["virtual-size"])')" = 2147483648
+    qemu-img compare -q -f raw "$raw" "$disk"
+done
+""",
+    args = ["$(location :boot-demo.fedora)", "$(location :boot-demo.fedora[qcow2])", "$(location :boot-demo.fedora[vmdk])"],
+    distro = _FEDORA,
+)
+
+# The AMI parameters register the disk for the image's architecture with a root volume of its virtual_size.
+box.sh_test(
+    name = "ami-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = """
+python3 -c '
+import json, sys
+register = json.load(open(sys.argv[1]))
+assert register["Architecture"] == sys.argv[2], register
+assert register["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"] == 2, register
+' "$@"
+""",
+    args = ["$(location :boot-demo.fedora[ami])"] + architecture.select({name: [spellings.ec2] for name, spellings in architecture.ARCHITECTURES.items()}),
+    distro = _FEDORA,
+)
+
+# data-disk has no ESP partition, so image.disk builds it without systemd-boot, UKIs or an initrd.
+image.disk(
+    name = "data-disk",
+    packages = ["bash"],
+    definitions = [
+        image.partition(
+            type = "root",
+            filesystem = "ext4",
+            copy_files = ["/"],
+            minimize = "guess",
+        ),
+    ],
+)
+
+box.sh_test(
+    name = "data-disk-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    test = "data-disk-test.sh",
+    args = ["$(location :data-disk.fedora)"],
+    distro = _FEDORA,
+)
+
+# demo-ext extends boot-demo. The DDI contains only the files that demo-ext adds to boot-demo,
+# and its extension-release file pins the exact build of boot-demo. `boot-demo-vm` binds
+# it into /var/lib/extensions.
+image.sysext(
     name = "demo-ext",
-    base = ":boot-demo",
+    parent = ":boot-demo",
     packages = ["zsh"],
     install_docs = False,
     # install a file from source tree; covers reproducibility check under varying umasks
-    ops = [image.copy("from-source.txt", "/usr/lib/tine/from-source")],
+    ops = [image.ops.copy("from-source.txt", "/usr/lib/tine/from-source")],
+)
+
+# demo-confext contains only /etc. Its extension-release file pins the exact build of boot-demo,
+# as the one of demo-ext does.
+image.confext(
+    name = "demo-confext",
+    parent = ":boot-demo",
+    ops = [image.ops.write_file("/etc/tine/from-confext", "confext\n")],
+)
+
+# portablectl attaches only the units whose names start with the image name, so the service is
+# called demo-portable.service.
+image.portable(
+    name = "demo-portable",
+    packages = ["bash", "coreutils"],
+    install_docs = False,
+    ops = [
+        image.ops.copy("demo-portable.service", "/usr/lib/systemd/system/demo-portable.service"),
+        # demo-portable-ext must not contain this directory, because only demo-portable creates it.
+        image.ops.mkdir("/etc/tine/from-parent"),
+    ],
+)
+
+# demo-portable.service fails unless it finds the files that demo-portable-ext adds to /usr and
+# /etc. systemd merges only /usr, /opt and /etc of an extension, so the extension DDI does not
+# contain the file that demo-portable-ext writes to /var. A portable service that needs a directory
+# under /var must find it in the portable image.
+image.extension(
+    name = "demo-portable-ext",
+    parent = ":demo-portable",
+    classes = ["sysext", "confext"],
+    scope = ["portable"],
+    ops = [
+        image.ops.write_file("/usr/lib/tine/from-portable-ext", "usr\n"),
+        image.ops.write_file("/etc/tine/from-portable-ext", "etc\n"),
+        image.ops.write_file("/var/lib/tine/from-portable-ext", "var\n"),
+    ],
+)
+
+_PRELOADED_EXTENSIONS = [":demo-confext", ":demo-ext"]
+
+_PRELOADED_PORTABLES = [":demo-portable", ":demo-portable-ext"]
+
+# boot-demo with the demo DDIs on its ESP, where systemd-sysupdate would update them. Nothing merges or
+# attaches them at boot yet: whoever instantiates the disk does that.
+image.ddi_preloaded_disk(
+    name = "boot-demo-preloaded",
+    base = ":boot-demo",
+    extensions = _PRELOADED_EXTENSIONS,
+    portables = _PRELOADED_PORTABLES,
+)
+
+# boot-demo's published raw.zst and AMI parameters, the way a project that builds on a release of it
+# imports them, and the same DDIs on its ESP.
+image.imported_disk(
+    name = "boot-demo-imported",
+    ami = ":boot-demo[ami]",
+    disk = ":boot-demo[raw.zst]",
+    # As boot-demo's own, which a release would publish beside the disk.
+    virtual_size = "2G",
+)
+
+image.ddi_preloaded_disk(
+    name = "boot-demo-imported-preloaded",
+    base = ":boot-demo-imported",
+    extensions = _PRELOADED_EXTENSIONS,
+    portables = _PRELOADED_PORTABLES,
+)
+
+# The preloaded disk defaults to the virtual_size of the imported one.
+box.sh_test(
+    name = "imported-virtual-size-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = """test "$(qemu-img info --output=json "$1" | jq '."virtual-size"')" = 2147483648""",
+    args = ["$(location :boot-demo-imported-preloaded.fedora[qcow2])"],
+    distro = _FEDORA,
+)
+
+image.vm(
+    name = "boot-demo-preloaded-vm",
+    autologin = "root",
+    credentials = {
+        "firstboot.locale": "C.UTF-8",
+        "firstboot.timezone": "UTC",
+    },
+    image = ":boot-demo-preloaded",
+)
+
+# The checks activate the DDIs on the ESP the way an instance would, see "image.ddi_preloaded_disk" in images.md.
+# The ESP carries one version of each, so the links can name the .raw.v directories.
+tests.vm_smoke(
+    name = "boot-demo-preloaded-vm-smoke",
+    vm = ":boot-demo-preloaded-vm",
+    checks = [
+        # The disk has boot-demo's virtual_size
+        'test "$(lsblk --nodeps --noheadings --bytes --output SIZE /dev/vda)" = 2147483648',
+        # The ESP is where systemd-gpt-auto-generator mounts it, which is /boot on this image.
+        'test -d "$(bootctl --print-esp-path)/extensions"',
+        "mkdir -p /run/extensions /run/confexts",
+        'ln -s "$(bootctl --print-esp-path)/extensions/demo-ext.raw.v" /run/extensions/',
+        'ln -s "$(bootctl --print-esp-path)/extensions/demo-confext.raw.v" /run/confexts/',
+        "systemd-sysext refresh",
+        "systemd-confext refresh",
+        # systemd-vpick picked each newest version out of its directory, and the extension-release of
+        # each matches boot-demo.
+        "test -x /usr/bin/zsh",
+        "test -f /etc/tine/from-confext",
+        'portablectl attach --now --runtime --extension "$(bootctl --print-esp-path)/portables/demo-portable-ext.raw.v" "$(bootctl --print-esp-path)/portables/demo-portable.raw.v"',
+        "systemctl is-active demo-portable.service",
+    ],
+)
+
+# The preloaded disk registers with the AMI parameters of boot-demo, under its own name.
+box.sh_test(
+    name = "preloaded-ami-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = """
+python3 -c '
+import json, sys
+base, preloaded = (json.load(open(path)) for path in sys.argv[1:])
+assert preloaded["Name"] == preloaded["Description"] == "boot-demo-preloaded", preloaded
+names = ("Name", "Description")
+assert {k: v for k, v in preloaded.items() if k not in names} == {k: v for k, v in base.items() if k not in names}, (base, preloaded)
+' "$@"
+""",
+    args = ["$(location :boot-demo.fedora[ami])", "$(location :boot-demo-preloaded.fedora[ami])"],
+    distro = _FEDORA,
+)
+
+# Preloading the imported raw.zst writes the same disk as preloading boot-demo itself, and registers it
+# with the same AMI parameters, under its own name.
+box.sh_test(
+    name = "imported-disk-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = """
+python3 -c '
+import hashlib, json, sys
+disk, imported_disk, ami, imported_ami = sys.argv[1:]
+digests = [hashlib.file_digest(open(path, "rb"), "sha256").hexdigest() for path in (disk, imported_disk)]
+assert digests[0] == digests[1], digests
+ami, imported_ami = json.load(open(ami)), json.load(open(imported_ami))
+assert imported_ami["Name"] == "boot-demo-imported-preloaded", imported_ami
+names = ("Name", "Description")
+assert {k: v for k, v in ami.items() if k not in names} == {k: v for k, v in imported_ami.items() if k not in names}
+' "$@"
+""",
+    args = [
+        "$(location :boot-demo-preloaded.fedora)",
+        "$(location :boot-demo-imported-preloaded.fedora)",
+        "$(location :boot-demo-preloaded.fedora[ami])",
+        "$(location :boot-demo-imported-preloaded.fedora[ami])",
+    ],
+    distro = _FEDORA,
 )
 
 # A file tree that differs per distribution is one copy whose source is a select, rather than a
@@ -287,51 +535,25 @@ image.layer(
     name = "tree.layer",
     parent = ":base",
     ops = [
-        image.copy("tree/os", "/"),
-        image.copy(distribution.select({"arch": "tree/os.arch"}, default = None), "/"),
+        image.ops.copy("tree/os", "/"),
+        image.ops.copy(distribution.select({"DEFAULT": None, "arch": "tree/os.arch"}), "/"),
     ],
 )
 
 image.archive(
     name = "tree",
-    image = ":tree.layer",
+    parent = ":tree.layer",
     format = "tar",
 )
 
-# Once per distribution the PACKAGE file declares, so the test sees the select choose the arch tree
-# and none for the rest, whichever those are.
+# The test runs once per release of the catalog. It checks that the select picks the arch tree for
+# Arch and no tree for the other releases.
 box.sh_test(
     name = "tree-test",
     labels = ["image"],
     box = "@tine//tools:dev.box",
     test = "tree-test.sh",
-    args = ["$(location :tree)"] + distribution.select({name: [name if name == "arch" else "none"] for name in DISTRIBUTIONS}),
-    **distribution.distributed("tree-test"),
-)
-
-# Replacing a populated directory exercises the opaque-dir marker.
-image.layer(
-    name = "opaque-base",
-    package_manager = ":image.package-manager",
-    packages = ["bash", "coreutils"],
-    ops = [
-        image.run(["/usr/bin/bash", "-c", "mkdir -p /etc/tine/sub; echo old > /etc/tine/sub/old"], chroot = True),
-    ],
-)
-
-image.layer(
-    name = "opaque-child.layer",
-    parent = ":opaque-base",
-    ops = [
-        image.remove("/etc/tine/sub"),
-        image.run(["/usr/bin/bash", "-c", "mkdir -p /etc/tine/sub; echo new > /etc/tine/sub/fresh"], chroot = True),
-    ],
-)
-
-image.archive(
-    name = "opaque",
-    image = ":opaque-child.layer",
-    format = "tar",
+    args = ["$(location :tree)"] + distribution.select({d["release"]: [name if name == "arch" else "none"] for name, d in DISTRIBUTIONS.items()}),
 )
 
 # The UKI's module selection still carries what the demo image boots through. The smoke proves the
@@ -344,7 +566,11 @@ box.sh_test(
     box = "@tine//tools:dev.box",
     test = "@tine//tests:contains.sh",
     args = ["$(location :boot-demo.fedora[uki][modules])"]
-    + ['"path": ".*/{}\\.ko'.format(module) for module in ["erofs", "dm-verity", "loop", "overlay", "nvme", "vfat", "virtio_scsi", "virtio_net", "virtiofs"]],
+    + [
+        '"path": ".*/{}\\.ko'.format(module)
+        for module in ["erofs", "dm-verity", "ena", "loop", "overlay", "nvme", "vfat", "virtio_scsi", "virtio_net", "virtiofs"]
+    ],
+    distro = _FEDORA,
 )
 
 # The file manifest is what tells a consumer which paths an image ships, so its framing and its
@@ -359,6 +585,7 @@ box.sh_test(
         "$(location :manifest_check.py)",
         "$(location :demo.fedora[manifest])",
     ],
+    distro = _FEDORA,
 )
 
 box.sh_test(
@@ -372,7 +599,8 @@ box.sh_test(
         "$(location :boot-demo.fedora[boot][initrd])",
         "$(location :boot-demo.fedora[initrd])",
     ]
-    + architecture.select({name: [name] for name in ARCHITECTURES}),
+    + architecture.select({name: [name] for name in architecture.ARCHITECTURES}),
+    distro = _FEDORA,
 )
 
 # The splash the image ships reached the UKI. The image tools' box carries ukify, which lists a
@@ -380,10 +608,9 @@ box.sh_test(
 box.sh_test(
     name = "uki-splash-test",
     labels = ["image"],
-    box = "@tine//catalog:fedora.rawhide.box",
+    box = "tine//distribution:tools.box",
     script = 'test "$(ukify inspect "$1" | grep -cx ".splash:")" = "$2"',
-    args = ["$(location :boot-demo[boot][uki])"] + distribution.select({"arch": ["1"]}, default = ["0"]),
-    **distribution.distributed("uki-splash-test"),
+    args = ["$(location :boot-demo[boot][uki])"] + distribution.select({"DEFAULT": ["0"], "arch": ["1"]}),
 )
 
 # The microcode the image installs reached the UKI, which only an x86 kernel takes that way. The
@@ -391,9 +618,30 @@ box.sh_test(
 box.sh_test(
     name = "uki-microcode-test",
     labels = ["image"],
-    box = "@tine//catalog:fedora.rawhide.box",
+    box = "tine//distribution:tools.box",
     test = "uki-microcode.sh",
-    args = ["$(location :boot-demo.fedora[boot][uki])"] + architecture.select({name: [name] for name in ARCHITECTURES}),
+    args = ["$(location :boot-demo.fedora[boot][uki])"] + architecture.select({name: [name] for name in architecture.ARCHITECTURES}),
+    distro = _FEDORA,
+)
+
+# systemd-stub reads the TOFU= token of the booted profile from the .profile section of that profile. The base
+# profile only has a .profile section if profile_fields is set.
+box.sh_test(
+    name = "uki-profiles-test",
+    labels = ["image"],
+    box = "tine//distribution:tools.box",
+    script = """
+profiles=$(ukify inspect "$1" | grep -E '^\\.profile:$|^    (ID|TOFU)=' | sed -n '/^\\.profile:$/,$p')
+expected='.profile:
+    ID=main
+    TOFU=dev.tine.example
+.profile:
+    ID=debug
+    TOFU=dev.tine.example'
+test "$profiles" = "$expected"
+""",
+    args = ["$(location :boot-demo.fedora[boot][uki])"],
+    distro = _FEDORA,
 )
 
 # Once per distribution, because each package system captures its database in its own format.
@@ -403,7 +651,6 @@ box.sh_test(
     box = "@tine//tools:dev.box",
     test = "pkgdb-format.sh",
     args = ["$(location :demo[pkgdb])"] + distribution.select({"arch": ["tar.zst", "alpm"], "debian": ["tar.zst", "dpkg"], "fedora": ["sqlite", "rpm"]}),
-    **distribution.distributed("pkgdb-format-test"),
 )
 
 # A DDI's file name is what a systemd-sysupdate transfer matches, so it is part of the contract
@@ -413,9 +660,40 @@ box.sh_test(
     name = "sysext-name-test",
     labels = ["image"],
     box = "@tine//tools:dev.box",
-    script = 'test "$(basename "$1")" = "$2"',
+    script = 'test "$(basename "$1")" = "$2" && test "$(basename "$3")" = "$4"',
     args = ["$(location :demo-ext.fedora)"]
-    + architecture.select({name: ["demo-ext_0_{}.sysext.raw".format(spellings.systemd)] for name, spellings in ARCHITECTURES.items()}),
+    + architecture.select({name: ["demo-ext_0_{}.sysext.raw".format(spellings.systemd)] for name, spellings in architecture.ARCHITECTURES.items()})
+    + ["$(location :demo-confext.fedora)"]
+    + architecture.select({name: ["demo-confext_0_{}.confext.raw".format(spellings.systemd)] for name, spellings in architecture.ARCHITECTURES.items()}),
+    distro = _FEDORA,
+)
+
+# portablectl takes the image name from the DDI's file name, up to the first "_", and matches the
+# units it attaches against that name.
+box.sh_test(
+    name = "portable-name-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = 'test "$(basename "$1")" = "$2" && test "$(basename "$3")" = "$4"',
+    args = ["$(location :demo-portable.fedora)"]
+    + architecture.select({name: ["demo-portable_0_{}.raw".format(spellings.systemd)] for name, spellings in architecture.ARCHITECTURES.items()})
+    + ["$(location :demo-portable-ext.fedora)"]
+    + architecture.select({name: ["demo-portable-ext_0_{}.raw".format(spellings.systemd)] for name, spellings in architecture.ARCHITECTURES.items()}),
+    distro = _FEDORA,
+)
+
+# The portable image contains its os-release and no extension-release files. The extension contains
+# extension-release files, no os-release, and none of the files of demo-portable.
+box.sh_test(
+    name = "portable-manifest-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    test = "portable-manifest.sh",
+    args = [
+        "$(location :demo-portable.fedora[disk-manifest])",
+        "$(location :demo-portable-ext.fedora[disk-manifest])",
+    ],
+    distro = _FEDORA,
 )
 
 # [NAME, DIGEST, PATH] for each target expected.json tracks, per architecture. Sorted, so the command line
@@ -441,9 +719,17 @@ box.sh_test(
         arch: [arch, "{}/actual.{}.json".format(package_name(), arch)] + [item for target in targets for item in target]
         for arch, targets in _reproducibility_targets.items()
     }),
+    distro = _FEDORA,
+    # expected.json records the digests of images that the catalog's default boxes build. The boxes of
+    # another release build the same images with other tools, which write different bytes.
+    target_compatible_with = []
+    if read_config("tine", "box") == None
+    else select({
+        "DEFAULT": select_incompatible("expected.json records the digests that the catalog's default boxes build"),
+    }),
 )
 
-box_python_binary(
+python.binary(
     name = "refresh-expected",
     box = "@tine//tools:dev.box",
     main = "expected.py",

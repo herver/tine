@@ -5,10 +5,11 @@
 
     buck test tine//go:test
 
-Exercise writable source views, package selection, and build commands. The box carries no Go toolchain.
+Exercise the read-only project, package selection, and build commands. The box carries no Go toolchain.
 """
 
 import errno
+import json
 import subprocess
 import tempfile
 import unittest
@@ -32,22 +33,27 @@ class TestBuildGo(unittest.TestCase):
         (self.source / "main.go").write_text("original", encoding="utf-8")
         (self.project / "outside").write_text("outside", encoding="utf-8")
 
-    def test_source_writes_are_disposable_and_kept_outputs_survive_failure(self) -> None:
+    def test_sources_are_read_only_and_kept_outputs_survive_failure(self) -> None:
         for iteration, fail in enumerate((False, True, False)):
             with self.subTest(iteration=iteration, fail=fail):
                 scratch = self.scratch / str(iteration)
                 scratch.mkdir()
                 spec = build.Spec(
                     bin=f"bin-{iteration}",
+                    build_mode=None,
                     cgo=None,
                     cgo_cflags=[],
                     gocache="gocache",
+                    goarch="amd64",
                     linker_flags=[],
                     module_cache_dir=None,
                     packages={"example": "."},
                     root="",
                     src="checkout",
                     tags=[],
+                    test_packages=None,
+                    tests=None,
+                    toolchain=None,
                 )
                 stale = self.project / spec["bin"] / "undeclared"
                 stale.parent.mkdir()
@@ -63,12 +69,13 @@ class TestBuildGo(unittest.TestCase):
                     fails: bool = fail,
                 ) -> None:
                     self.assertTrue(check)
-                    (cwd / "main.go").write_text("changed", encoding="utf-8")
+                    self.assertEqual(cwd.resolve(), self.source.resolve())
                     # The driver runs in the project directory, so `outside` is a path in the project.
-                    # The build must find the project read-only.
-                    with self.assertRaises(OSError) as caught:
-                        Path("outside").write_text("changed", encoding="utf-8")
-                    self.assertEqual(caught.exception.errno, errno.EROFS)
+                    # The build must find the project read-only, including the sources.
+                    for path in (cwd / "main.go", Path("outside")):
+                        with self.assertRaises(OSError) as caught:
+                            path.write_text("changed", encoding="utf-8")
+                        self.assertEqual(caught.exception.errno, errno.EROFS)
 
                     state = Path(env["GOCACHE"]) / "state"
                     self.assertEqual(state.read_text() if state.exists() else "0", str(index))
@@ -92,7 +99,6 @@ class TestBuildGo(unittest.TestCase):
                         build.build_go(spec)
 
                 self.assertEqual((self.source / "main.go").read_text(encoding="utf-8"), "original")
-                self.assertEqual(list((scratch / "build").iterdir()), [])
                 output = self.project / spec["bin"] / "example"
                 if fail:
                     self.assertFalse(output.exists())
@@ -102,6 +108,116 @@ class TestBuildGo(unittest.TestCase):
                     self.assertEqual(output.stat().st_mode & 0o777, 0o755)
                 self.assertEqual((self.project / "gocache/state").read_text(), str(iteration + 1))
                 (self.project / "outside").write_text("writable again", encoding="utf-8")
+
+
+class TestCompileTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="go-build-test.", dir="/var/tmp")))
+        self.project = root / "project"
+        (self.project / "checkout").mkdir(parents=True)
+        (root / "scratch").mkdir()
+        self.enterContext(chdir(self.project))
+        self.enterContext(patch.object(tempfile, "tempdir", str(root / "scratch")))
+
+    def test_writes_a_binary_and_a_manifest_entry_per_package(self) -> None:
+        spec = build.Spec(
+            bin="bin",
+            build_mode="pie",
+            cgo=None,
+            cgo_cflags=[],
+            gocache=None,
+            goarch="amd64",
+            linker_flags=["-s"],
+            module_cache_dir=None,
+            packages={},
+            root="",
+            src="checkout",
+            tags=[],
+            test_packages=["./..."],
+            tests="tests",
+            toolchain=None,
+        )
+        stale = self.project / "tests" / "7.test"
+        stale.parent.mkdir()
+        stale.touch()
+        commands: list[list[str]] = []
+
+        def run(command: list[str], *, check: bool, cwd: Path, env: dict[str, str]) -> None:
+            commands.append(command)
+            self.assertIn("-buildmode=pie", env["GOFLAGS"].split())
+            self.assertEqual(env["PKG_CONFIG"], "pkgconf")
+            Path(command[command.index("-o") + 1]).write_text("compiled", encoding="utf-8")
+
+        packages = [("example.com/a", "a"), ("example.com/b/a", "b/a")]
+        with (
+            patch.object(build, "_test_packages", return_value=packages) as listed,
+            patch.object(build.subprocess, "run", side_effect=run),
+        ):
+            build.build_go(spec)
+
+        self.assertEqual(listed.call_args.args[0], ["./..."])
+        self.assertEqual(
+            [command[-1] for command in commands],
+            ["example.com/a", "example.com/b/a"],
+        )
+        tests = self.project / "tests"
+        self.assertFalse(stale.exists())
+        self.assertEqual((tests / "0.test").read_text(encoding="utf-8"), "compiled")
+        self.assertEqual(
+            json.loads((tests / "manifest.json").read_text(encoding="utf-8")),
+            [
+                {"binary": "0.test", "package": "example.com/a", "dir": "a"},
+                {"binary": "1.test", "package": "example.com/b/a", "dir": "b/a"},
+            ],
+        )
+
+    def test_compile_command(self) -> None:
+        self.assertEqual(
+            build._test_command(Path("/var/tmp/tests/0.test"), "example.com/a", ["-s", "-w"]),
+            [
+                "go",
+                "test",
+                "-c",
+                "-vet=off",
+                "-o",
+                "/var/tmp/tests/0.test",
+                "-ldflags=-s -w",
+                "example.com/a",
+            ],
+        )
+
+    def test_lists_packages_with_tests_relative_to_src(self) -> None:
+        src = self.project / "checkout"
+        listing = "".join(
+            json.dumps(package)
+            for package in [
+                {"ImportPath": "example.com/a", "Dir": str(src / "server/a"), "TestGoFiles": ["a_test.go"]},
+                {"ImportPath": "example.com/b", "Dir": str(src / "server/b")},
+                {"ImportPath": "example.com/c", "Dir": str(src / "api"), "XTestGoFiles": ["c_test.go"]},
+            ]
+        )
+        with patch("build.subprocess.run") as run:
+            run.return_value.stdout = listing
+            self.assertEqual(
+                build._test_packages(["./..."], src / "server", src, {}),
+                [("example.com/a", "server/a"), ("example.com/c", "api")],
+            )
+
+    def test_rejects_test_packages_outside_src(self) -> None:
+        listing = json.dumps(
+            {
+                "ImportPath": "rsc.io/quote",
+                "Dir": "/var/tmp/modules/rsc.io/quote",
+                "TestGoFiles": ["quote_test.go"],
+            }
+        )
+        with (
+            patch("build.subprocess.run") as run,
+            self.assertRaisesRegex(SystemExit, "rsc.io/quote is not in src"),
+        ):
+            run.return_value.stdout = listing
+            build._test_packages(["rsc.io/quote"], Path("checkout"), Path("checkout"), {})
 
 
 class TestBuildCommand(unittest.TestCase):

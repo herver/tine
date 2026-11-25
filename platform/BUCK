@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
+# SPDX-License-Identifier: MPL-2.0
+
+load("@prelude//platforms:defs.bzl", "host_configuration")
+load(":architecture.bzl", "architecture")
+load(":defs.bzl", "platform")
+
+# `tine init` points a project that builds against this cell here too, for both its execution and
+# its target platform, so every such project caches without configuring anything.
+platform.execution(
+    name = "default",
+    cpu_configuration = host_configuration.cpu,
+    os_configuration = host_configuration.os,
+    visibility = ["PUBLIC"],
+)
+
+# A target platform per supported architecture; select with `--target-platforms`
+[
+    platform.target(
+        name = name,
+        configurations = [spellings.config, "config//os:linux"],
+        visibility = ["PUBLIC"],
+    )
+    for name, spellings in architecture.ARCHITECTURES.items()
+]

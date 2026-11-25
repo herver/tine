@@ -3,6 +3,7 @@
 
 """The conventional Fedora distribution declaration."""
 
+load("//box:defs.bzl", "box")
 load("//distribution:defs.bzl", "distribution")
 load("//package:buildroot.bzl", "buildroot")
 load("//package:manager.bzl", "package_manager")
@@ -22,7 +23,7 @@ _FEDORA_SIGNING_KEYS = {
     "47": "B2E766FA50CA6FA2D5ED06FC09D879E09488FB64",
 }
 
-def fedora_signing_keys(*versions) -> dict[str, str]:
+def _signing_keys(*versions) -> dict[str, str]:
     """The `signing_keys` for a repository signed with the named Fedora releases' keys."""
     for version in versions:
         if version not in _FEDORA_SIGNING_KEYS:
@@ -42,7 +43,17 @@ _FEDORA_PACKAGE_SETS = {
         "util-linux",
     ],
     "buildroot": ["@buildsys-build"],
-    "initrd": ["bash", "kmod", "systemd", "systemd-udev", "veritysetup"],
+    "initrd": [
+        "bash",
+        "kmod",
+        # avoid full libcurl, not necessary for imds
+        "libcurl-minimal",
+        "systemd",
+        "systemd-imds",
+        "systemd-networkd",
+        "systemd-udev",
+        "veritysetup",
+    ],
 }
 
 def _merge_package_sets(
@@ -53,15 +64,29 @@ def _merge_package_sets(
     package_sets.update(overrides)
     return package_sets
 
+# The root box of a Fedora release contains the packages that resolve, verify and install a box.
+# tine//distribution:tools.box contains everything else.
+_FEDORA_ROOT_PACKAGES = [
+    "coreutils",
+    "python3-createrepo_c",
+    "python3-libdnf5",
+    # The rpm drivers define rpm macros through the rpm module.
+    "python3-rpm",
+    "rpm",
+    # A relaxed box binds the host's /run, and nss-systemd reads the caller's identity from the host's
+    # UserDB services there. Without libnss_systemd, getpwuid() cannot find a systemd-homed caller, and
+    # ssh-keygen aborts.
+    "systemd-libs",
+]
+
 def _check_name(name: str, family: str, version: str) -> None:
     expected = "{}.{}".format(family, version)
     if name != expected:
         fail("{} release name must be {!r}".format(family, expected))
 
-def fedora_release(
+def _release(
     name: str,
     version: str,
-    box: str,
     architectures: list[str],
     signing_keys: dict[str, str],
     baseurl: str | None = None,
@@ -94,6 +119,7 @@ def fedora_release(
     )
     repository_universe(
         name = name + ".repositories",
+        target_compatible_with = distribution.serves(name, architectures),
         package_system = PACKAGE_SYSTEM,
         # The additional repositories are part of the release, not just of installs from it. An
         # box resolves against the universe and nothing else, so leaving them out would stop a
@@ -101,24 +127,46 @@ def fedora_release(
         # these has to be assembled by the matching ukify and repart, which live in the same place.
         required_repositories = [":" + name + ".repository"] + additional_repositories,
     )
-    distribution.new(name = name + ".distribution", visibility = visibility)
+    distribution.new(name = name + ".distribution", architectures = architectures, visibility = visibility)
     os_release(
         name = name + ".release",
+        target_compatible_with = distribution.serves(name, architectures, in_box = True),
+        box = ":" + name + ".box",
         repository_universe = ":" + name + ".repositories",
         package_sets = _merge_package_sets(_FEDORA_PACKAGE_SETS, package_set_overrides),
         visibility = visibility,
     )
+    box.new(
+        name = name + ".box",
+        architectures = architectures,
+        packages = _FEDORA_ROOT_PACKAGES,
+        release = ":" + name + ".release",
+        repository_universe = ":" + name + ".repositories",
+        root = True,
+        visibility = visibility,
+    )
     package_manager(
         name = name + ".package-manager",
+        target_compatible_with = distribution.serves(name, architectures, in_box = True),
         release = ":" + name + ".release",
-        box = box,
         additional_repositories = additional_repositories,
         repository_priorities = repository_priorities,
         visibility = visibility,
     )
     buildroot(
         name = name + ".buildroot",
+        target_compatible_with = distribution.serves(name, architectures, in_box = True),
+        # rpmbuild and dnf run chrooted in the buildroot. Outside of the chroot, a buildroot action only needs
+        # Python and the package system, and the root box contains both. The buildroot doesn't depend on the
+        # tools box, so the tools box can install a package that the buildroot builds.
+        box = ":" + name + ".box",
+        incoming_transition = ":" + name + ".distribution",
         package_manager = ":" + name + ".package-manager",
         package_set = "buildroot",
         visibility = visibility,
     )
+
+fedora = struct(
+    release = _release,
+    signing_keys = _signing_keys,
+)

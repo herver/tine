@@ -7,7 +7,7 @@ SPDX-License-Identifier: MPL-2.0
 
 tine composes operating-system images out of packages and pinned third-party repositories with
 [Buck2](https://buck2.build/). Every build action runs in an unprivileged sandbox without network access.
-Filesystem images are stacks of overlay deltas. tine's primary output targets are [unified kernel
+Each image layer describes a complete filesystem snapshot. tine's primary output targets are [unified kernel
 images](https://uapi-group.org/specifications/specs/unified_kernel_image/) and dm-verity protected GPT
 disks in various formats, and also additional artifacts like
 [SBOM](https://en.wikipedia.org/wiki/Software_supply_chain).
@@ -16,18 +16,27 @@ disks in various formats, and also additional artifacts like
 
 The host needs only:
 
- * Linux with unprivileged user namespaces. On Ubuntu you need to allow them with a
+ * Linux ≥ 6.16 with unprivileged user namespaces. On Ubuntu you need to allow them with a
  [sysctl](https://www.freedesktop.org/software/systemd/man/latest/sysctl.d.html):
-   `kernel.apparmor_restrict_unprivileged_userns=0`
- * `/usr/bin/python3` ≥ 3.14, or ≥ 3.12 together with `zstd`
+   `kernel.apparmor_restrict_unprivileged_userns=0`.
+ * A host root that supports `pivot_root()`; some kernels cannot pivot an initramfs root
+ * glibc ≥ 2.17, which the pinned Python that starts every sandbox links against. The pinned Python looks
+   for the glibc loader at the standard path, such as `/lib64/ld-linux-x86-64.so.2`. NixOS keeps its loader
+   elsewhere and has a stub at the standard path. When no loader runs from the standard path, `tine` binds
+   the loader of the host's `python3` over it in its own mount namespace. The bind needs a file at the
+   standard path, which NixOS's `environment.stub-ld.enable` option creates.
+ * `python3` ≥ 3.14 on `PATH`, or ≥ 3.12 together with `zstd`
  * `git`
+ * `/bin/sh`, which runs the fetch of a Rust project's git dependencies
  * `/dev/kvm` to run VMs for testing; without it, you can still build everything
+ * Read access to `/proc/sys/kernel/overflowuid` for directory exports
 
-tine uses the host's `python` and `git` to bootstrap itself and to read the project's git state, such as
-the version an image derives from it; every tool a build itself runs is pinned. The first
-[`tine`](bin/tine) invocation that runs Buck fetches and verifies the pinned Buck2 binary into
-`${XDG_CACHE_HOME:-~/.cache}/tine/buck2` (one directory per pin, safe to delete); everything else is
-fetched and cached by Buck itself.
+tine uses the host's `python` and `git` to bootstrap itself and to read the project's git state, such as the
+version an image derives from it. A build also runs the host's `git` to fetch git checkouts, and the host's
+`git` and `/bin/sh` to fetch the git dependencies of Rust projects. It unpacks the pinned Python with the
+host's `python3`. Every other tool a build runs is pinned. The first [`tine`](bin/tine) invocation that runs
+Buck fetches and verifies the pinned Buck2 binary into `${XDG_CACHE_HOME:-~/.cache}/tine/buck2` (one
+directory per pin, safe to delete); everything else is fetched and cached by Buck itself.
 
 ### HOME directory
 
@@ -66,13 +75,12 @@ demos):
 ```Starlark
 load("@tine//image:defs.bzl", "image")
 
-image.rootfs_archive(
+image.archive(
     name = "demo",
-    package_manager = ":image.package-manager",
     packages = ["bash", "coreutils"],
     ops = [
-        image.copy("marker.txt", "/etc/tine/marker"),
-        image.run(["/usr/bin/bash", "-c", "echo built-by-tine >> /etc/tine/marker"], chroot = True),
+        image.ops.copy("marker.txt", "/etc/tine/marker"),
+        image.ops.run(["/usr/bin/bash", "-c", "echo built-by-tine >> /etc/tine/marker"], chroot = True),
     ],
     format = "tar",
 )
@@ -125,6 +133,7 @@ tine box                 # run the project's root box target
 tine mount <verb>        # manage external directories mounted over project paths
 tine cache-status        # report on the shim serving the shared build cache
 tine init [<path>]       # write the configuration a project needs, for the checkout this command is in
+tine bump <arguments>    # update the pins in the project's tine.lock.json
 tine completion <shell>  # print the completion script for bash, fish or zsh
 ```
 
@@ -171,7 +180,7 @@ so an image build rebuilds exactly the affected packages.
 ## Pinned dependencies
 
 [`tine.lock.json`](tine.lock.json) declares the supported Buck2 and every other tool tine uses
-internally. `tine//tools:bump` updates those pins. tine depends on fixes in its Buck2 fork, so running
+internally. `tine bump` updates those pins. tine depends on fixes in its Buck2 fork, so running
 another Buck2 is unsupported.
 
 ## Developing tine
@@ -180,7 +189,7 @@ another Buck2 is unsupported.
 tine buck run tine//tools:check           # lint, type-check, unit tests
 tine buck run tine//tools:fmt             # auto-format and auto-fix
 tine buck run tine//tools:verify-catalog  # assert the committed catalog lock matches
-tine buck build tine//...                 # build everything: the catalog, examples, tooling
+tine buck build tine//... catalog//...    # build everything: the catalog, examples, tooling
 tools/ci.sh                               # the whole CI pipeline: checks, builds, image tests
 ```
 
@@ -192,15 +201,22 @@ User guides:
 
 - [Building images](docs/user/images.md): host requirements, declaring images and layers, output formats,
   the VM runner
+- [Publishing images to AWS EC2](docs/user/aws.md): importing a disk as an AMI, and booting a test
+  instance
+- [Publishing quarry releases](docs/user/quarry.md): a release folder with the
+  [TUF](https://theupdateframework.io/) targets.
+  [quarry](https://github.com/amutable/quarry) updates machines from that.
 - [Building Rust projects](docs/user/cargo.md): building a checked-out Rust project offline, with its
   crate graph in the executables and image SBOM
 - [Building Go projects](docs/user/go.md): the same for a checked-out Go project, whose module list go
   itself embeds in the executables
 - [Fetching project sources](docs/user/git.md): pinning an external project, or use a local checkout
   for development
+- [Building RPM packages](docs/user/rpm.md): building a package from a spec, its build dependencies
 - [Maintaining packages](docs/user/importer.md): importing and updating packages from upstream
   distributions, local modifications, branch curation
 - [Development boxes](docs/user/box.md): pinned interactive development environments
+- [Pinning downloads](docs/user/http.md): downloading a file or tool release pinned in `tine.lock.json`
 - [Signing with external keys](docs/user/signing-pkcs11.md): Secure Boot, PCR policy and verity signing
   over PKCS#11, with the keys outside the build
 - [Shared build cache](docs/user/remote-cache.md): configuring it, the keys, the bucket, and reading the

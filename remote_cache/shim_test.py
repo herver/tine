@@ -20,9 +20,12 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
 from collections.abc import Callable, Iterator
+from concurrent import futures
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 import grpc
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -218,9 +221,10 @@ class TestContentAddressableStorage(ShimCase):
         thing a trusted client should be able to do by accident either."""
         outside = reapi.Digest(hash="../../lock", size_bytes=1)
         response = self.batch_read(reapi.BatchReadBlobsRequest(digests=[outside]))
-        self.assertEqual([one.status.code for one in response.blobs if one.status], [reapi.NOT_FOUND])
-        missing = self.find_missing(reapi.FindMissingBlobsRequest(blob_digests=[outside]))
-        self.assertEqual(missing.missing_blob_digests, [outside])
+        self.assertEqual([one.status.code for one in response.blobs if one.status], [reapi.INVALID_ARGUMENT])
+        with self.assertRaises(grpc.RpcError) as caught:
+            self.find_missing(reapi.FindMissingBlobsRequest(blob_digests=[outside]))
+        self.assertEqual(status_of(caught.exception), grpc.StatusCode.INVALID_ARGUMENT)
         with self.assertRaises(grpc.RpcError) as caught:
             self.get_action_result(reapi.GetActionResultRequest(action_digest=outside))
         self.assertEqual(status_of(caught.exception), grpc.StatusCode.INVALID_ARGUMENT)
@@ -238,6 +242,23 @@ class TestContentAddressableStorage(ShimCase):
         assert status is not None
         self.assertEqual(status.code, reapi.INVALID_ARGUMENT)
         self.assertEqual(self.store.counts()[0], 1)  # only the empty blob
+
+    def test_one_bad_blob_in_a_batch_is_refused_alone(self) -> None:
+        """The batch is stored at once, but answered per blob, the way the API asks."""
+        honest = reapi.Digest.for_bytes(b"honest")
+        response = self.batch_update(
+            reapi.BatchUpdateBlobsRequest(
+                blobs=[
+                    reapi.Blob(digest=honest, data=b"honest"),
+                    reapi.Blob(digest=reapi.Digest.for_bytes(b"also honest"), data=b"a lie"),
+                ]
+            )
+        )
+        self.assertEqual(
+            [one.status.code for one in response.blobs if one.status], [reapi.OK, reapi.INVALID_ARGUMENT]
+        )
+        self.assertEqual(self.store.blob(honest), b"honest")
+        self.assertEqual(self.store.counts()[0], 2)  # and the empty blob
 
 
 class TestByteStream(ShimCase):
@@ -314,6 +335,28 @@ class TestActionCache(ShimCase):
         served = self.get_action_result(reapi.GetActionResultRequest(action_digest=action))
         self.assertEqual(served, result)
 
+    def test_a_result_naming_something_that_is_not_a_digest_is_an_error(self) -> None:
+        """As an output file or as a Tree. A client or builder bug, so never quietly a miss."""
+        outside = reapi.Digest(hash="../../lock", size_bytes=1).to_bytes()
+        for raw in (
+            wire.submessage(2, wire.text(1, "out") + wire.submessage(2, outside)),
+            wire.submessage(3, wire.text(1, "dir") + wire.submessage(3, outside)),
+        ):
+            action = reapi.Digest.for_bytes(raw)
+            with self.assertRaises(grpc.RpcError) as caught:
+                self.update_action_result(
+                    reapi.UpdateActionResultRequest(
+                        action_digest=action, action_result=reapi.ActionResult.parse(raw)
+                    )
+                )
+            self.assertEqual(status_of(caught.exception), grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertIsNone(self.store.result(action))
+            # As if a builder had signed it.
+            self.store.put_result(action, shim.ac_pack(shim.Pointer(bundle="b" * 64, result=raw)))
+            with self.assertRaises(grpc.RpcError) as caught:
+                self.get_action_result(reapi.GetActionResultRequest(action_digest=action))
+            self.assertEqual(status_of(caught.exception), grpc.StatusCode.UNKNOWN)
+
     def test_a_result_whose_blob_is_gone_is_a_miss(self) -> None:
         """Including a blob named inside the Tree, which is only reachable by parsing it."""
         action, result = self.result_with_a_tree()
@@ -329,16 +372,28 @@ class TestActionCache(ShimCase):
             self.get_action_result(reapi.GetActionResultRequest(action_digest=action))
         self.assertEqual(status_of(caught.exception), grpc.StatusCode.NOT_FOUND)
 
-    def test_a_blob_rewritten_on_disk_is_a_miss_and_is_dropped(self) -> None:
-        """A hit is claimed only for bytes that still hash to their names, whatever the files say."""
+    def test_a_blob_of_another_size_on_disk_is_a_miss(self) -> None:
+        """A truncated file is as good as gone, and a hit is never claimed for one."""
         action, result = self.result_with_a_tree()
         digest = result.file_digests[0]
-        (self.store.root / "blobs" / digest.hash[:2] / digest.hash).write_bytes(b"x" * digest.size_bytes)
+        (self.store.root / "blobs" / digest.hash[:2] / digest.hash).write_bytes(b"truncated")
         with self.assertRaises(grpc.RpcError) as caught:
             self.get_action_result(reapi.GetActionResultRequest(action_digest=action))
         self.assertEqual(status_of(caught.exception), grpc.StatusCode.NOT_FOUND)
-        self.assertEqual(self.store.has_blobs([digest]), [False])
         self.assertEqual(self.counts.report()["incomplete"], 1)
+
+    def test_a_blob_rewritten_on_disk_at_its_size_is_refused_where_it_is_read(self) -> None:
+        """A hit does not read every blob it names; the bytes are checked where they are served.
+
+        With no bucket to fetch them from again, the hit fails there: the price of not reading.
+        """
+        action, result = self.result_with_a_tree()
+        digest = result.file_digests[0]
+        (self.store.root / "blobs" / digest.hash[:2] / digest.hash).write_bytes(b"x" * digest.size_bytes)
+        self.get_action_result(reapi.GetActionResultRequest(action_digest=action))
+        response = self.batch_read(reapi.BatchReadBlobsRequest(digests=[digest]))
+        self.assertEqual([one.status.code for one in response.blobs if one.status], [reapi.NOT_FOUND])
+        self.assertEqual(self.store.has_blobs([digest]), [False])
 
 
 def one_file_result(digest: reapi.Digest) -> reapi.ActionResult:
@@ -380,6 +435,34 @@ class BucketCase(ShimCase):
             return status_of(error)
         return None
 
+    def start_shim_counting_locks(self) -> Callable[[str, int], bool]:
+        """A new shim whose per-bundle locks count who asked for them, and a wait for that count.
+
+        Asking for the lock is where a request starts to wait for another one's fetch of the same
+        bundle, so a test can hold the first in its download until the second is queued behind it,
+        not merely started. The wait says whether the count was reached, for the test to assert
+        once it let the download go: failing while holding it would leave the requests hanging.
+        """
+        asked: Counter[str] = Counter()
+        changed = threading.Condition()
+
+        class Counting(shim.KeyedLocks):
+            @override
+            def __call__(self, key: str) -> threading.Lock:
+                with changed:
+                    asked[key] += 1
+                    changed.notify_all()
+                return super().__call__(key)
+
+        with mock.patch.object(shim, "KeyedLocks", Counting):
+            self.start_shim()
+
+        def wait(key: str, count: int) -> bool:
+            with changed:
+                return changed.wait_for(lambda: asked[key] >= count, timeout=30)
+
+        return wait
+
 
 class TestBucketFetch(BucketCase):
     """What a reader does with the bucket, one request at a time."""
@@ -395,6 +478,51 @@ class TestBucketFetch(BucketCase):
         self.assertIsNone(self.lookup(second))
         self.assertEqual(self.served.counts[f"bundle/{bundle_name}"], 1)
         self.assertEqual(self.served.counts[f"ac/{second.hash}"], 1)
+
+    def test_a_lookup_overlapping_a_fetch_of_its_bundle_waits_for_it(self) -> None:
+        """Buck2 retries a lookup that takes long; the retry must not fetch the bundle again."""
+        action = self.publish(b"one action", b"the output")
+        (bundle_name,) = self.served.keys("bundle")
+        gate = self.served.held[f"bundle/{bundle_name}"] = threading.Event()
+        wait = self.start_shim_counting_locks()
+        with futures.ThreadPoolExecutor() as pool:
+            lookups = [pool.submit(self.lookup, action) for _ in range(2)]
+            queued = wait(bundle_name, 2)
+            gate.set()
+            self.assertTrue(queued)
+            self.assertEqual([one.result() for one in lookups], [None, None])
+        self.assertEqual(self.served.counts[f"bundle/{bundle_name}"], 1)
+
+    def test_reads_of_evicted_blobs_from_one_bundle_fetch_it_once(self) -> None:
+        """Buck2 reads a result's outputs in parallel, and each may find its blob evicted."""
+        bodies = [b"one output", b"another output"]
+        digests = self.upload(*bodies)
+        action = reapi.Digest.for_bytes(b"one action")
+        files = b"".join(
+            wire.submessage(2, wire.text(1, f"out{index}") + wire.submessage(2, digest.to_bytes()))
+            for index, digest in enumerate(digests)
+        )
+        self.update_action_result(
+            reapi.UpdateActionResultRequest(
+                action_digest=action, action_result=reapi.ActionResult.parse(files)
+            )
+        )
+        (bundle_name,) = self.served.keys("bundle")
+        wait = self.start_shim_counting_locks()
+        self.assertIsNone(self.lookup(action))
+        for digest in digests:
+            self.store.drop_blob(digest)
+        gate = self.served.held[f"bundle/{bundle_name}"] = threading.Event()
+        with futures.ThreadPoolExecutor() as pool:
+            reads = [
+                pool.submit(self.batch_read, reapi.BatchReadBlobsRequest(digests=[one])) for one in digests
+            ]
+            # Once for the lookup, then once for each read.
+            queued = wait(bundle_name, 3)
+            gate.set()
+            self.assertTrue(queued)
+            self.assertEqual([one.result().blobs[0].data for one in reads], bodies)
+        self.assertEqual(self.served.counts[f"bundle/{bundle_name}"], 2)
 
     def test_what_happened_is_counted_by_kind(self) -> None:
         """Buck2 sees one kind of miss; the status report has to tell a refusal from an absence."""
@@ -450,6 +578,17 @@ class TestBucketFetch(BucketCase):
         response = self.batch_read(reapi.BatchReadBlobsRequest(digests=[digest]))
         self.assertEqual([one.data for one in response.blobs], [b"the output"])
         self.assertEqual(self.counts.report()["bundles refilled"], 2)
+
+    def test_a_blob_rewritten_on_disk_at_its_size_comes_back_from_its_bundle_when_read(self) -> None:
+        """The hit was claimed by size, so the read is where it has to be made good."""
+        action = self.publish(b"one action", b"the output")
+        digest = reapi.Digest.for_bytes(b"the output")
+        self.start_shim()
+        self.assertIsNone(self.lookup(action))
+        (self.store.root / "blobs" / digest.hash[:2] / digest.hash).write_bytes(b"x" * digest.size_bytes)
+        self.assertIsNone(self.lookup(action))
+        self.assertEqual(self.read(reapi.ReadRequest(resource_name=self.resource(digest))), b"the output")
+        self.assertEqual(self.counts.report()["bundles refilled"], 1)
 
     def test_a_refill_from_a_rewritten_bundle_is_a_refusal(self) -> None:
         action = self.publish(b"one action", b"the output")
@@ -508,6 +647,23 @@ class TestBucketFetch(BucketCase):
         response = self.find_missing(reapi.FindMissingBlobsRequest(blob_digests=[digest]))
         self.assertEqual(response.missing_blob_digests, [digest])
         self.assertEqual(sum(self.served.counts.values()), asked)
+
+
+class TestPublish(BucketCase):
+    def test_a_blob_gone_before_its_bundle_is_written_is_a_publish_failure(self) -> None:
+        """Checked by size when the result arrives, so a rewritten file is only found here."""
+        (digest,) = self.upload(b"the output")
+        (self.store.root / "blobs" / digest.hash[:2] / digest.hash).write_bytes(b"x" * digest.size_bytes)
+        with self.assertRaises(grpc.RpcError) as caught:
+            self.update_action_result(
+                reapi.UpdateActionResultRequest(
+                    action_digest=reapi.Digest.for_bytes(b"one action"),
+                    action_result=one_file_result(digest),
+                )
+            )
+        self.assertEqual(status_of(caught.exception), grpc.StatusCode.UNKNOWN)
+        self.assertEqual(self.counts.report()["publish failures"], 1)
+        self.assertEqual(self.served.keys("ac"), [])
 
 
 class TestProven(unittest.TestCase):

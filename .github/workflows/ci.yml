@@ -21,19 +21,35 @@ concurrency:
 jobs:
   build:
     strategy:
-      # One architecture failing says nothing about the other, and which of the two broke is the
+      # One architecture or box failing says nothing about the others, and which one broke is the
       # first thing worth knowing.
       fail-fast: false
       matrix:
-        # architecture is tine's name for it, as in platforms/architecture.bzl
+        # architecture is tine's name for it, as in platform/architecture.bzl. distro names the release
+        # that the run builds and tests.
         include:
+          # Empty = catalog's default, Fedora. This also checks the digests in examples/image/expected.json.
           - runner: ubuntu-24.04
             architecture: x86_64
+            distro: ""
           - runner: ubuntu-24.04-arm
             architecture: arm64
-    name: build (${{ matrix.runner }})
+            distro: ""
+          # Arch serves x86_64 only.
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            distro: arch.rolling
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            distro: debian.testing
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+            distro: debian.testing
+    # The ruleset of main requires the checks `build (ubuntu-24.04)` and `build (ubuntu-24.04-arm)`.
+    # A run with the default boxes keeps that name, because a PR otherwise waits for those checks forever.
+    name: build (${{ matrix.runner }}${{ matrix.distro && format(', {0}', matrix.distro) || '' }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/gh-runner-setup
@@ -42,12 +58,14 @@ jobs:
       # emits a log group per step
       - name: CI
         run: tools/ci.sh
+        env:
+          TINE_TEST_DISTRO: ${{ matrix.distro }}
 
       # If examples/image:reproducibility-test fails, for easy pickup. Unarchived, the artifact is the
       # file itself, under its own name.
       - name: Upload actual reproducibility digests
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: examples/image/actual.${{ matrix.architecture }}.json
           archive: false

@@ -36,7 +36,7 @@ import signing
 import wire
 from bucket import Bucket, Reader, S3Writer, Writer
 from status import ask, serving
-from store import Store
+from store import Store, check_blob
 
 # What Buck2 falls back to when a server advertises no limit of its own, so advertising the same
 # keeps it on the path it would take against a real cache: batches below this, ByteStream above.
@@ -111,6 +111,22 @@ class Counts:
             return dict(sorted(self._counter.items()))
 
 
+class KeyedLocks:
+    """One lock per key, made on first use.
+
+    Never cleaned up, which costs a lock object per distinct key a shim ever sees: keys are bundle
+    names, a few dozen per build.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def __call__(self, key: str) -> threading.Lock:
+        with self._guard:
+            return self._locks.setdefault(key, threading.Lock())
+
+
 class Local:
     """The local cache store, and populating it from the bucket.
 
@@ -129,10 +145,22 @@ class Local:
         # is uploaded again regardless, or the bad object would sit there for its whole lifetime,
         # a miss for every action that shares it, with every rebuild pointing at it afresh.
         self.tainted: set[str] = set()
+        # Held by bundle name while it is fetched and admitted. A second request that needs the same
+        # bundle, such as Buck2 reading several of its evicted blobs at once, waits and then finds
+        # it here.
+        self.fetching = KeyedLocks()
 
     def blob(self, digest: reapi.Digest) -> bytes | None:
-        """A blob's bytes, fetching the bundle it arrived in if they are no longer here."""
-        return self.store.blob(digest) if self.ensure([digest]) else None
+        """A blob's bytes, fetching the bundle it arrived in if they are no longer here.
+
+        Or if they no longer hash to their name, which the store finds only on reading them and
+        then drops them: a hit checks sizes, so it may have been claimed for exactly these.
+        """
+        if not self.ensure([digest]):
+            return None
+        if (data := self.store.blob(digest)) is None and self.ensure([digest]):
+            data = self.store.blob(digest)
+        return data
 
     def ensure(self, digests: list[reapi.Digest]) -> bool:
         """Make all of these present, fetching whole bundles rather than asking per blob."""
@@ -141,23 +169,30 @@ class Local:
             return True
         if self.bucket is None:
             return False
-        wanted = {name for one in missing if (name := self.store.bundle_of(one)) is not None}
-        for name in wanted:
-            # Every member is checked against its own name on the way out, and this bundle was
-            # already proven against the result that named it when it first arrived. There is no
-            # result to prove it against now, so only what this store already attributes to the
-            # bundle is taken from it: a rewritten one could otherwise fill the store with junk
-            # that hashes correctly, and re-point another bundle's blobs at itself.
-            members = self.fetch_bundle(name)
-            if members is not None:
-                known = self.store.members_of(name)
-                self.admit({member: blob for member, blob in members.items() if member in known}, name)
-                self.counts.add("bundles refilled")
+        wanted: dict[str, list[reapi.Digest]] = {}
+        for one in missing:
+            if (name := self.store.bundle_of(one)) is not None:
+                wanted.setdefault(name, []).append(one)
+        for name, needed in wanted.items():
+            with self.fetching(name):
+                if all(self.store.has_blobs(needed)):
+                    continue
+                # Every member is checked against its own name on the way out, and this bundle was
+                # already proven against the result that named it when it first arrived. There is
+                # no result to prove it against now, so only what this store already attributes to
+                # the bundle is taken from it: a rewritten one could otherwise fill the store with
+                # junk that hashes correctly, and re-point another bundle's blobs at itself.
+                members = self.fetch_bundle(name)
+                if members is not None:
+                    known = self.store.members_of(name)
+                    self.admit({member: blob for member, blob in members.items() if member in known}, name)
+                    self.counts.add("bundles refilled")
         return all(self.store.has_blobs(digests))
 
     def fetch_bundle(self, name: str) -> dict[str, bytes] | None:
         """A bundle's members by hash, or None with the reason logged and counted."""
         assert self.bucket is not None
+        started = time.monotonic()
         try:
             # Bounded by the store: a bundle that would not fit could not be kept anyway, and the
             # operator, not the builder, decides how large the object under this name is.
@@ -177,12 +212,21 @@ class Local:
             log.info("bundle %s is gone from the bucket", name[:12])
             self.counts.add("bundles gone")
             return None
+        downloaded = time.monotonic()
         try:
-            return dict(bundle.unpack(packed))
+            members = dict(bundle.unpack(packed))
         except ValueError as error:
             log.error("bundle %s is unreadable: %s", name[:12], error)
             self.refuse(name)
             return None
+        log.info(
+            "bundle %s, %d bytes: downloaded in %.1fs, unpacked in %.1fs",
+            name[:12],
+            len(packed),
+            downloaded - started,
+            time.monotonic() - downloaded,
+        )
+        return members
 
     def refuse(self, name: str) -> None:
         """This bundle is not what its name says. Remembered, so a publisher writes it again."""
@@ -191,8 +235,10 @@ class Local:
 
     def admit(self, members: dict[str, bytes], name: str) -> None:
         """Every member into the store, each remembering the bundle it can be fetched from again."""
-        for member, blob in members.items():
-            self.store.put_blob(reapi.Digest(hash=member, size_bytes=len(blob)), blob, bundle=name)
+        self.store.put_blobs(
+            {reapi.Digest(hash=member, size_bytes=len(blob)): blob for member, blob in members.items()},
+            bundle=name,
+        )
 
 
 def referenced(
@@ -251,15 +297,8 @@ class ActionCache:
         self.signer = signer
         self.verifier = verifier
         self.accepting = accepts_uploads(signer, verifier)
-        # One lock per bundle being uploaded, so two results that share a bundle do not both send
-        # it. Keyed by name and never cleaned up, which costs a lock object per distinct bundle a
-        # shim ever publishes: a few dozen per build.
-        self._uploads: dict[str, threading.Lock] = {}
-        self._uploads_guard = threading.Lock()
-
-    def _upload_lock(self, name: str) -> threading.Lock:
-        with self._uploads_guard:
-            return self._uploads.setdefault(name, threading.Lock())
+        # By bundle name, so two results that share a bundle do not both send it.
+        self._upload_lock = KeyedLocks()
 
     def get(
         self, request: reapi.GetActionResultRequest, context: grpc.ServicerContext
@@ -267,6 +306,7 @@ class ActionCache:
         action = request.action_digest
         if action is None or not signing.is_sha256_hex(action.hash):
             abort(context, grpc.StatusCode.INVALID_ARGUMENT, "no action digest")
+        started = time.monotonic()
         self.counts.add("lookups")
         found = self._kept(action)
         if found is None and self.bucket is not None:
@@ -276,20 +316,16 @@ class ActionCache:
             abort(context, grpc.StatusCode.NOT_FOUND, "no result for this action")
         _, result = found
         blobs = referenced(self.local.blob, result)
-        # Present, then read: `ensure` fetches what is missing bundle by bundle, and reading is
-        # what proves the bytes on disk still hash to their names.
-        if (
-            blobs is None
-            or not self.local.ensure(blobs)
-            or any(self.store.blob(one) is None for one in blobs)
-        ):
+        # Present at their size: `ensure` fetches what is missing bundle by bundle. Not read, which
+        # would cost every hit as much as its outputs weigh, for the few Buck2 then reads.
+        if blobs is None or not self.local.ensure(blobs):
             # A result we cannot back is a miss, never a hit that fails later: that is the whole
             # reason Buck2's "expired in the RE CAS" error stays out of reach.
             log.info("AC incomplete %s", action.hash[:12])
             self.counts.add("incomplete")
             abort(context, grpc.StatusCode.NOT_FOUND, "result names blobs this cache does not have")
         self.counts.add("hits")
-        log.info("AC hit %s, %d blobs", action.hash[:12], len(blobs))
+        log.info("AC hit %s, %d blobs, in %.1fs", action.hash[:12], len(blobs), time.monotonic() - started)
         return result
 
     def update(
@@ -301,7 +337,12 @@ class ActionCache:
         if not self.accepting:
             self.counts.add("uploads refused")
             abort(context, grpc.StatusCode.PERMISSION_DENIED, NOT_ACCEPTING)
-        prepared = self._prepare(action, result)
+        try:
+            prepared = self._prepare(action, result)
+        except ValueError as error:
+            # The store refusing something in the result that is not a digest: the client's bug,
+            # the same as one in the request.
+            abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(error))
         if prepared is None:
             return result
         payload, bundle_name, blobs = prepared
@@ -373,19 +414,6 @@ class ActionCache:
                 self.counts.add("misses")
                 return None
             pointer, result = self._trusted(action, stored)
-            # Another pointer to the same bundle, usually: the same outputs under an action digest
-            # that differs only in configuration. The pointer is signed and every blob it names is
-            # content-addressed and already proven, so there is nothing left for the bundle to
-            # prove, and a hit stays at one request rather than re-downloading the same bundle.
-            local = referenced(self.store.blob, result)
-            if local is not None and all(self.store.has_blobs(local)):
-                self.store.put_result(action, stored)
-                # The blobs may have come from this machine's own build and know no bundle yet;
-                # the signed pointer says which one has them, and that is what an eviction needs.
-                for digest in local:
-                    self.store.remember(digest, pointer.bundle)
-                log.info("AC from bucket %s, %d blobs already here", action.hash[:12], len(local))
-                return pointer, result
         except urllib.error.URLError as error:
             # A broken endpoint. Loud, and still a miss: the build rebuilds rather than failing on
             # something the bucket did.
@@ -398,24 +426,40 @@ class ActionCache:
             log.error("AC %s refused: %s", action.hash[:12], error)
             self.counts.add("pointers refused")
             return None
-        members = self.local.fetch_bundle(pointer.bundle)
-        if members is None:
-            return None
-        try:
-            blobs = self._proven(pointer, result, members)
-        except ValueError as error:
-            log.error("AC %s: %s", action.hash[:12], error)
-            self.local.refuse(pointer.bundle)
-            return None
-        self.local.admit(members, pointer.bundle)
-        self.store.put_result(action, stored)
-        log.info(
-            "AC from bucket %s, bundle %s, %d blobs",
-            action.hash[:12],
-            pointer.bundle[:12],
-            len(blobs),
-        )
-        return pointer, result
+        with self.local.fetching(pointer.bundle):
+            # Another pointer to the same bundle, usually: the same outputs under an action digest
+            # that differs only in configuration, or a lookup that waited for this lock while
+            # another one fetched it. The pointer is signed and every blob it names is
+            # content-addressed and already proven, so there is nothing left for the bundle to
+            # prove, and a hit stays at one request rather than re-downloading the same bundle.
+            local = referenced(self.store.blob, result)
+            if local is not None and all(self.store.has_blobs(local)):
+                self.store.put_result(action, stored)
+                # The blobs may have come from this machine's own build and know no bundle yet;
+                # the signed pointer says which one has them, and that is what an eviction needs.
+                self.store.remember_all(local, pointer.bundle)
+                log.info("AC from bucket %s, %d blobs already here", action.hash[:12], len(local))
+                return pointer, result
+            members = self.local.fetch_bundle(pointer.bundle)
+            if members is None:
+                return None
+            try:
+                blobs = self._proven(pointer, result, members)
+            except ValueError as error:
+                log.error("AC %s: %s", action.hash[:12], error)
+                self.local.refuse(pointer.bundle)
+                return None
+            started = time.monotonic()
+            self.local.admit(members, pointer.bundle)
+            self.store.put_result(action, stored)
+            log.info(
+                "AC from bucket %s, bundle %s, %d blobs, admitted in %.1fs",
+                action.hash[:12],
+                pointer.bundle[:12],
+                len(blobs),
+                time.monotonic() - started,
+            )
+            return pointer, result
 
     @staticmethod
     def _proven(
@@ -502,15 +546,15 @@ class ActionCache:
                 for digest in blobs:
                     data = self.store.blob(digest)
                     if data is None:
-                        log.error("not publishing %s: %s is gone from the store", action.hash[:12], digest)
-                        return
+                        raise RuntimeError(
+                            f"not publishing {action.hash[:12]}: {digest} is gone from the store"
+                        )
                     members[digest.hash] = data
                 writer.put(key, bundle.pack(members))
                 self.local.tainted.discard(bundle_name)
         writer.put(f"ac/{action.hash}", payload)
         # Now that it is there, every blob remembers which bundle it can be fetched from again.
-        for digest in blobs:
-            self.store.remember(digest, bundle_name)
+        self.store.remember_all(blobs, bundle_name)
         self.counts.add("published")
         if not shared:
             self.counts.add("bundles uploaded")
@@ -533,7 +577,11 @@ class ContentAddressableStorage:
         self, request: reapi.FindMissingBlobsRequest, context: grpc.ServicerContext
     ) -> reapi.FindMissingBlobsResponse:
         digests = request.blob_digests
-        answers = zip(digests, self.store.has_blobs(digests), strict=True)
+        try:
+            present = self.store.has_blobs(digests)
+        except ValueError as error:
+            abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        answers = zip(digests, present, strict=True)
         missing = [digest for digest, found in answers if not found]
         log.info("find missing: %d of %d", len(missing), len(digests))
         return reapi.FindMissingBlobsResponse(missing_blob_digests=missing)
@@ -544,18 +592,23 @@ class ContentAddressableStorage:
         if not self.accepting:
             self.local.counts.add("uploads refused")
             abort(context, grpc.StatusCode.PERMISSION_DENIED, NOT_ACCEPTING)
+        # Checked one by one, so that a bad blob is answered for alone, then stored in one
+        # `put_blobs`, for the reason it gives.
         answers = []
+        good: dict[reapi.Digest, bytes] = {}
         for entry in request.blobs:
             status = reapi.Status(code=reapi.OK)
             if entry.digest is None:
                 status = reapi.Status(code=reapi.INVALID_ARGUMENT, message="no digest")
             else:
                 try:
-                    self.store.put_blob(entry.digest, entry.data)
+                    check_blob(entry.digest, entry.data)
+                    good[entry.digest] = entry.data
                 except ValueError as error:
                     log.error("batch put %s: %s", entry.digest, error)
                     status = reapi.Status(code=reapi.INVALID_ARGUMENT, message=str(error))
             answers.append(reapi.Blob(digest=entry.digest, status=status))
+        self.store.put_blobs(good)
         log.info("batch put: %d blobs", len(answers))
         return reapi.BatchUpdateBlobsResponse(blobs=answers)
 
@@ -564,14 +617,12 @@ class ContentAddressableStorage:
     ) -> reapi.BatchReadBlobsResponse:
         answers = []
         for digest in request.digests:
-            data = self.local.blob(digest)
-            answers.append(
-                reapi.Blob(
-                    digest=digest,
-                    data=data or b"",
-                    status=reapi.Status(code=reapi.OK if data is not None else reapi.NOT_FOUND),
-                )
-            )
+            try:
+                data = self.local.blob(digest)
+                status = reapi.Status(code=reapi.OK if data is not None else reapi.NOT_FOUND)
+            except ValueError as error:
+                data, status = None, reapi.Status(code=reapi.INVALID_ARGUMENT, message=str(error))
+            answers.append(reapi.Blob(digest=digest, data=data or b"", status=status))
         found = sum(1 for one in answers if one.status and one.status.code == reapi.OK)
         log.info("batch read: %d of %d", found, len(answers))
         return reapi.BatchReadBlobsResponse(blobs=answers)
@@ -796,6 +847,10 @@ def build_server(
         grpc.server(
             futures.ThreadPoolExecutor(max_workers=workers),
             interceptors=[activity] if activity is not None else None,
+            # Buck2 keeps pinging while it waits for a slow lookup. By default, gRPC drops the
+            # connection after more than two pings less than five minutes apart with nothing sent
+            # back in between (grpc's doc/keepalive.md). 0 tolerates any number of them.
+            options=[("grpc.http2.max_ping_strikes", 0)],
         ),
     )
     server.add_generic_rpc_handlers(handlers(Local(store, bucket, counts), signer, verifier))

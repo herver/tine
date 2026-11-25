@@ -13,8 +13,8 @@ offline against that fetched cache.
 Go embeds the module list in every binary it links (`runtime/debug.BuildInfo`), so the image's SBOM reports
 those modules.
 
-`examples/image-go-project` is a complete worked example: a builder box, two projects checked out
-beside it, and an image carrying the resulting binaries.
+`examples/image-go-project` builds the Go projects checked out beside it in a box and copies two of their
+binaries into an image.
 
 ## Declaring a build
 
@@ -23,7 +23,6 @@ load("@tine//go:defs.bzl", "go")
 
 go.package(
     name = "hello",
-    box = ":go.box",
     packages = {"hello-cli": "./cmd/hello-cli"},
 )
 ```
@@ -33,24 +32,30 @@ go.package(
   `src = ":hello.git"` for a directory artifact produced by [`git.fetch()`](git.md). Individual files and
   lists of sources are not accepted. Nothing needs to be added inside the checkout, so a pristine project
   clone works.
-- The source directory must contain a `go.mod`, and its directory is the module root the build runs in.
-  An action finds it once the source directory has been built, and the fetch and the build are declared
-  from what it reports.
-- A checkout carrying more than one `go.mod` declares modules nested in the project, such as a tools or
-  testdata helper; go leaves those out of a `./...` build, and so does this. The `go.sum` beside the
-  project's own `go.mod` pins what the fetch may download. A module that resolves nothing has no
-  `go.sum`; then nothing is fetched and the build runs with `GOPROXY=off`, so anything go would want to
-  resolve fails.
+- The source directory must contain a `go.mod`. The directory of the selected `go.mod` is the module root
+  the build runs in. An action finds it once the source directory has been built, and the fetch and the
+  build are declared from what it reports.
+- Without `module_root`, the build selects the outermost `go.mod`. Every other `go.mod` must be in a
+  directory below it, such as a tools or testdata helper module. go leaves nested modules out of a `./...`
+  build, and so does `go.package()`. A checkout with a `go.mod` at its root builds that module, even when the
+  program is in a module below it. A checkout whose modules are side by side, with no `go.mod` above them,
+  fails. The `go.sum` beside the selected `go.mod` pins what the fetch may download, and a `go.sum` elsewhere
+  in `src` is not read. A module that resolves nothing has no `go.sum`; then nothing is fetched and the build
+  runs with `GOPROXY=off`, so anything go would want to resolve fails.
+- `module_root` selects the module to build in a checkout with several modules. It is the path of the
+  directory that contains the module's `go.mod`, relative to `src`, such as `"server"`. A `replace`
+  directive in the selected `go.mod` can point at another module in `src`. `packages` are relative to the
+  selected module.
 - `packages` maps output names to Go main packages, such as `{"etcd": "."}` or
   `{"server": "./cmd/server"}`. Values are paths relative to the module root or full import paths;
   keys set the binary's filename and sub-target name. Together these are the target's default outputs.
+  A binary named `box` fails analysis, because `box` names the sub-target that opens the build box.
   `packages` may be left out when the module holds exactly one main package. The binary is then named
   after the target, not after the package's directory as a bare `go build` would: `hello` above would
   yield `:hello[hello]` rather than `hello-cli`. Every main package under the module root counts,
   including ones under `tools/` or `examples/`. With none or several, the build fails and lists what
   it found.
-- `box` is the build environment, declared by the consumer because only the consumer knows what its
-  projects need.
+- `box` is the build environment. It defaults to `tine//go:build.box`, described below.
 - `tags` are Go build tags: a `//go:build <tag>` line decides whether a file compiles at all. Nothing
   declares which tags a project defines, and one tag set applies to every module in the build, so this
   list has to come from the project's own build recipe.
@@ -61,47 +66,277 @@ go.package(
   variable at link time, and `-extldflags` reaches the C linker of a cgo build.
 - `cgo_cflags` adds C compiler flags for a cgo build, on top of the `-O2 -g` the driver always passes. A
   project needs one when a dependency's headers do not compile as the box's compiler defaults.
-- `cgo` forces cgo on or off. Unset, the box toolchain's own default decides, as it would for a
+- `cgo` forces cgo on or off. Unset, the toolchain's own default decides, as it would for a
   `go build` run in the checkout by hand; that default is on. `cgo = False` builds static binaries and
   needs no C compiler, taking Go's own resolver and user lookup instead of the system's. `cgo = True`
   turns a missing C compiler into a build failure, rather than that same silent switch.
+- `build_mode` sets go's `-buildmode` to `"exe"` or `"pie"`. `"pie"` builds position-independent
+  executables, which the kernel loads at a random address on each run. Unset, the toolchain's default
+  applies, which is `"exe"` on x86-64 and AArch64 Linux.
+- `toolchain` is a Go toolchain that builds the project instead of the box's `go`, or
+  `catalog//:go.releases` to build it with the Go version that the project's `.go-version` names. See
+  [Building with your own Go toolchain](#building-with-your-own-go-toolchain) and
+  [Building with the Go version that a project names](#building-with-the-go-version-that-a-project-names).
 
-The binaries are ordinary artifacts, so an image installs one with an `image.copy()` operation; see the
+The binaries are ordinary artifacts, so an image installs one with an `image.ops.copy()` operation; see the
 example.
 
-For example, the `etcd` target builds the module's root package (`.`) as the binary `etcd-server`,
-available through `:etcd[etcd-server]`:
+For example, etcd's build scripts build the server in `server/`, which contains the server module. The
+server's `go.mod` replaces other etcd modules with their directories in the checkout:
+
+```
+replace (
+	go.etcd.io/etcd/api/v3 => ../api
+	go.etcd.io/etcd/client/pkg/v3 => ../client/pkg
+	go.etcd.io/etcd/client/v3 => ../client/v3
+	go.etcd.io/etcd/pkg/v3 => ../pkg
+)
+```
+
+The `etcd` target below selects the server module and builds its root package (`.`) as the binary
+`etcd-server`, available through `:etcd[etcd-server]`. The fetch and the build find the replaced modules in
+the checkout:
 
 ```Starlark
 go.package(
     name = "etcd",
-    box = ":go.box",
+    module_root = "server",
     packages = {"etcd-server": "."},
 )
 ```
 
-## What the builder box needs
+## Running a project's tests
+
+Set `test_packages` on the `go.package()` to compile the project's tests in its build, and declare a
+`go.test()` that runs them:
 
 ```Starlark
-box.new(
-    name = "go.box",
-    packages = ["ca-certificates", "golang", "python3"],
-    release = "tine//catalog:fedora.rawhide.release",
+go.package(
+    name = "hello",
+    packages = {"hello-cli": "./cmd/hello-cli"},
+    test_packages = ["./..."],
+)
+
+go.test(
+    name = "hello-test",
+    package = ":hello",
 )
 ```
 
-- `golang` is the toolchain, `python3` runs the in-box drivers, and `ca-certificates` gives the module
-  fetch its TLS trust for `proxy.golang.org`. A module that proxy does not serve is fetched directly, with
-  `git`, which then has to be there too.
-- Both actions set `GOTOOLCHAIN=local`: the box's go is the toolchain, never a downloaded one, so a
-  `go.mod` demanding a newer go than the box carries fails the build instead.
-- A project using cgo needs `gcc` and the `-devel` packages it binds, plus `pkgconf-pkg-config` and `rpm`
-  for a `#cgo pkg-config:` directive, because Fedora's `/usr/bin/pkg-config` shells out to `rpm --eval`.
-  Its binaries then link dynamically, so the image needs the matching runtime packages. This is not
-  limited to projects that write C: with cgo enabled, importing `net` or `os/user` is enough. `cgo =
-  False` uses Go's own implementations of those instead, and needs no C compiler.
+`buck test :hello-test` runs the tests in the package's box, without network, once for each distribution
+that the package builds for.
 
-The box is a build environment. It never becomes part of an image, and the toolchain is not shipped.
+- `test_packages` lists Go package patterns relative to the module root, such as `["./..."]` or
+  `["./pkg/...", "./internal/store"]`. The build compiles one test binary for each matched package that has
+  `_test.go` files, with the same tags, cgo setting, `build_mode` and `linker_flags` as the binaries.
+  Building the binaries also compiles the tests.
+- A test that does not compile fails the build of the `go.package()`, and with it the binaries. go's vet
+  checks do not run, so a vet finding fails neither the build nor the tests.
+- A pattern that matches a package outside `src`, such as a dependency's package, fails the build.
+- Each test binary runs in its package's directory, as with `go test`, so a test finds its `testdata/`.
+  The sources are read-only while the tests run, so a test that writes into its package directory fails.
+- `args` passes arguments to every test binary. A test binary takes the `-test.` form of the `go test`
+  flags, such as `["-test.short", "-test.skip=TestNetwork"]`. Each binary has a timeout of 10 minutes,
+  which `-test.timeout` overrides.
+- `labels` are passed to the test runner, so `buck test --exclude <label>` can leave the test out.
+
+## The build box
+
+`tine//go:build.box` contains the distribution's Go toolchain and `ca-certificates`, which gives the module
+fetch its TLS trust for `proxy.golang.org`. It installs them from the release of the distribution that the
+binaries are built for. Like an image, `go.package()` builds once for each distribution of its package,
+and `:hello.fedora` names the build for Fedora. See
+[Choosing a distribution](images.md#choosing-a-distribution).
+
+- Fedora's Go package depends on `gcc`, so go enables cgo in the Fedora box. A binary that imports `net` or
+  `os/user` then links dynamically against the C library. The Arch and Debian boxes contain no C compiler,
+  so go disables cgo there and links static binaries. `cgo = False` builds static binaries for every
+  distribution.
+- A project that depends on a module that `proxy.golang.org` does not serve needs `git` in
+  `buildroot_packages`, because go fetches that module directly with `git`.
+- The fetch and the build set `GOTOOLCHAIN=local`, so go never downloads another toolchain. A `go.mod`
+  that requires a newer Go than the box's `go`, or than the `toolchain`, fails the build.
+
+The box is a build environment. It never becomes part of an image.
+
+A project using cgo needs `gcc` and the `-devel` packages it binds. Add them with `buildroot_packages`:
+
+```Starlark
+go.package(
+    name = "hello",
+    buildroot_packages = ["gcc", "libpathrs-devel", "pkgconf"],
+)
+```
+
+A `#cgo pkg-config:` directive needs `pkgconf`, because the build runs `pkgconf` in place of `pkg-config`.
+The binaries then link dynamically, so the image needs the matching runtime packages. This is not limited to
+projects that write C: with cgo enabled, importing `net` or `os/user` is enough. `cgo = False` uses Go's own
+implementations of those instead, and needs no C compiler.
+
+The packages are installed in a layer on top of the box. Every `go.package()` that adds the same packages
+to the same box shares that layer. The names are the distribution's own. A project that builds for several
+families picks them with `distribution.select()`.
+
+The build fails when the box's packages and `buildroot_packages` together resolve to other packages than
+the box contains, such as another provider of a library. Then declare a box with all of the packages, and
+pass it as `box`.
+
+`buck run :hello[box]` opens a shell in the box that builds `:hello`, with its `buildroot_packages`
+installed.
+
+To build in a box of your own, pass it as `box`. Its packages need the Go toolchain, `ca-certificates` and
+`python3`, which runs tine's drivers inside the box.
+
+## Building with your own Go toolchain
+
+Set `toolchain` to build with a Go release other than the one in the box, such as an older release that a
+project requires. An upstream Go release from go.dev works as a toolchain. Pin it in the project's
+`tine.lock.json` and download it with [`http.tool()`](http.md).
+
+Add a pin for the Go version to `tine.lock.json`, without digests:
+
+```json
+{
+  "go": {
+    "url": "https://go.dev/dl",
+    "release": "go1.27",
+    "releases": {
+      "url": "https://go.dev/dl/?mode=json&include=all",
+      "pattern": "go1\\.27\\.[0-9]+"
+    },
+    "platforms": {
+      "arm64": {"artifact": "go1.27.linux-arm64.tar.gz", "strip_prefix": "go"},
+      "x86_64": {"artifact": "go1.27.linux-amd64.tar.gz", "strip_prefix": "go"}
+    }
+  }
+}
+```
+
+The pattern matches the Go 1.27 releases in the release list on go.dev. Run `tine bump` to move the pin to
+the newest of them and fill in the digests and sizes:
+
+```sh
+tine bump --tool go
+```
+
+```
+go: updated go1.27 -> go1.27.2
+```
+
+Declare the toolchain and pass it to `go.package()`:
+
+```Starlark
+load("//:tine.lock.json", pins = "value")
+load("@tine//box:defs.bzl", "box")
+load("@tine//go:defs.bzl", "go")
+load("@tine//http:defs.bzl", "http")
+
+http.tool(
+    name = "go",
+    directory = True,
+    path = "bin/go",
+    spec = pins["go"],
+)
+
+box.new(
+    name = "go-toolchain.box",
+    packages = ["ca-certificates"],
+    release = "catalog//:fedora.rawhide.release",
+)
+
+go.package(
+    name = "hello",
+    box = ":go-toolchain.box",
+    packages = {"hello-cli": "./cmd/hello-cli"},
+    toolchain = ":go",
+)
+```
+
+- The toolchain's `go` fetches the modules and builds the binaries and the tests. The box does not need
+  the `golang` package.
+- `toolchain` takes any target whose output is a Go root directory, the directory that contains `bin/go`.
+- The toolchain runs inside the box, so Buck downloads the release for the box's architecture. go then
+  cross-compiles for the target architecture, as the box's `go` does.
+- `buck run :go -- version` runs the pinned `go`.
+- `bump` keeps the pin on the releases that the pattern matches. Change the pattern, such as to
+  `"go1\\.28\\.[0-9]+"`, and run `bump` again to move to another minor version.
+
+## Building with the Go version that a project names
+
+Set `toolchain` to `catalog//:go.releases` to build a project with the Go version that its `.go-version`
+file names. The checkouts of Kubernetes and etcd contain such a file at their root. etcd builds its server
+module in `server/`:
+
+```Starlark
+load("@tine//box:defs.bzl", "box")
+load("@tine//go:defs.bzl", "go")
+
+box.new(
+    name = "go-toolchain.box",
+    packages = ["ca-certificates"],
+    release = "catalog//:fedora.rawhide.release",
+)
+
+go.package(
+    name = "etcd",
+    box = ":go-toolchain.box",
+    module_root = "server",
+    packages = {"etcd-server": "."},
+    toolchain = "catalog//:go.releases",
+)
+```
+
+The catalog contains the newest patch release of every minor version from Go 1.21 on. The build uses the
+catalog's release of the minor version that `.go-version` names: a project whose `.go-version` names `1.26.2`
+builds with the catalog's Go 1.26 release, such as `go1.26.10`. Go publishes a patch release only to fix
+critical problems, such as security problems. The binaries that the catalog's release builds contain those
+fixes.
+
+- The build uses the `.go-version` nearest to the module root. It looks in the module root first, then in
+  each parent directory up to the root of the source tree. etcd's `server/` contains no `.go-version`, so the
+  build uses the one at the root of the checkout.
+- `.go-version` contains one Go version, such as `1.26.8`, `go1.26.8`, `1.26` or `1.26rc1`.
+- Buck downloads a release only when a `go.package()` build uses it, and every `go.package()` that uses the
+  same release shares one download.
+- The `go` of the release runs inside the box, as with a pinned toolchain. The box does not need the
+  `golang` package, and Buck downloads the archive for the box's architecture.
+
+The build fails when:
+
+- neither the module root nor a parent directory up to the root of the source tree contains a
+  `.go-version`;
+- the `.go-version` is a symlink, is larger than 256 bytes, or names no Go version;
+- the catalog contains no release of the minor version that `.go-version` names;
+- `.go-version` names a newer patch release than the catalog contains.
+
+`catalog/snapshot/go/go.json` contains the URL, sha256 and size of the archives of every release.
+`refresh-catalog` writes it from go.dev's release list, so the refresh downloads no archive. Advance the
+Go releases to move every minor version to its newest patch release, and to add the minor versions that Go
+released since the last advance:
+
+```sh
+tine buck run tine//tools:refresh-catalog -- --go --advance
+```
+
+`--go` refreshes the Go releases and nothing else, unless `--box` also selects boxes. Without `--go`,
+`--advance` also moves the repository pins. `--box` without `--go` doesn't refresh the Go releases.
+
+- An advance rebuilds every project that builds with a minor version whose release moved.
+- `verify-catalog` fails when go.dev lists another sha256 or size for a release in the snapshot, or no
+  longer lists it.
+
+A project that declares its own `catalog` cell declares `go.releases` in it to build with
+`catalog//:go.releases`, and advances the Go releases with `--go --advance` to write the cell's
+`snapshot/go/go.json`:
+
+```Starlark
+load("@tine//go:defs.bzl", "go")
+
+go.releases(
+    name = "go.releases",
+    visibility = ["PUBLIC"],
+)
+```
 
 ## Properties and limits
 
@@ -110,8 +345,10 @@ How the modules are pinned, fetched and verified is described under "Go source b
 
 - **A project is one cache unit, and reruns are incremental for a `tine mount`.** Any change to its sources
   reruns the build action for the whole project, but go's build cache survives between runs, so it recompiles
-  only what changed. Only changes to `go.mod`/`go.sum` rerun the fetch, whose module cache survives too, so a
-  dependency bump downloads only what is missing. `buck2 clean` is what forces a build from scratch.
+  only what changed. Only changes to `go.sum` and to the `go.mod` files the fetch reads rerun the fetch. Its
+  module cache is kept too, so a dependency bump downloads only what is missing. The fetch reads the
+  project's `go.mod` and the `go.mod` of each module that it replaces with a directory. `buck clean` is what
+  forces a build from scratch.
 - **A fetched or committed project keeps neither cache between runs**. Its build cache never reaches the
   shared cache, only the binaries; the module cache does, refetched whole whenever the pins move.
 - **`go.mod` and `go.sum` must agree.** The build runs `-mod=readonly`, so a stale `go.sum` fails the
@@ -119,8 +356,6 @@ How the modules are pinned, fetched and verified is described under "Go source b
 - **The fetch is a network action**, one of the few build steps that reach out at all. It declares its own
   `GOPROXY` (`proxy.golang.org`, then `direct`) and checksum database rather than taking the box's,
   which a distribution patches.
-- **A build cannot `rename(2)` a directory of its sources.** It builds on an overlay of them, where that
-  fails with `EXDEV`, as it does in a container. `mv` works, since it copies instead.
 - **A local `go build` in the checkout wants `-o`.** A bare one writes its binary into the current
   directory. Since `src` is an action input, use `-o` to place that binary outside the source directory.
 - **A checkout is not the only way in.** The module is found in the built sources rather than at parse
@@ -129,4 +364,12 @@ How the modules are pinned, fetched and verified is described under "Go source b
 - **A committed `vendor/` tree is ignored**, because the build passes `-mod=readonly`, and an explicit
   `-mod` is what turns off go's habit of preferring a vendor directory. Every module comes from the
   `go.sum` either way.
-- **`go.work` workspaces are refused**, because a workspace spans modules where this rule builds one.
+- **A `replace` directive must point inside `src`.** A `go.mod` that replaces a module with a directory
+  outside `src` fails the build, because the build would read files that are not among its inputs.
+- **`module_root` must be a directory in `src` that contains a `go.mod`.** An empty path, an absolute path,
+  a path with `..` and a path through a symlink to a directory fail the build.
+- **A committed `go.work` is ignored**, because the build sets `GOWORK=off`. The module builds against its
+  own `go.sum`.
+- **The build reads the source directory as it is on disk**, including the files that Buck ignores. An
+  ignored `.go` file, such as generated code, is compiled into the binary. See
+  [Building from a local checkout instead](git.md#building-from-a-local-checkout-instead).

@@ -11,42 +11,41 @@ load("@tine//box:defs.bzl", "box")
 load("@tine//cargo:defs.bzl", "cargo")
 load("@tine//git:defs.bzl", "git")
 load("@tine//image:defs.bzl", "image")
-load("@tine//package:defs.bzl", "package")
 
-# The build environment for our Rust projects; it never reaches an image.
-box.new(
-    name = "rust.box",
-    packages = [
-        "cargo",
-        "gcc",
-        "rust",
-    ],
-    release = "tine//catalog:fedora.rawhide.release",
-)
-
-# Products use git.fetch() for projects they build but do not vendor. This example's `hello/` directory
-# overrides the fetch, avoiding network access during the test. Both paths give cargo.package() the same
-# opaque directory artifact and exercise its workspace discovery.
-git.fetch(
-    name = "hello.git",
-    repo = "https://github.com/example/hello",
-    rev = "1c9e0f4b0f7d2a5e8b3c6d1a4f7b2e5c8d0a3f6b",
-)
-
-# A fetched project needs no build file of its own. Its Cargo.lock both pins the crates and marks the
-# workspace root, even though neither it nor Cargo.toml is visible until the checkout action runs.
+# A checked-out project needs no build file of its own: the sources default to the directory named
+# after the target. Its Cargo.lock both pins the crates and marks the workspace root, even though
+# neither it nor Cargo.toml is visible until the source tree has been built.
 cargo.package(
     name = "hello",
     binaries = ["hello-cli"],
-    box = ":rust.box",
-    srcs = [":hello.git"],
 )
 
-# A project with no dependencies at all, which therefore commits no Cargo.lock.
+# A project with no dependencies. Its Cargo.lock lists only the project itself.
 cargo.package(
     name = "nodeps",
     binaries = ["nodeps"],
-    box = ":rust.box",
+)
+
+# Products use git.fetch() for projects they build but do not vendor. The local checkout must override
+# this fetch, so its revision is deliberately a placeholder.
+git.fetch(
+    name = "nodeps.git",
+    repo = "https://github.com/example/nodeps",
+    rev = "1111111111111111111111111111111111111111",
+)
+
+cargo.package(
+    name = "renamed",
+    binaries = ["nodeps"],
+    src = ":nodeps.git",
+)
+
+cargo.package(
+    name = "incremental",
+    binaries = ["nodeps"],
+    # Exercise persistent output even when the checkout is not mounted in dev mode.
+    dev = True,
+    src = "nodeps",
 )
 
 box.sh_test(
@@ -54,10 +53,10 @@ box.sh_test(
     labels = ["image"],
     box = "@tine//tools:dev.box",
     script = 'for binary in "$@"; do [[ "$("$binary")" == "nothing to resolve" ]]; done',
-    # $(exe) goes through RunInfo: a single binary is run as the target, any binary as its sub-target.
     args = [
-        "$(exe :nodeps)",
-        "$(exe :nodeps[nodeps])",
+        "$(location :nodeps)",
+        "$(location :renamed[nodeps])",
+        "$(location :incremental)",
     ],
 )
 
@@ -69,22 +68,16 @@ image.install(
     # against glibc.
     packages = ["glibc"],
     ops = [
-        image.copy(":hello[hello-cli]", "/usr/bin/hello-cli"),
-        image.copy(":nodeps[nodeps]", "/usr/bin/nodeps"),
-        image.mkdir("/usr/share/hello"),
+        image.ops.copy(":hello[hello-cli]", "/usr/bin/hello-cli"),
+        image.ops.copy(":nodeps[nodeps]", "/usr/bin/nodeps"),
+        image.ops.mkdir("/usr/share/hello"),
     ],
 )
 
-package.manager(
-    name = "image.package-manager",
-    base = "tine//catalog:fedora.rawhide.package-manager",
-)
-
 # `:demo[sbom][cyclonedx]` reports the crates the binary was built from, next to the image's packages.
-image.rootfs_archive(
+image.archive(
     name = "demo",
-    package_manager = ":image.package-manager",
-    ops = [image.install_from(":demo.install")],
+    ops = [image.ops.install_from(":demo.install")],
     format = "tar",
 )
 

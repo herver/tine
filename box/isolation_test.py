@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack, chdir
 from pathlib import Path
+from typing import override
 from unittest import mock
 
 import isolation
@@ -105,68 +106,171 @@ class TestStartup(unittest.TestCase):
         self.assertFalse(unwanted & set(process.stdout.splitlines()))
 
 
+class TestLibseccomp(unittest.TestCase):
+    def test_libseccomp_is_found_in_each_library_directory(self) -> None:
+        for directory in ("usr/lib64", f"usr/lib/{os.uname().machine}-linux-gnu", "usr/lib"):
+            with self.subTest(directory=directory), tempfile.TemporaryDirectory(dir="/var/tmp") as root:
+                library = Path(root, directory, "libseccomp.so.2")
+                library.parent.mkdir(parents=True)
+                library.touch()
+
+                self.assertEqual(isolation._libseccomp(root), str(library))
+
+    def test_a_root_without_libseccomp_fails(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as root:
+            with self.assertRaises(isolation.SandboxOSError) as raised:
+                isolation._libseccomp(root)
+
+            self.assertEqual(raised.exception.message, "the box contains no libseccomp.so.2")
+
+
+def _path(fd: int) -> Path:
+    """Close `fd` and return the path it referred to."""
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{fd}"))
+    finally:
+        os.close(fd)
+
+
+class TestKernel(unittest.TestCase):
+    def test_the_running_kernel_passes(self) -> None:
+        isolation.check_kernel()
+
+    def test_an_unavailable_syscall_names_the_kernel_and_seccomp(self) -> None:
+        # No kernel implements system call number 1023, so the probe fails with ENOSYS like an old kernel.
+        for release in ("6.12", "7.1"):
+            with (
+                self.subTest(release=release),
+                mock.patch.object(isolation, "_NR_OPEN_TREE_ATTR", 1023),
+                mock.patch.object(os, "uname", return_value=os.uname_result(("Linux", "", release, "", ""))),
+                self.assertRaises(isolation.SandboxOSError) as raised,
+            ):
+                isolation.check_kernel()
+            self.assertIn(f"unavailable on Linux {release}", raised.exception.message)
+            self.assertIn("open_tree_attr()", raised.exception.message)
+            self.assertIn("seccomp", raised.exception.message)
+
+    def test_a_kernel_before_6_16_names_the_version(self) -> None:
+        # Linux 6.15 has open_tree_attr() but refuses the overlays of snapshot roots. Pretend the
+        # running kernel is one of several releases and check that only those before 6.16 fail.
+        for release, supported in (
+            ("6.15.9", False),
+            ("6.16-rc1", True),
+            ("6.16.0-arch1-1", True),
+            ("7.0", True),
+        ):
+            with (
+                self.subTest(release=release),
+                mock.patch.object(os, "uname", return_value=os.uname_result(("Linux", "", release, "", ""))),
+            ):
+                if supported:
+                    isolation.check_kernel()
+                    continue
+                with self.assertRaises(isolation.SandboxOSError) as raised:
+                    isolation.check_kernel()
+                self.assertIn(f"Linux 6.16 or newer; this is Linux {release}", raised.exception.message)
+
+    def test_an_unsupported_root_explains_pivot_root_failure(self) -> None:
+        with (
+            mock.patch.object(isolation, "_move_mount"),
+            mock.patch.object(os, "fchdir"),
+            mock.patch.object(isolation._LIBC, "pivot_root", return_value=-1),
+            mock.patch.object(isolation.ctypes, "get_errno", return_value=errno.EINVAL),
+            self.assertRaises(isolation.SandboxOSError) as raised,
+        ):
+            isolation._switch_root(123)
+        self.assertIn("initramfs", raised.exception.message)
+
+
 class TestPaths(unittest.TestCase):
-    def test_nofollow_dot_components_do_not_escape_the_supplied_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
-            root = Path(directory)
-            (root / "sub").mkdir()
-            for path in ("/", "/.", "/..", "/../..", "/sub/..", "/sub/../../"):
-                with self.subTest(path=path):
-                    self.assertEqual(isolation._resolve(root, path, nofollow=True), str(root))
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/var/tmp")))
+        self.fd = os.open(self.root, os.O_PATH | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.fd)
 
-    def test_absolute_symlinks_resolve_inside_the_supplied_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
-            root = Path(directory)
-            (root / "real").mkdir()
-            (root / "real/file").touch()
-            (root / "alias").symlink_to("/real")
-            (root / "real/link").symlink_to("/real/file")
+    def test_opening_a_missing_directory_can_fail_without_creating_it(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            isolation.open_directory(self.fd, "missing/child", create=False)
+        self.assertFalse((self.root / "missing").exists())
 
-            self.assertEqual(isolation._resolve(root, "/alias/link"), str(root / "real/file"))
-            self.assertEqual(isolation._resolve(root, "/alias/link", nofollow=True), str(root / "real/link"))
-            self.assertEqual(
-                isolation._resolve(root, "/alias/link/", nofollow=True), str(root / "real/link")
-            )
+    def test_dot_components_do_not_escape_the_root(self) -> None:
+        (self.root / "sub").mkdir()
+        for path in ("/", "/.", "/..", "/../..", "/sub/..", "/sub/../../"):
+            with self.subTest(path=path):
+                self.assertEqual(_path(isolation.open_directory(self.fd, path)), self.root)
+
+    def test_absolute_symlinks_resolve_inside_the_root(self) -> None:
+        (self.root / "real").mkdir()
+        (self.root / "real/file").touch()
+        (self.root / "alias").symlink_to("/real")
+        (self.root / "real/link").symlink_to("/real/file")
+
+        self.assertEqual(_path(isolation._lookup(self.fd, "/alias/link")), self.root / "real/file")
+        self.assertEqual(
+            _path(isolation._lookup(self.fd, "/alias/link", os.O_NOFOLLOW)), self.root / "real/link"
+        )
 
     def test_parent_components_are_resolved_after_symlinks(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
-            root = Path(directory)
-            (root / "sub/directory").mkdir(parents=True)
-            (root / "jump").symlink_to("sub/directory")
-            (root / "sub/file").touch()
+        (self.root / "sub/directory").mkdir(parents=True)
+        (self.root / "jump").symlink_to("sub/directory")
+        (self.root / "sub/file").touch()
 
-            self.assertEqual(isolation._resolve(root, "/jump/../file"), str(root / "sub/file"))
+        self.assertEqual(_path(isolation._lookup(self.fd, "/jump/../file")), self.root / "sub/file")
 
-    def test_relative_paths_only_resolve_against_the_current_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory, chdir(directory):
-            root = Path(directory)
-            (root / "target").touch()
-            (root / "alias").symlink_to("target")
+    def test_a_lookup_that_races_with_a_mount_is_retried(self) -> None:
+        busy = BlockingIOError(errno.EAGAIN, "openat2")
+        with mock.patch.object(isolation, "_syscall", side_effect=[busy, busy, 42]) as syscall:
+            self.assertEqual(isolation._lookup(self.fd, "/sub/../file"), 42)
+        self.assertEqual(syscall.call_count, 3)
 
-            self.assertEqual(isolation._resolve(Path("/"), Path("alias")), str(root / "target"))
-            self.assertEqual(isolation._resolve("/", "alias", nofollow=True), str(root / "alias"))
-            with self.assertRaisesRegex(ValueError, "must be absolute"):
-                isolation._resolve(root, "alias")
+    def test_relative_paths_resolve_against_the_working_directory(self) -> None:
+        (self.root / "target").touch()
+        (self.root / "alias").symlink_to("target")
+
+        with chdir(self.root):
+            self.assertEqual(_path(isolation._lookup(isolation.AT_FDCWD, "alias")), self.root / "target")
+            self.assertEqual(
+                _path(isolation._lookup(isolation.AT_FDCWD, "alias", os.O_NOFOLLOW)), self.root / "alias"
+            )
+
+    def test_missing_directories_are_created_inside_the_root(self) -> None:
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/var/tmp")))
+        (self.root / outside.relative_to("/")).mkdir(parents=True)
+        (self.root / "alias").symlink_to(outside)
+
+        created = _path(isolation.open_directory(self.fd, "/alias/new/directory"))
+
+        self.assertEqual(created, self.root / outside.relative_to("/") / "new/directory")
+        self.assertFalse((outside / "new").exists())
+
+    def test_a_path_that_leaves_the_root_fails_beneath_it(self) -> None:
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/var/tmp")))
+        (self.root / "absolute").symlink_to(outside)
+        (self.root / "relative").symlink_to(Path("..") / outside.name)
+        for path in ("absolute/new", "relative/new", "../new", "/new"):
+            with self.subTest(path=path), self.assertRaises(OSError) as caught:
+                isolation.open_directory(self.fd, path, beneath=True)
+            self.assertEqual(caught.exception.errno, errno.EXDEV)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.root.parent / "new").exists())
 
     def test_symlink_target_text_is_preserved(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
-            target = Path(directory) / "link"
-            isolation.Symlink("./usr/bin/", target).mount()
+        target = self.root / "link"
+        isolation.Symlink("./usr/bin/", target).attach()
 
-            self.assertEqual(os.readlink(target), "./usr/bin/")
+        self.assertEqual(os.readlink(target), "./usr/bin/")
 
-    def test_symlink_parents_are_resolved_inside_the_supplied_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
-            root, outside = Path(directory) / "root", Path(directory) / "outside"
-            inside = root / outside.relative_to("/")
-            inside.mkdir(parents=True)
-            outside.mkdir()
-            (root / "alias").symlink_to(outside)
+    def test_symlink_parents_are_resolved_inside_the_root(self) -> None:
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/var/tmp")))
+        inside = self.root / outside.relative_to("/")
+        inside.mkdir(parents=True)
+        (self.root / "alias").symlink_to(outside)
 
-            isolation.Symlink("target", "/alias/link").mount(new_root=root)
+        isolation.Symlink("target", "/alias/link").attach(self.fd)
 
-            self.assertFalse((outside / "link").is_symlink())
-            self.assertEqual((inside / "link").readlink(), Path("target"))
+        self.assertFalse((outside / "link").is_symlink())
+        self.assertEqual((inside / "link").readlink(), Path("target"))
 
     def test_mounts_sort_by_components_and_bind_over_symlinks(self) -> None:
         parent = isolation.Tmpfs("/usr")
@@ -181,25 +285,157 @@ class TestPaths(unittest.TestCase):
         )
 
 
+class TestExitStack(unittest.TestCase):
+    def test_every_context_exits_in_reverse_order_when_an_exit_fails(self) -> None:
+        calls = mock.MagicMock()
+        calls.middle.__exit__.side_effect = OSError("middle")
+        with self.assertRaisesRegex(OSError, "middle"), isolation.ExitStack() as stack:
+            for context in (calls.first, calls.middle, calls.last):
+                stack.enter_context(context)
+        self.assertEqual(
+            [call[0] for call in calls.mock_calls if call[0].endswith("__exit__")],
+            ["last.__exit__", "middle.__exit__", "first.__exit__"],
+        )
+
+
+class TestSubmounts(unittest.TestCase):
+    def test_lists_the_visible_mounts_below_a_directory_parents_first(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory, ExitStack() as stack:
+            root = Path(directory)
+            tree, source = root / "tree", root / "source"
+            (source / "inner").mkdir(parents=True)
+            tree.mkdir()
+            # The binds below `tree` stay attached when their contexts exit. The unmount of the tmpfs at
+            # `tree` removes all of them.
+            stack.enter_context(isolation.Tmpfs(tree)).mount()
+            for name in ("with space", "covered/below"):
+                (tree / name).mkdir(parents=True)
+            # The name of `tree2` starts with the name of `tree`, but `tree2` is not below `tree`.
+            (root / "tree2").mkdir()
+            # The kernel gives a mount its ID when it creates the mount. `covering` gets a lower ID than the
+            # mount at covered/below, although `covering` covers that mount. `inner` gets a lower ID than the
+            # mount at "with space", although `inner` is below that mount.
+            covering = stack.enter_context(isolation.Bind(source, tree / "covered"))
+            inner = stack.enter_context(isolation.Bind(source, tree / "with space/inner"))
+            for target in ("with space", "covered/below"):
+                stack.enter_context(isolation.Bind(source, tree / target)).attach()
+            inner.attach()
+            covering.attach()
+            stack.enter_context(isolation.Bind(source, root / "tree2")).mount()
+
+            # The bind at covered hides the bind at covered/below. Mounts at the same depth come in the order
+            # that the kernel created them.
+            expected = [tree / "covered", tree / "with space", tree / "with space/inner"]
+            self.assertEqual(isolation.submounts(str(tree)), [str(path) for path in expected])
+
+
 class TestMountContexts(unittest.TestCase):
-    def test_overlay_paths_escape_option_separators(self) -> None:
+    def test_failed_mount_metadata_lookup_detaches_the_mount(self) -> None:
         with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
             root = Path(directory)
-            # A separator of each class, and two lowers, so the joined list is exercised as well.
-            top, bottom, upper, work = (root / name for name in ("to:p", "bot,tom", "up,per", "wo\\rk"))
-            for path in (top, bottom, upper, work):
+            source, target, jail = (root / name for name in ("source", "target", "jail"))
+            for path in (source, target, jail):
                 path.mkdir()
-            (top / "original").write_text("original")
-            (bottom / "underneath").write_text("underneath")
-            (top / "shadowed").write_text("from the top")
-            (bottom / "shadowed").write_text("from the bottom")
+            (target / "underlying").touch()
+            with (
+                isolation.Bind("/proc", jail / "proc") as proc,
+                isolation.Close(os.open(target, os.O_PATH | os.O_DIRECTORY)) as fd,
+                isolation.Bind(source, ".") as mounted,
+            ):
+                proc.mount()
+                with (
+                    isolation.chroot(jail),
+                    mock.patch.object(isolation, "_statmount_point", side_effect=OSError("lookup failed")),
+                    self.assertRaisesRegex(OSError, "lookup failed"),
+                ):
+                    os.fchdir(fd)
+                    mounted.mount()
+            self.assertTrue((target / "underlying").exists())
+
+    def test_overlay_paths_may_contain_option_separators(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            root = Path(directory)
+            # The mount option parser splits options at `,`. overlayfs splits lowerdir at `:` and treats `\`
+            # as an escape. overlayfs gets its layers as file descriptors and doesn't parse their paths.
+            lower, upper, work = (root / name for name in ("lo:w,er", "up,per", "wo\\rk"))
+            for path in (lower, upper, work):
+                path.mkdir()
+            (lower / "original").write_text("original")
             target = root / "target"
-            with isolation.Overlay((top, bottom), upper, work, target, lazy_unmount=False):
+            with isolation.Overlay(lower, upper, work, target) as mounted:
+                mounted.mount()
                 self.assertEqual((target / "original").read_text(), "original")
-                self.assertEqual((target / "underneath").read_text(), "underneath")
-                self.assertEqual((target / "shadowed").read_text(), "from the top")
                 (target / "generated").write_text("output")
             self.assertEqual((upper / "generated").read_text(), "output")
+
+    def test_overlay_reads_data_layers_without_changing_blobs(self) -> None:
+        # Sparse lower files provide distinct metadata for shared data in two hidden data layers.
+        # Reading must not copy data up; chmod and writes must leave the data layers unchanged.
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            root = Path(directory)
+            lower, first, second, upper, work = (
+                root / name for name in ("lower", "data:one", "data,two\\", "upper", "work")
+            )
+            for path in (lower, first, second, upper, work):
+                path.mkdir()
+            (first / "shared").write_bytes(b"first")
+            (second / "shared").write_bytes(b"other")
+            (second / "inherited").write_bytes(b"parent")
+            for name, redirect, size, mode, timestamp in (
+                ("a", "shared", 5, 0o640, 111),
+                ("b", "shared", 5, 0o755, 222),
+                ("c", "inherited", 6, 0o644, 333),
+            ):
+                path = lower / name
+                with path.open("wb") as stream:
+                    stream.truncate(size)
+                os.setxattr(path, "user.overlay.metacopy", b"")
+                os.setxattr(path, "user.overlay.redirect", ("/" + redirect).encode())
+                path.chmod(mode)
+                os.utime(path, ns=(timestamp, timestamp))
+            before = (first / "shared").stat()
+            target = root / "target"
+            with isolation.Overlay(
+                lower, upper, work, target, datadirs=(first, second), strict_unmount=True
+            ) as mounted:
+                mounted.mount()
+                self.assertEqual({path.name for path in target.iterdir()}, {"a", "b", "c"})
+                self.assertEqual((target / "a").read_bytes(), b"first")
+                self.assertEqual((target / "b").read_bytes(), b"first")
+                self.assertEqual((target / "c").read_bytes(), b"parent")
+                self.assertFalse((target / "a").samefile(target / "b"))
+                self.assertEqual((target / "a").stat().st_mode & 0o777, 0o640)
+                self.assertEqual((target / "b").stat().st_mtime_ns, 222)
+                self.assertFalse((upper / "a").exists())
+                (target / "a").chmod(0o600)
+                self.assertTrue((upper / "a").exists())
+                self.assertEqual((upper / "a").read_bytes(), b"first")
+                (target / "a").write_bytes(b"changed")
+                self.assertEqual((target / "b").read_bytes(), b"first")
+            self.assertEqual((first / "shared").read_bytes(), b"first")
+            self.assertEqual((first / "shared").stat().st_mode, before.st_mode)
+            self.assertEqual((first / "shared").stat().st_mtime_ns, before.st_mtime_ns)
+            self.assertEqual((second / "shared").read_bytes(), b"other")
+
+    def test_overlay_without_an_upper_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            root = Path(directory)
+            lower, data = root / "lower", root / "data"
+            for path in (lower, data):
+                path.mkdir()
+            (lower / "underneath").write_text("underneath")
+            target = root / "target"
+            with isolation.Overlay(lower, None, None, target, datadirs=(data,)) as mounted:
+                mounted.mount()
+                self.assertEqual((target / "underneath").read_text(), "underneath")
+                with self.assertRaises(OSError) as raised:
+                    (target / "generated").write_text("output")
+                self.assertEqual(raised.exception.errno, errno.EROFS)
+
+    def test_overlay_needs_a_workdir_with_its_upper_and_a_datadir_without(self) -> None:
+        for upper, work in (("upper", None), (None, None)):
+            with self.subTest(upper=upper, work=work), self.assertRaises(ValueError):
+                isolation.Overlay("lower", upper, work, "target")
 
     def test_overlay_parent_keeps_its_mode_with_a_permissive_umask(self) -> None:
         with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
@@ -211,8 +447,9 @@ class TestMountContexts(unittest.TestCase):
 
             with ExitStack() as stack:
                 stack.callback(os.umask, os.umask(0))
-                stack.enter_context(mock.patch.object(isolation, "mount"))
-                isolation.Overlay((lower,), upper, work, target, lazy_unmount=True).mount()
+                stack.enter_context(mock.patch.object(isolation, "_move_mount"))
+                with isolation.Overlay(lower, upper, work, target) as overlay:
+                    overlay.attach()
 
             self.assertEqual(target.parent.stat().st_mode & 0o777, 0o755)
             self.assertEqual(target.stat().st_mode & 0o777, 0o755)
@@ -225,7 +462,8 @@ class TestMountContexts(unittest.TestCase):
             other.write_text("other")
             target.symlink_to("other")
 
-            with isolation.Bind(source, target, readonly=True):
+            with isolation.Bind(source, target, readonly=True) as mounted:
+                mounted.mount()
                 self.assertEqual(target.read_text(), "source")
                 with self.assertRaises(OSError) as raised:
                     target.write_text("changed")
@@ -234,6 +472,58 @@ class TestMountContexts(unittest.TestCase):
 
             self.assertEqual(target.readlink(), Path("other"))
             self.assertEqual(source.read_text(), "source")
+
+    def test_file_covers_its_target_with_its_own_content_read_only(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.write_text("host")
+
+            with isolation.File("box", target) as mounted:
+                mounted.mount()
+                self.assertEqual(target.read_text(), "box")
+                with self.assertRaises(OSError) as raised:
+                    target.write_text("changed")
+                self.assertEqual(raised.exception.errno, errno.EROFS)
+
+            self.assertEqual(target.read_text(), "host")
+
+    def test_bind_takes_its_source_from_a_tree(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            root = Path(directory)
+            top, bottom, target = root / "top", root / "bottom", root / "target"
+            (top / "real").mkdir(parents=True)
+            (top / "real/file").write_text("from the top")
+            (bottom / "real").mkdir(parents=True)
+            (bottom / "real/other").write_text("from the bottom")
+            # An absolute symlink in a tree resolves inside the tree, not in the host's root.
+            (top / "alias").symlink_to("/real")
+            for layers in ((top,), (top, bottom)):
+                with self.subTest(layers=len(layers)):
+                    with (
+                        isolation.Close(
+                            isolation.open_layers(tuple(str(layer) for layer in layers))
+                        ) as tree,
+                        isolation.Bind("/alias", target, root=tree) as bind,
+                    ):
+                        bind.mount()
+                        self.assertEqual((target / "file").read_text(), "from the top")
+                        self.assertEqual((target / "other").exists(), len(layers) == 2)
+                        with self.assertRaises(OSError) as raised:
+                            (target / "generated").touch()
+                        self.assertEqual(raised.exception.errno, errno.EROFS)
+
+    def test_a_failed_attach_names_the_target(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            root = Path(directory)
+            source, target = root / "source", root / "target"
+            source.touch()
+            target.mkdir()
+
+            with isolation.Bind(source, target) as bind, self.assertRaises(OSError) as raised:
+                bind.attach()
+
+            self.assertEqual(raised.exception.filename, str(target))
 
     def test_mounts_unwind_on_success_and_failure(self) -> None:
         with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
@@ -249,7 +539,7 @@ class TestMountContexts(unittest.TestCase):
                 isolation.Tmpfs(target),
                 isolation.Devices(target),
                 # Strict, so that unwinding covers both unmount flavours.
-                isolation.Overlay((lower,), upper, work, target, lazy_unmount=False),
+                isolation.Overlay(lower, upper, work, target, strict_unmount=True),
             ]
             for mount in mounts:
                 for fail in (False, True):
@@ -257,6 +547,7 @@ class TestMountContexts(unittest.TestCase):
                         try:
                             with mount as entered:
                                 self.assertIs(entered, mount)
+                                entered.mount()
                                 self.assertFalse((target / "underlying").exists())
                                 (target / "during").touch()
                                 if fail:
@@ -278,47 +569,67 @@ class TestMountContexts(unittest.TestCase):
             alias.symlink_to("target")
             with ExitStack() as stack:
                 stack.enter_context(chdir(root))
-                with isolation.Tmpfs(Path("alias")):
+                with isolation.Tmpfs(Path("alias")) as mounted:
+                    mounted.mount()
                     alias.unlink()
                     alias.symlink_to("other")
                     stack.enter_context(chdir(other))
                     self.assertFalse((target / "underlying").exists())
                 self.assertTrue((target / "underlying").exists())
 
+    def test_mount_unmounts_while_proc_is_covered(self) -> None:
+        # The child process covers /proc in a mount namespace of its own. Its mounts are slaves of the
+        # test's mounts, so the tmpfs on /proc doesn't propagate back to the test.
+        script = (
+            "import os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import isolation\n"
+            "isolation.unshare(isolation.CLONE_NEWNS)\n"
+            "isolation._set_propagation('/', isolation.MS_SLAVE)\n"
+            "with isolation.Tmpfs('/proc') as proc:\n"
+            "    proc.attach()\n"
+            "with isolation.Tmpfs(sys.argv[2]) as mounted:\n"
+            "    mounted.mount()\n"
+            "    assert os.path.ismount(sys.argv[2])\n"
+            "assert not os.path.ismount(sys.argv[2])\n"
+        )
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            process = subprocess.run(
+                [sys.executable, "-I", "-c", script, str(Path(isolation.__file__).parent), directory],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(process.returncode, 0, process.stderr)
+
     def test_bind_of_symlink_unmounts_without_following_it(self) -> None:
         with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
             root = Path(directory)
             source, target = root / "source", root / "target"
             source.symlink_to("missing")
-            with isolation.Bind(source, target, nofollow=True):
+            with isolation.Bind(source, target, nofollow=True) as mounted:
+                mounted.mount()
                 self.assertEqual(target.readlink(), Path("missing"))
             self.assertFalse(target.is_symlink())
             self.assertTrue(target.is_file())
 
-    def test_failed_device_setup_unmounts_partial_tree(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
-            target = Path(directory) / "dev"
-            target.mkdir()
-            (target / "underlying").touch()
-            with (
-                mock.patch.object(isolation.Devices, "_populate", side_effect=OSError("device failed")),
-                self.assertRaisesRegex(OSError, "device failed"),
-                isolation.Devices(target),
-            ):
-                self.fail("failed mount must not enter the body")
-            self.assertTrue((target / "underlying").exists())
-
-    def test_failed_initial_mount_does_not_unmount_existing_tree(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
-            target = Path(directory)
-            with (
-                mock.patch.object(isolation, "mount", side_effect=OSError("mount failed")),
-                mock.patch.object(isolation, "umount2") as unmount,
-                self.assertRaisesRegex(OSError, "mount failed"),
-                isolation.Tmpfs(target),
-            ):
-                self.fail("failed mount must not enter the body")
-            unmount.assert_not_called()
+    def test_a_failed_enter_closes_its_file_descriptors(self) -> None:
+        mounts = [
+            (
+                isolation.Devices("/var/tmp/dev"),
+                mock.patch.object(isolation, "_touch", side_effect=OSError("failed")),
+            ),
+            (
+                isolation.Tmpfs("/var/tmp/tmpfs"),
+                mock.patch.object(isolation, "_fsmount", side_effect=OSError("failed")),
+            ),
+        ]
+        for mount, failure in mounts:
+            with self.subTest(mount=type(mount).__name__):
+                before = os.listdir("/proc/self/fd")
+                with failure, self.assertRaisesRegex(OSError, "failed"), mount:
+                    self.fail("a failed __enter__ must not enter the body")
+                self.assertEqual(os.listdir("/proc/self/fd"), before)
+                self.assertEqual(mount.fd, -1)
 
 
 if __name__ == "__main__":

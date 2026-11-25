@@ -14,14 +14,16 @@ SBOM learns what went into it.
 """
 
 import os
-import shutil
 import subprocess
-import tomllib
+import tempfile
 from pathlib import Path
 from typing import TypedDict
 
 import specs
 import util
+
+import rootfs
+from isolation import Bind
 
 
 class GitSource(TypedDict):
@@ -34,8 +36,10 @@ class GitSource(TypedDict):
 class Spec(TypedDict):
     # The cargo-auditable wrapper cargo builds through.
     auditable: str
-    # Declared binary name -> the output to write it to.
-    binaries: dict[str, str]
+    # The output directory that contains the binaries.
+    bin: str
+    # The binaries to take out of the build.
+    binaries: list[str]
     # Locked commit -> the git source to replace with its fetched repository.
     git: dict[str, GitSource]
     # Where the workspace sits inside `src`, empty when the project is its own root.
@@ -44,43 +48,17 @@ class Spec(TypedDict):
     src: str
     # Cargo's persistent incremental build directory for a project in dev mode
     target: str | None
+    # cargo builds the binaries for this Rust target triple.
+    triple: str
     # The unpacked crates the build resolves against.
     vendor: str
 
 
-# Any manifest table that can carry a dependency, including cargo's deprecated underscore spellings,
-# plus `target` and `workspace`, whose subtables can hide one. Deliberately too broad: a harmless match
-# only asks for a Cargo.lock the project could have committed anyway, while a miss would let it build
-# unlocked and fail later in cargo's own resolver.
-_DEPENDENCY_TABLES = (
-    "build-dependencies",
-    "build_dependencies",
-    "dependencies",
-    "dev-dependencies",
-    "dev_dependencies",
-    "target",
-    "workspace",
-)
-
-
-def _reject_unlocked_dependencies(workspace: Path) -> None:
-    """A manifest that names any dependency table must come with the lock cargo writes.
-
-    Without one there is nothing to build the vendored tree from, and the failure cargo itself
-    produces — offline resolution against an empty registry — points at the network rather than at
-    the missing file.
-    """
-    manifest = tomllib.loads((workspace / "Cargo.toml").read_text(encoding="utf-8"))
-    declared = [table for table in _DEPENDENCY_TABLES if manifest.get(table)]
-    if declared:
-        util.fail(f"cargo-build: [{declared[0]}] without a Cargo.lock; commit the lock cargo writes")
-
-
-def _reject_local_config(build: Path, workspace: Path) -> None:
+def _reject_local_config(source: Path, workspace: Path) -> None:
     """Refuse a checkout's own cargo configuration, which would outrank the one this driver writes.
 
     Cargo merges configuration from the working directory upward and reads `$CARGO_HOME` last, so a
-    file in the project wins: it can redirect the crates-io source away from the vendored tree, or
+    file in the checkout wins: it can redirect the crates-io source away from the vendored tree, or
     move the directory the declared binaries are taken from.
     """
     directory = workspace
@@ -89,10 +67,10 @@ def _reject_local_config(build: Path, workspace: Path) -> None:
             found = directory / ".cargo" / name
             if found.exists():
                 util.fail(
-                    f"cargo-build: {found.relative_to(build)} would override the vendored source "
-                    "configuration; keep it out of srcs"
+                    f"cargo-build: {found.relative_to(source)} would override the vendored source "
+                    "configuration; keep it out of src"
                 )
-        if directory == build:
+        if directory == source:
             return
         directory = directory.parent
 
@@ -115,57 +93,95 @@ def _cargo_config(vendor: Path, git: dict[str, GitSource]) -> str:
     return "\n".join(sections)
 
 
-def main(argv: list[str] | None = None) -> None:
-    spec = specs.parse(Spec, "cargo-build", argv)
+def _take_binaries(target: Path, triple: str, names: list[str], into: Path) -> None:
+    """Copy each declared binary out of cargo's `target/<triple>/release` into the output directory."""
+    built = target / triple / "release"
+    missing = [name for name in names if not (built / name).is_file()]
+    if missing:
+        # Everything executable in there, which after an earlier build of the same project may name
+        # more than this one produced.
+        entries = built.iterdir() if built.is_dir() else []
+        found = sorted(entry.name for entry in entries if entry.is_file() and os.access(entry, os.X_OK))
+        holds = f"which holds: {', '.join(found)}" if found else "which holds no executable"
+        util.fail(f"cargo-build: no {', '.join(missing)} in target/{triple}/release, {holds}")
+    for name in names:
+        util.clone_file(built / name, into / name)
 
-    # Cargo needs somewhere to write, and the build inputs are read-only artifacts. The sandbox
-    # backs /var/tmp with the action's scratch space, which Buck clears before each execution, so
-    # fixed names neither collide with a preserved failed tree nor accumulate across builds.
-    build = Path("/var/tmp/build")
-    cargo_home = Path("/var/tmp/cargo")
 
-    # Cargo's build directory is the exception: for an incremental build buck keeps the previous one, so
-    # a rebuild redoes only what changed. Cargo decides that from the modification times of the sources,
-    # which the copy below preserves. Otherwise it goes in the scratch space.
-    # Cargo runs with the workspace as its cwd, so every path handed to it must be absolute.
-    target = Path(spec["target"]).absolute() if spec["target"] is not None else Path("/var/tmp/target")
+def build_cargo(spec: Spec) -> None:
+    """Build a Cargo workspace on a read-only bind mount of its sources, in a read-only project."""
+    # The sandbox points TMPDIR at /var/tmp, which it backs with the action's scratch space. Buck
+    # clears the scratch space before each run, so none of these paths exists yet.
+    scratch = Path(tempfile.gettempdir())
+    build = scratch / "build"
+    cargo_home = scratch / "cargo"
+    target = scratch / "target"
+    out = scratch / "bin"
 
-    shutil.copytree(spec["src"], build)
-
-    workspace = build / spec["root"]
-    _reject_local_config(build, workspace)
-
-    cargo_home.mkdir(parents=True)
+    # Cargo resolves a relative path in a config.toml against the directory that contains the file.
+    # Cargo also runs in the workspace, not in the project. Every project path that this driver passes
+    # to cargo is therefore absolute.
+    cargo_home.mkdir()
     (cargo_home / "config.toml").write_text(
         _cargo_config(Path(spec["vendor"]).absolute(), spec["git"]),
         encoding="utf-8",
     )
 
-    # A project that resolves nothing carries no lock for --locked to hold cargo to. The empty
-    # vendored source and the unshared network are what keep such a build from resolving anything.
-    locked = ["--locked"]
-    if not (workspace / "Cargo.lock").exists():
-        _reject_unlocked_dependencies(workspace)
-        locked = []
-    # Cargo refuses every git transfer under --offline, the file:// repositories included. That
-    # flag is just belt-and-suspenders though: the action always runs in an unshared network
-    # namespace, so cargo can never reach out to the actual internet.
-    offline = [] if spec["git"] else ["--offline"]
-    subprocess.run(
-        [
-            Path(spec["auditable"]).absolute(),
-            "auditable",
-            "build",
-            "--release",
-            *locked,
-            *offline,
-        ],
-        check=True,
-        cwd=workspace,
-        env=os.environ | {"CARGO_HOME": str(cargo_home), "CARGO_TARGET_DIR": str(target)},
-    )
+    outputs = {Path(spec["bin"]): out}
+    if spec["target"] is not None:
+        # For an incremental build buck keeps cargo's previous build directory, so a rebuild redoes
+        # only what changed. Cargo decides that from the modification times of the sources.
+        outputs[Path(spec["target"])] = target
+    with rootfs.readonly_project(Path.cwd(), outputs):
+        util.remove_previous_binaries(out)
 
-    util.take_binaries(target / "release", spec["binaries"], tool="cargo-build", where="target/release")
+        # Cargo reads `.cargo/config.toml` and a `Cargo.toml` with a `[workspace]` table in every parent
+        # directory of the workspace. Inside the project, those parents belong to the consuming
+        # repository, and their files would change the build. The parents of the bind mount are
+        # directories of the sandbox. The bind is read-only, because it is a bind of a directory in the
+        # read-only project.
+        with Bind(Path(spec["src"]), build) as bind:
+            bind.mount()
+            workspace = build / spec["root"]
+            _reject_local_config(build, workspace)
+
+            # Cargo refuses every git transfer under --offline, the file:// repositories included. That
+            # flag is just belt-and-suspenders though: the action always runs in an unshared network
+            # namespace, so cargo can never reach out to the actual internet.
+            offline = [] if spec["git"] else ["--offline"]
+            subprocess.run(
+                [
+                    Path(spec["auditable"]).absolute(),
+                    "auditable",
+                    "build",
+                    "--release",
+                    "--locked",
+                    # Without --target, cargo builds for the box's architecture. The image that
+                    # contains the binaries can be for another architecture. A cross build needs the
+                    # target's standard library and a linker for it in the box. Without them, cargo
+                    # fails.
+                    "--target",
+                    spec["triple"],
+                    *offline,
+                ],
+                check=True,
+                cwd=workspace,
+                env=os.environ
+                | {
+                    "CARGO_HOME": str(cargo_home),
+                    "CARGO_TARGET_DIR": str(target),
+                    # Fedora's pkg-config is a wrapper script that runs `rpm --eval`, and its package
+                    # doesn't depend on rpm. In a box without rpm, every pkg-config lookup fails. The
+                    # pkg-config crate runs PKG_CONFIG in place of pkg-config.
+                    "PKG_CONFIG": "pkgconf",
+                },
+            )
+
+        _take_binaries(target, spec["triple"], spec["binaries"], out)
+
+
+def main(argv: list[str] | None = None) -> None:
+    build_cargo(specs.parse(Spec, "cargo-build", argv))
 
 
 if __name__ == "__main__":

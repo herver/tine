@@ -18,12 +18,12 @@ Three signing roles can each take such a key, independently:
 |--------------|------------------------------------------------------|-----------------------------|
 | Secure Boot  | the UKI, its kernel, systemd-boot, ESP enrollment    | `systemd-sbsign`, `bootctl` |
 | expected PCR | the TPM policy sealing PCR 11, per UKI profile       | `systemd-measure`           |
-| verity       | disk/sysext `*-verity-sig` partitions                | `systemd-repart`            |
+| verity       | disk/extension/portable `*-verity-sig` partitions    | `systemd-repart`            |
 
-`image_sysext`/`sysext_image` take a verity-role key for their DDI as well. The host merging the extension
-validates the signature against the certificates in its `/usr/lib/verity.d/`; these must be files, which a
-token's certificate is not. Every key rule therefore publishes `:<name>[cert]`, its certificate as a PEM
-artifact, so an image installs one the same way whatever holds the key.
+The extension rules and `image.portable` take a verity-role key for their DDI as well. The host merging the
+extension validates the signature against the certificates in its `/usr/lib/verity.d/`; these must be files,
+which a token's certificate is not. Every key rule therefore publishes `:<name>[cert]`, its certificate as a
+PEM artifact, so an image installs one the same way whatever holds the key.
 
 ## How the pieces connect
 
@@ -55,8 +55,8 @@ Two things do cross into the build that are worth pointing out:
 
 ## Prerequisites
 
-The build side needs nothing from you: the catalog installs `pkcs11-provider` and `p11-kit-client` into
-every box. On the host holding the key:
+The build side needs nothing from you: the tools box contains `pkcs11-provider` and p11-kit's client module,
+whatever release it builds from. On the host holding the key:
 
 - `p11-kit-server` for the `p11-kit server` subcommand and its systemd units.
 - your backend's module and its tooling: `tpm2-pkcs11` and `tpm2-pkcs11-tools`, or `opensc`, or `softhsm`.
@@ -75,7 +75,7 @@ load("@tine//image:defs.bzl", "image")
 image.pkcs11_signing_key(name = "secureboot", section = "secure-boot-signing")
 image.pkcs11_signing_key(name = "pcr-signing", section = "pcr-signing")
 
-image.bootable_disk(
+image.disk(
     name = "image",
     secure_boot_key = ":secureboot",
     sign_expected_pcr_key = ":pcr-signing",
@@ -95,7 +95,7 @@ image.generate_signing_key(name = "secureboot")
 
 SIGN_WITH_TOKEN = read_config("secure-boot-signing", "token") != None
 
-image.bootable_disk(
+image.disk(
     name = "image",
     secure_boot_key = ":secureboot.token" if SIGN_WITH_TOKEN else ":secureboot",
     ...
@@ -280,11 +280,13 @@ ships it. Starting over is `rm -r` on that directory; nothing lives outside it.
 ## Giving the key a certificate
 
 You need to generate an X.509 certificate for a freshly created key. `openssl` takes the module from
-`PKCS11_PROVIDER_MODULE` exported above, and prompts for the PIN:
+`PKCS11_PROVIDER_MODULE` exported above, and prompts for the PIN. With tpm2-pkcs11 and OpenSSL 3,
+`openssl req` hangs when it loads the pkcs11 provider before the default provider, so the command loads
+the default provider first.
 
 ```sh
 openssl req -new -x509 -days 3650 -sha256 \
-    -provider pkcs11 -provider default \
+    -provider default -provider pkcs11 \
     -key "pkcs11:token=<token>;object=<key>;type=private" \
     -subj "/CN=<token> signing key/" \
     -out cert.pem

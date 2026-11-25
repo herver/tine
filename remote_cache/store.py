@@ -31,7 +31,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 from typing import TextIO, cast
 
@@ -59,6 +59,13 @@ def write_atomically(path: Path, data: bytes) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def check_blob(digest: reapi.Digest, data: bytes) -> None:
+    """Raise a `ValueError` unless these are the bytes the digest names."""
+    found = hashlib.sha256(data).hexdigest()
+    if found != digest.hash or len(data) != digest.size_bytes:
+        raise ValueError(f"filed under {digest} but hashes to {found}/{len(data)}")
+
+
 def _now() -> int:
     """Unix nanoseconds.
 
@@ -70,6 +77,9 @@ def _now() -> int:
 
 # Held open for as long as a store is served, naming who holds it.
 LOCK_NAME = "lock"
+
+# The share of `max_bytes` an eviction leaves held, once the store went over it.
+EVICTED_DOWN_TO = 0.9
 
 # Bumped whenever the tables below change shape. A store is a cache, so the answer to meeting an
 # older one is to throw it away rather than to carry migrations for something nobody deployed.
@@ -226,31 +236,48 @@ class Store:
     # Blobs.
 
     def put_blob(self, digest: reapi.Digest, data: bytes, bundle: str | None = None) -> None:
-        """Store a blob under the digest it was filed under, if that is what it hashes to.
+        """Store one blob, see `put_blobs`."""
+        self.put_blobs({digest: data}, bundle)
+
+    def put_blobs(self, blobs: Mapping[reapi.Digest, bytes], bundle: str | None = None) -> None:
+        """Store blobs under the digests they were filed under, if that is what they all hash to.
 
         Checking here is what a cache filled from somewhere else cannot skip, so it is not an
-        assertion about our own client but the one place the rule belongs.
+        assertion about our own client but the one place the rule belongs. Nothing is stored if one
+        of them does not match.
+
+        One transaction and one eviction pass for all of them, because a bundle can hold tens of
+        thousands of blobs, and committing and counting rows per blob takes minutes for that. The
+        room is made before writing, and never from the blobs being stored: a bundle that evicted
+        its own members would be fetched again on every lookup.
         """
-        found = hashlib.sha256(data).hexdigest()
-        if found != digest.hash or len(data) != digest.size_bytes:
-            raise ValueError(f"filed under {digest} but hashes to {found}/{len(data)}")
-        path = self._path(digest.hash)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(path, data)
+        for digest, data in blobs.items():
+            check_blob(digest, data)
         with self._lock:
-            known = self._db.execute(
-                "SELECT size, present FROM blob WHERE hash = ?", (digest.hash,)
-            ).fetchone()
-            self._db.execute(
+            arriving = sum(one.size_bytes for one in blobs if not self._present(one.hash))
+        self._evict(arriving, keeping={one.hash for one in blobs})
+        for digest, data in blobs.items():
+            path = self._path(digest.hash)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_atomically(path, data)
+        with self._lock:
+            # Counted again: another thread may have stored some of them meanwhile.
+            self.held += sum(one.size_bytes for one in blobs if not self._present(one.hash))
+            now = _now()
+            self._db.executemany(
                 "INSERT INTO blob (hash, size, bundle, present, seen) VALUES (?, ?, ?, 1, ?)"
                 " ON CONFLICT (hash) DO UPDATE SET present = 1, bundle = COALESCE(?, bundle), seen = ?",
-                (digest.hash, digest.size_bytes, bundle, _now(), bundle, _now()),
+                [(digest.hash, digest.size_bytes, bundle, now, bundle, now) for digest in blobs],
             )
             self._db.commit()
-            if known is None or not known[1]:
-                self.held += digest.size_bytes
+        # Only a batch larger than the whole bound is still over it here.
         self._evict()
         self._evict_rows()
+
+    def _present(self, digest_hash: str) -> bool:
+        """Whether the index counts this blob's bytes as here. The caller holds the lock."""
+        row = self._db.execute("SELECT present FROM blob WHERE hash = ?", (digest_hash,)).fetchone()
+        return row is not None and bool(row[0])
 
     def blob(self, digest: reapi.Digest) -> bytes | None:
         """The bytes filed under this digest, if they still hash to it.
@@ -260,8 +287,6 @@ class Store:
         names, not that the file under a digest still holds those bytes. One that does not is
         dropped, so the next request fetches it again from its bundle.
         """
-        if not signing.is_sha256_hex(digest.hash):
-            return None
         path = self._path(digest.hash)
         try:
             data = path.read_bytes()
@@ -278,8 +303,24 @@ class Store:
         return data
 
     def has_blobs(self, digests: list[reapi.Digest]) -> list[bool]:
-        """Which of these are here. Something that is not a digest is not, rather than an error."""
-        return [signing.is_sha256_hex(one.hash) and self._path(one.hash).is_file() for one in digests]
+        """Which of these are here, each counted as used, like a read.
+
+        A hit names every blob of its result, but Buck2 reads only a few of them. Without this, a
+        result looked up in every build would age as unused, and its bundle would be fetched again
+        after the next eviction. A file of another size than its digest counts as absent; what it
+        holds is checked by `blob`, when it is read.
+        """
+        return [self._use(one) for one in digests]
+
+    def _use(self, digest: reapi.Digest) -> bool:
+        path = self._path(digest.hash)
+        try:
+            if path.stat().st_size != digest.size_bytes:
+                return False
+            os.utime(path)
+        except FileNotFoundError:
+            return False
+        return True
 
     # The two below are how a test takes blobs away to see what happens: nothing in the shim
     # enumerates or evicts by hand.
@@ -294,13 +335,17 @@ class Store:
         """Forget a blob's bytes. Where it came from is kept: that is how it can be asked for again."""
         self._forget([digest.hash])
 
-    def remember(self, digest: reapi.Digest, bundle: str) -> None:
-        """Record which bundle a blob arrived in, whether or not its bytes are still here."""
+    def remember_all(self, digests: Iterable[reapi.Digest], bundle: str) -> None:
+        """Record which bundle these blobs arrived in, whether or not their bytes are still here.
+
+        One transaction for all of them, like `put_blobs`.
+        """
+        now = _now()
         with self._lock:
-            self._db.execute(
+            self._db.executemany(
                 "INSERT INTO blob (hash, size, bundle, present, seen) VALUES (?, ?, ?, 0, ?)"
                 " ON CONFLICT (hash) DO UPDATE SET bundle = ?, seen = ?",
-                (digest.hash, digest.size_bytes, bundle, _now(), bundle, _now()),
+                [(digest.hash, digest.size_bytes, bundle, now, bundle, now) for digest in digests],
             )
             self._db.commit()
         self._evict_rows()
@@ -386,12 +431,16 @@ class Store:
             self._db.commit()
             self.held -= freed
 
-    def _evict(self) -> None:
-        """Drop the least recently used blobs until the store is inside its bound.
+    def _evict(self, arriving: int = 0, keeping: Collection[str] = ()) -> None:
+        """Drop the least recently used blobs until `arriving` more bytes fit well inside the bound.
 
-        Least recently used by the file's own timestamp, which `blob` moves on every read.
+        Least recently used by the file's own timestamp, which `blob` and `has_blobs` move. None of
+        `keeping` goes.
+
+        Finding them stats every blob here, so this frees room for more than the blob that crossed
+        the bound: a full store would otherwise pay that again for every single blob Buck2 uploads.
         """
-        if self.held <= self.max_bytes:
+        if self.held + arriving <= self.max_bytes:
             return
         with self._lock:
             # Only blobs whose bytes are worth something. The one blob of no size is the empty one,
@@ -400,13 +449,15 @@ class Store:
             rows = self._db.execute("SELECT hash, size FROM blob WHERE present = 1 AND size > 0").fetchall()
         ages = []
         for one, size in rows:
+            if one in keeping:
+                continue
             try:
                 ages.append((self._path(one).stat().st_atime, one, size))
             except FileNotFoundError:
                 # Dropped by another thread between the query and here.
                 continue
         ages.sort()
-        over = self.held - self.max_bytes
+        over = self.held + arriving - int(self.max_bytes * EVICTED_DOWN_TO)
         going = []
         freed = 0
         for _, one, size in ages:

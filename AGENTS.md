@@ -9,6 +9,8 @@ SPDX-License-Identifier: MPL-2.0
 
 - **Never touch `buck-out/` directly**: no `rm`, `mv`, or edits. To inspect an output, get its path from
   `buck build --show-output`/`--out` and read it read-only.
+- **Never call `buck2` directly**: `tine buck` is the only entry point; every `buck` here and in the docs
+  is shorthand for that.
 - **Never `buck build | tail`**: redirect the full output to a log file, print the path so the user can
   follow along, and check the exit status separately. `tine buck log what-ran --failed --show-std-err`
   prints the full stderr of the actions that failed in the last build, which the build output truncates.
@@ -19,31 +21,30 @@ SPDX-License-Identifier: MPL-2.0
   `reuse` and fails on a file with neither.
 - Line break documents and plans at 109 columns.
 - Comments explain *why*, not *what*; say each thing once.
-- Do not write user-facing documentation. At most, add a TODO comment where documentation should be
-  written by a human.
 
 ## Layout
 
 Cell layout and architecture: [the design plan](docs/design/architecture.md). User guides are under
 `docs/user/`, design documents under `docs/design/`.
 
-- A unit test is `<driver>_test.py` beside its driver, run by a `box_python_test` in the same package.
-- An assertion about what a build produced is a `box_sh_test` beside the target that produced it, taking
+- A unit test is `<driver>_test.py` beside its driver, run by a `python.test` in the same package.
+  Pass `box` when the tests need its interpreter or packages.
+- An assertion about what a build produced is a `box.sh_test` beside the target that produced it, taking
   artifacts as `$(location)` arguments so it runs against pinned tools rather than the host's.
-- Python sources reach a suite in another package through `deps` on a `tine_python_library`, never
+- Python sources reach a suite in another package through `deps` on a `python.library`, never
   `export_file`.
-- Python drivers use `tine_python_library`/`tine_python_binary`. Never declare the prelude's bootstrap
+- Python drivers use `python.library`/`python.binary`. Never declare the prelude's bootstrap
   target or a `-ty` check by hand; the macros do both.
 - A driver importing third-party modules lists the `boxes` its check resolves against, one check per box.
   `typecheck = False` is for vendored sources only.
 
 ## Commands
 
-**Every `buck` below means `tine buck`**: nothing else on this machine is the Buck2 this project pins.
 `mise.toml` puts `./bin` and `./tools` on `PATH`; every pinned tool is declared in `tine.lock.json`.
 `tine buck` runs Buck with the mounts declared by `tine mount` in `.buck/tine-mounts.toml`.
 
-- **Build everything:** `buck build tine//...`, which runs no tests.
+- **Build everything:** `buck build tine//... catalog//...`, which runs no tests. The catalog is a cell of
+  its own, so `tine//...` leaves it out.
 - **Lint (format, lint, type-check, whole-graph analysis):** `buck run tine//tools:lint`
 - **Check (lint plus the fast test suites):** `buck run tine//tools:check`
 - **Auto-format + auto-fix:** `buck run tine//tools:fmt`
@@ -61,7 +62,8 @@ Cell layout and architecture: [the design plan](docs/design/architecture.md). Us
   writes into a root. The test carries the `image` label, so `check` does not run it and only CI's
   image step catches a stale file.
 - **Full CI pipeline:** `tools/ci.sh`, fail-fast. Run individual groups by stating their names, e.g.
-  `tools/ci.sh check build`
+  `tools/ci.sh check build`. It covers one release of the catalog, the default one unless
+  `TINE_TEST_DISTRO` names another, such as `arch.rolling`.
 - **rpm importer:** `buck run tine//tools:importer -- <verb>`; see [importer.md](docs/user/importer.md).
 - **BuildRequires cycle analysis:** `buck run tine//tools:scc -- <branch label>`; background in
   [self-host-approaches.md](docs/design/self-host-approaches.md).
@@ -71,7 +73,7 @@ Cell layout and architecture: [the design plan](docs/design/architecture.md). Us
 `starlark_fmt` owns the layout of every `.bzl` and `BUCK` file and wraps at 160 columns.
 
 - Leave a trailing comma after the last argument to keep a signature or call broken across lines.
-- It sorts dict keys unconditionally; mark a dict whose order is a contract (`disk.bzl:partition` feeds
+- It sorts dict keys unconditionally; mark a dict whose order is a contract (`ddi.bzl:partition` feeds
   partition UUIDs) `# @unsorted-dict-items`.
 - It drops load symbols it cannot see used; annotate type-only imports `# @unused`.
 
@@ -110,11 +112,11 @@ Buck hands drivers project-relative paths and runs them at the project root, whi
 at `/tine/project`. Keep them relative; making one absolute is a decision that needs a reason.
 
 - **`.absolute()`** only when something downstream changes the frame of reference: a chroot, a subprocess
-  given its own `cwd=`, a mount option the kernel resolves itself, a path written into a spec another
-  process consumes, or a library documented as needing it (libdnf5). Say which in a comment.
+  given its own `cwd=`, a path written into a spec another process consumes, or a library documented as
+  needing it (libdnf5). Say which in a comment.
 - **`.resolve()`** follows symlinks on top of that, so reach for it only when following them is the
-  point: `rootfs.py` resolves overlay lowers before entering a chroot, `sandbox.py` walks the tools tree
-  to recreate its usr-merge links rather than bind through them.
+  point: `source_overlay()` in `rootfs.py` resolves the source tree to compare it with the mount points
+  that statmount() returns, which have their symlinks resolved.
 
 ## Commits
 

@@ -3,16 +3,18 @@
 # SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
 # SPDX-License-Identifier: MPL-2.0
 
-"""Apply ordered operations against one mounted root and capture its overlay delta."""
+"""Apply ordered operations against one mounted root and capture its complete snapshot."""
 
 import glob  # noqa: F401  # Preload for Path.glob before entering the image chroot.
 import os
 import re
-import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
@@ -22,6 +24,8 @@ import util
 import finalize
 import installer
 import rootfs
+import storage
+from isolation import AT_FDCWD, Bind, Close, open_directory
 
 
 class LayerInstall(TypedDict):
@@ -37,19 +41,21 @@ class LayerInstall(TypedDict):
 class Spec(TypedDict):
     lower: list[str]
     out: str
-    work: str | None
     install: LayerInstall | None
     operations: list[object]
 
 
-# Where a chrooted command sees the project, and so every declared input. /run is one of the
-# tmpfs mounts apivfs puts over the mounted root, so the mount point never reaches the overlay
-# upper the layer captures, and the path does not depend on where the project is checked out.
+# apivfs covers /run with a tmpfs, so the project mount for copy and chrooted run is not captured.
 PROJECT = "/run/tine/project"
 
 
-def _chroots(operation: list[object]) -> bool:
-    return operation[0] == "run" and len(operation) == 4 and operation[3] is True
+@contextmanager
+def _project_chroot(target: Path) -> Generator[None]:
+    with ExitStack() as stack:
+        root = stack.enter_context(Close(open_directory(AT_FDCWD, str(target), create=False)))
+        stack.enter_context(Bind(".", PROJECT, readonly=True)).mount(root)
+        with rootfs.chroot(target):
+            yield
 
 
 def _operation(value: object) -> list[object]:
@@ -76,11 +82,38 @@ def _run(tag: str, raw_cmd: object, raw_env: object, cwd: str | None = None) -> 
         util.fail(f"image op `{tag} {cmd}` failed (rc={rc})")
 
 
-def _destination(tree: Path, value: str) -> Path:
+def _destination(value: str) -> Path:
     path = PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts:
         util.fail(f"image copy destination must be an absolute image path: {value!r}")
-    return tree.joinpath(*path.parts[1:])
+    return Path(path)
+
+
+def _copy_file(source: Path, destination: Path) -> None:
+    # git only stores the executable bit, and a checkout gets the other bits from the umask of whoever
+    # checked it out. Give the copy the mode that a checkout under umask 0022 has, so that the image
+    # doesn't depend on that umask.
+    # A file in the image can have hardlinks. Replace it instead of writing into it, so that the other
+    # names keep their contents.
+    destination.unlink(missing_ok=True)
+    util.clone_file(source, destination)
+    destination.chmod(0o755 if source.stat().st_mode & 0o111 else 0o644)
+
+
+def _merge_directory(source: Path, destination: Path) -> None:
+    # copytree would give a directory that already exists in the image the mode and extended attributes of
+    # the directory in the checkout. Leave existing directories alone, and create missing ones with 0755.
+    if not destination.is_dir():
+        destination.mkdir()
+        destination.chmod(0o755)
+    for entry in sorted(source.iterdir()):
+        target = destination / entry.name
+        if entry.is_dir() and not entry.is_symlink():
+            if (target.exists() or target.is_symlink()) and not target.is_dir():
+                util.fail(f"cannot merge directory {entry} into non-directory {target}")
+            _merge_directory(entry, target)
+        else:
+            _copy(entry, target)
 
 
 def _copy(source: Path, destination: Path) -> None:
@@ -90,27 +123,21 @@ def _copy(source: Path, destination: Path) -> None:
             util.fail(f"cannot replace directory {destination} with symlink {source}")
         if destination.exists() or destination.is_symlink():
             destination.unlink()
-        shutil.copy2(source, destination, follow_symlinks=False)
+        # shutil.copy2() would keep the mtime of the symlink in the checkout. Capture keeps an mtime before
+        # the epoch, so the image would depend on when the checkout was made. A new symlink gets the
+        # current time, and capture clamps that to the epoch.
+        destination.symlink_to(source.readlink())
     elif source.is_dir():
         if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
             util.fail(f"cannot merge directory {source} into non-directory {destination}")
-        shutil.copytree(
-            source,
-            destination,
-            dirs_exist_ok=True,
-            # Reflink each regular file; copytree recreates symlinks itself
-            copy_function=lambda s, d: util.clone_file(Path(s), Path(d)),
-            symlinks=True,
-        )
+        _merge_directory(source, destination)
     else:
         if destination.is_dir() and not destination.is_symlink():
             util.fail(f"cannot replace directory {destination} with file {source}")
-        if destination.is_symlink():
-            destination.unlink()
-        util.clone_file(source, destination)
+        _copy_file(source, destination)
 
 
-def _merge_os_release(tree: Path, raw_fields: object) -> None:
+def _merge_os_release(raw_fields: object) -> None:
     """Merge quoted KEY="value" assignments into /usr/lib/os-release, replacing existing keys."""
     fields = dict(_mapping("os_release", "fields", raw_fields))
     for key, value in fields.items():
@@ -119,7 +146,7 @@ def _merge_os_release(tree: Path, raw_fields: object) -> None:
         # Values are emitted double-quoted verbatim, so refuse anything needing escapes.
         if '"' in value or "\\" in value or "\n" in value:
             util.fail(f"image op 'os_release' value needs escaping: {value!r}")
-    path = tree / "usr/lib/os-release"
+    path = Path("/usr/lib/os-release")
     lines = []
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -132,6 +159,41 @@ def _merge_os_release(tree: Path, raw_fields: object) -> None:
     path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
 
+def pin_release(parent: dict[str, str], release: dict[str, str]) -> dict[str, str]:
+    """Add the parent's identity to the extension-release fields `release` does not set.
+
+    The extension is a delta against the parent it was built on, so systemd must refuse to merge
+    it onto anything else: it pins the parent's ID and VERSION_ID, and the IMAGE_ID and
+    IMAGE_VERSION of a parent that is an image build. An extension that declares ID=_any matches
+    any OS and gets none of them.
+    """
+    if release.get("ID") == "_any":
+        return release
+    keys = ("ID", "VERSION_ID", "IMAGE_ID", "IMAGE_VERSION")
+    strict = {key: parent[key] for key in keys if key in parent and key not in release}
+    return strict | release
+
+
+def _extension_release(path: str, raw_fields: object, pin: bool) -> None:
+    """Write an extension-release file, pinned to the os-release of the root when `pin` is set."""
+    fields = dict(_mapping("extension_release", "fields", raw_fields))
+    if pin:
+        parent = {}
+        for candidate in ("/usr/lib/os-release", "/etc/os-release"):
+            if Path(candidate).is_file():
+                for line in Path(candidate).read_text().splitlines():
+                    key, sep, value = line.strip().partition("=")
+                    if key and sep and not key.startswith("#"):
+                        parent[key] = value.strip("\"'")
+                break
+        if "ID" not in parent:
+            util.fail("image op 'extension_release': the parent os-release lacks ID")
+        fields = pin_release(parent, fields)
+    destination = Path("/") / path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("".join(f"{key}={value}\n" for key, value in fields.items()))
+
+
 def _remove_glob(tree: Path, value: str) -> None:
     pattern = PurePosixPath(value)
     if not pattern.is_absolute() or ".." in pattern.parts:
@@ -142,23 +204,75 @@ def _remove_glob(tree: Path, value: str) -> None:
         util.remove_path(path)
 
 
-def _normalize_mode(path: Path) -> None:
-    """Normalize file permissions for path.
+# The ELF fields the stack check reads; see elf(5). Per class: the header after e_ident up to
+# e_phnum, and the offset of p_flags in a program header. Per data encoding: the byte order.
+_ELF_CLASSES = {1: ("HHIIIIIHHH", 24), 2: ("HHIQQQIHHH", 4)}
+_ELF_ORDERS = {1: "<", 2: ">"}
+_ET_EXEC, _ET_DYN = 2, 3
+_PT_GNU_STACK = 0x6474E551
+_PF_X = 1
 
-    See docs/user/images.md.
+# The machines on which an object without PT_GNU_STACK gets an executable stack: EM_386 and EM_X86_64.
+# glibc then applies DEFAULT_STACK_PROT_PERMS, which only the x86 stackinfo.h headers make executable;
+# the generic one, which aarch64 uses, is not. On ia32 the kernel even makes every readable mapping
+# executable (the table above elf_read_implies_exec).
+# https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/dl-load.c
+# https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/x86_64/stackinfo.h
+# https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/i386/stackinfo.h
+# https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/generic/stackinfo.h
+# https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/include/asm/elf.h
+_EXECUTABLE_BY_DEFAULT = {3, 62}
+
+
+def _stack(path: Path) -> str | None:
+    """Why the program or shared library at `path` would run on an executable stack, if it would.
+
+    A missing PT_GNU_STACK counts too, on the machines whose default stack is executable. Anything
+    that neither the kernel nor ld.so loads as a program has no stack of its own and passes: non-ELF
+    files, relocatable objects such as kernel modules, and ELF too truncated to read, which packages
+    ship as test data.
     """
-    mode = path.lstat().st_mode
-    if stat.S_ISDIR(mode):
-        path.chmod(0o755)
-    elif stat.S_ISREG(mode):
-        path.chmod(0o755 if mode & 0o111 else 0o644)
-    # ignore symlinks (meaningless mode), whiteout nodes, and non-files
+    with path.open("rb") as file:
+        ident = file.read(16)
+        if (
+            len(ident) < 16
+            or ident[:4] != b"\x7fELF"
+            or ident[4] not in _ELF_CLASSES
+            or ident[5] not in _ELF_ORDERS
+        ):
+            return None
+        layout, flags_offset = _ELF_CLASSES[ident[4]]
+        order = _ELF_ORDERS[ident[5]]
+        header = struct.Struct(order + layout)
+        raw = file.read(header.size)
+        if len(raw) < header.size:
+            return None
+        e_type, e_machine, _, _, phoff, _, _, _, phentsize, phnum = header.unpack(raw)
+        if e_type not in (_ET_EXEC, _ET_DYN):
+            return None
+        file.seek(phoff)
+        table = file.read(phentsize * phnum)
+    if len(table) < phentsize * phnum or phentsize < flags_offset + 4:
+        return None
+    word = struct.Struct(order + "I")
+    for entry in range(0, len(table), phentsize):
+        if word.unpack_from(table, entry)[0] == _PT_GNU_STACK:
+            return "executable stack" if word.unpack_from(table, entry + flags_offset)[0] & _PF_X else None
+    return "no PT_GNU_STACK" if e_machine in _EXECUTABLE_BY_DEFAULT else None
 
 
-def _normalize_modes(tree: Path) -> None:
-    _normalize_mode(tree)
-    for path in tree.rglob("*"):
-        _normalize_mode(path)
+def _executable_stacks(root: storage.Root) -> list[str]:
+    """Each program or shared library in `root` that would run on an executable stack, and why."""
+    found = []
+    # In an overlay, root.digests uses the upper inode of a hardlinked file, and root.entries() returns
+    # that inode. Path.lstat() would return the inode of the merged file, which misses the digest.
+    for entry in root.entries():
+        # A file that is unchanged since the restore belongs to a layer below, which checked it already.
+        if not stat.S_ISREG(entry.st.st_mode) or storage.identity(entry.st) in root.digests:
+            continue
+        if (problem := _stack(entry.path)) is not None:
+            found.append(f"/{entry.name}: {problem}")
+    return found
 
 
 def _apply_filesystem(operation: list[object]) -> None:
@@ -184,10 +298,10 @@ def _install(install: LayerInstall, target: Path, scratch: Path) -> None:
     request = installer.InstallSpec(
         arch=install["arch"],
         packages_dir=str(Path(install["packages_dir"]).absolute()),
-        target=None,
+        snapshot=None,
         installroot=str(target),
         lower=[],
-        work=None,
+        target=None,
         box_config=False,
         langs=install["langs"],
         docs=install["docs"],
@@ -199,25 +313,34 @@ def _install(install: LayerInstall, target: Path, scratch: Path) -> None:
 
 
 def _apply(value: object, target: Path) -> None:
-    """Apply one operation with its requested view of the mounted root."""
     operation = _operation(value)
     match operation:
         case ["run", raw_cmd, raw_env, bool(chroot)]:
             if not chroot:
                 _run("run", raw_cmd, raw_env)
             else:
-                with rootfs.chroot(target):
+                with _project_chroot(target):
                     _run("run", raw_cmd, raw_env, cwd=PROJECT)
         case ["copy", str(source), str(destination)]:
-            _copy(Path(source), _destination(target, destination))
+            path = PurePosixPath(source)
+            if path.is_absolute() or ".." in path.parts:
+                util.fail(f"image copy source must be a relative project path: {source!r}")
+            with _project_chroot(target):
+                _copy(Path(PROJECT) / source, _destination(destination))
         case ["os_release", raw_fields]:
-            _merge_os_release(target, raw_fields)
+            with rootfs.chroot(target):
+                _merge_os_release(raw_fields)
+        case ["extension_release", str(path), raw_fields, bool(pin)]:
+            with rootfs.chroot(target):
+                _extension_release(path, raw_fields, pin)
         case ["depmod"]:
             finalize.depmod(target)
         case ["hwdb", bool(usr), bool(strict)]:
             finalize.hwdb(target, usr=usr, strict=strict)
         case ["locale_gen"]:
             finalize.locale_gen(target)
+        case ["preset", bool(vendor)]:
+            finalize.preset(target, vendor=vendor)
         case ["mkdir", _] | ["symlink", _, _] | ["write_file", _, _] | ["remove", _]:
             with rootfs.chroot(target):
                 _apply_filesystem(operation)
@@ -228,51 +351,29 @@ def _apply(value: object, target: Path) -> None:
 def main(argv: list[str] | None = None) -> None:
     spec = specs.parse(Spec, "image", argv)
 
-    # Mount options name the upper and work directories; the kernel does not read them relative to
-    # this process.
-    out = Path(spec["out"]).absolute()
+    out = Path(spec["out"])
     out.mkdir(parents=True, exist_ok=True)
     operations = [_operation(operation) for operation in spec["operations"]]
-    for operation in operations:
-        if operation[0] == "copy" and len(operation) == 3 and isinstance(operation[1], str):
-            operation[1] = str(Path(operation[1]).absolute())
     install = spec["install"]
 
-    # A chrooted command names an artifact exactly as a box command does, so the project is
-    # mounted for the whole layer whenever one asks for it.
-    binds = [(os.getcwd(), PROJECT)] if any(_chroots(op) for op in operations) else []
-
     lower = spec["lower"]
-    if lower:
-        if spec["work"] is None:
-            util.fail("image lower stack needs a work overlay directory")
-        mounted = rootfs.rootfs(
-            "/buildroot",
-            lowers=lower,
-            upperdir=out,
-            workdir=Path(spec["work"]).absolute(),
-            apivfs=True,
-            binds=binds,
-        )
-    else:
-        if spec["work"] is not None:
-            util.fail("image work overlay directory requires a lower stack")
-        mounted = rootfs.rootfs(
-            "/buildroot",
-            bind=out,
-            capture_bind=True,
-            apivfs=True,
-            binds=binds,
-        )
-
-    with mounted as target, tempfile.TemporaryDirectory(prefix="layer.") as scratch:
-        # Packages land before the operations so every one of them sees what this layer installs.
+    with (
+        rootfs.snapshot_root(lower, out=out, apivfs=True) as restored,
+        tempfile.TemporaryDirectory(prefix="layer.", dir="/var/tmp") as scratch,
+    ):
         if install is not None:
-            _install(install, target, Path(scratch))
+            _install(install, rootfs.BUILDROOT, Path(scratch))
         for operation in operations:
-            _apply(operation, target)
-    _normalize_modes(out)
-    print(f"image: applied {len(operations)} ops over {len(lower)} lower(s) -> {out}", file=sys.stderr)
+            _apply(operation, rootfs.BUILDROOT)
+        # The API filesystems are mounted below BUILDROOT, not below the restored root.
+        stacks = _executable_stacks(restored)
+        if stacks:
+            util.fail(
+                "image: executable stacks are not allowed, see docs/user/images.md:\n" + "\n".join(stacks)
+            )
+    print(
+        f"image: applied {len(operations)} ops over {len(lower)} parent store(s) -> {out}", file=sys.stderr
+    )
 
 
 if __name__ == "__main__":

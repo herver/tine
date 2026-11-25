@@ -11,11 +11,8 @@ PKCS#11 key (https://p11-glue.github.io/p11-glue/p11-kit/manual/remoting.html) d
 Do not load image.bzl here: it consumes the provider, so that would close a load cycle.
 """
 
-load("//box:runtime.bzl", "BoxInfo", "box_run")
-
-# The sandbox forwards PKCS#11 calls rather than holding a backend module, so this is the only module
-# it ever loads, whatever the key is held by.
-_CLIENT_MODULE = "/usr/lib64/pkcs11/p11-kit-client.so"
+load("//box:defs.bzl", "box")
+load("//project:defs.bzl", "project")
 
 # Reads a certificate through the same OpenSSL provider the signing tools load the key with, so a
 # token's certificate needs no second way to address it. Not on PATH, hence the full path.
@@ -63,7 +60,7 @@ def resolve_signing_key(dep: Dependency | None) -> SigningKeyInfo | None:
     return dep[SigningKeyInfo] if dep != None else None
 
 def signing_key_spec(key: SigningKeyInfo | None) -> dict[str, typing.Any] | None:
-    """The key as one driver-spec object (repart.py's KeySpec), None when unsigned."""
+    """The key as one driver-spec object (ddi.py's KeySpec), None when unsigned."""
     if key == None:
         return None
     return {
@@ -133,19 +130,40 @@ def key_source_arguments(key: SigningKeyInfo) -> list[str]:
     return arguments
 
 def _signing_key_impl(ctx: AnalysisContext) -> list[Provider]:
-    key = ctx.actions.declare_output("signing.key")
-    certificate = ctx.actions.declare_output("signing.crt")
+    # The box is an input of the action, so every change to the box reruns it. `ukify genkey` creates a
+    # random pair, and every new pair changes every artifact signed with it. The action therefore writes
+    # the pair into a kept directory, whose path depends only on the target. It runs `ukify genkey` only
+    # when that directory contains no pair.
+    pair = project.kept_dir(ctx.actions, "pair")
+    key = pair.project("signing.key")
+    certificate = pair.project("signing.crt")
     ctx.actions.run(
         cmd_args(
-            box_run(box = ctx.attrs.box[BoxInfo]),
-            "ukify",
-            "genkey",
-            "--secureboot-certificate-common-name",
+            box.run(box = ctx.attrs._box[box.Info]),
+            "sh",
+            "-c",
+            """set -eu
+key=$1/signing.key
+certificate=$1/signing.crt
+if [ -s "$key" ] && [ -s "$certificate" ]; then
+    exit 0
+fi
+# An interrupted run can leave only one file of the pair. ukify fails when a file it writes exists.
+mkdir -p "$1"
+rm -f "$key" "$certificate"
+exec ukify genkey --secureboot-certificate-common-name "$2" \
+    --secureboot-private-key="$key" --secureboot-certificate="$certificate"
+""",
+            "sh",  # $0, which only names the shell in its own diagnostics
+            pair.as_output(),
             _GENERATED_CN_PREFIX + ctx.label.name,
-            cmd_args(key.as_output(), format = "--secureboot-private-key={}"),
-            cmd_args(certificate.as_output(), format = "--secureboot-certificate={}"),
         ),
         category = "signing_key",
+        # The output contains a private key that is not a function of the action's inputs. Through a shared
+        # cache, another workspace would download the same key.
+        allow_cache_upload = False,
+        local_only = True,
+        no_outputs_cleanup = True,
     )
     return [
         DefaultInfo(
@@ -160,17 +178,74 @@ def _signing_key_impl(ctx: AnalysisContext) -> list[Provider]:
 generate_signing_key = rule(
     impl = _signing_key_impl,
     attrs = {
-        "box": attrs.exec_dep(
-            providers = [BoxInfo],
-            default = "tine//catalog:fedora.rawhide.box",
-            doc = "box providing ukify",
-        ),
+        "_box": attrs.exec_dep(providers = [box.Info], default = "tine//distribution:tools.box"),
     },
     doc = """Mint a development signing key pair as a build artifact.
 
-    `ukify genkey` produces the pair per workspace into buck-out, so nothing secret is committed, and
-    anyone who wants one by hand can run `ukify genkey` directly. `:<name>[cert]` and `:<name>[key]`
-    are the PEM artifacts.
+    `ukify genkey` produces the pair once per workspace into buck-out, so nothing secret is committed,
+    and anyone who wants one by hand can run `ukify genkey` directly. Rebuilds reuse the pair, so signed
+    artifacts stay byte-identical when nothing else changes. After a `buck clean`, the next build generates
+    a new pair. The build never uploads the pair to a cache. `:<name>[cert]` and `:<name>[key]` are the
+    PEM artifacts.
+
+    The certificate is named `tine.generated.<name>`, to signify that it is not an official
+    production key.
+    """,
+)
+
+def _derived_signing_key_impl(ctx: AnalysisContext) -> list[Provider]:
+    common_name = _GENERATED_CN_PREFIX + ctx.label.name
+    # x509 limits a common name to 64 characters. Without the check, a long target name fails in the
+    # action with a Python traceback.
+    if len(common_name) > 64:
+        fail(
+            "derived_signing_key: the name {!r} is too long, the certificate's common name {!r} must have at most 64 characters".format(
+                ctx.label.name, common_name
+            )
+        )
+    key = ctx.actions.declare_output("signing.key")
+    certificate = ctx.actions.declare_output("signing.crt")
+    ctx.actions.run(
+        cmd_args(
+            box.run(box = ctx.attrs._box[box.Info], exe = ctx.attrs._derive),
+            common_name,
+            key.as_output(),
+            certificate.as_output(),
+        ),
+        category = "signing_key",
+        # Anyone who knows the name can compute the pair, so a shared cache may hold it.
+        allow_cache_upload = True,
+    )
+    return [
+        DefaultInfo(
+            sub_targets = {
+                "cert": [DefaultInfo(default_output = certificate)],
+                "key": [DefaultInfo(default_output = key)],
+            }
+        ),
+        SigningKeyInfo(certificate = certificate, private_key = key),
+    ]
+
+derived_signing_key = rule(
+    impl = _derived_signing_key_impl,
+    attrs = {
+        "_box": attrs.exec_dep(providers = [box.Info], default = "tine//distribution:tools.box"),
+        "_derive": attrs.exec_dep(default = "tine//image:signing-key"),
+    },
+    doc = """Derive a development ECDSA P-256 signing key pair from the target name.
+
+    The pair is a function of the name alone, so every build, workspace and project that uses the
+    same name gets the same pair. Images from different projects can then trust each other's
+    signatures without copying a certificate between them. Anyone who knows the name can compute
+    the private key, so never enroll the certificate on real hardware. `:<name>[cert]` and
+    `:<name>[key]` are the PEM artifacts.
+
+    UEFI firmware only enrolls certificates with RSA keys, so a P-256 key can't sign for Secure
+    Boot. Use `generate_signing_key` for that role. The kernel and systemd accept P-256 for
+    dm-verity signatures.
+
+    The pair is derived in the tools box of the default release. The certificate's signature needs
+    python-cryptography 45 or newer in that box.
 
     The certificate is named `tine.generated.<name>`, to signify that it is not an official
     production key.
@@ -259,7 +334,7 @@ def _extract_certificate(ctx: AnalysisContext, key: SigningKeyInfo) -> Artifact:
     access = merge_signing_access([key])
     ctx.actions.run(
         cmd_args(
-            box_run(box = ctx.attrs.box[BoxInfo], ro_binds = access.ro_binds, setenv = access.setenv),
+            box.run(box = ctx.attrs._box[box.Info], ro_binds = access.ro_binds, setenv = access.setenv),
             "sh",
             "-c",
             """set -eu
@@ -322,10 +397,9 @@ def _pkcs11_signing_key_impl(ctx: AnalysisContext) -> list[Provider]:
         private_key = uri + "private?pin-source=file:" + sandbox_pin,
         private_key_source = "provider:pkcs11",
         ro_binds = {host_directory: _SIGNING_CONFIG_DIR + host_directory, pin_file: sandbox_pin},
-        setenv = {
-            "P11_KIT_SERVER_ADDRESS": "unix:path={}".format(sandbox_socket),
-            "PKCS11_PROVIDER_MODULE": _CLIENT_MODULE,
-        },
+        # pkcs11-provider loads p11-kit's proxy module, and every box configures p11-kit to load its
+        # client module, see package/installer.py.
+        setenv = {"P11_KIT_SERVER_ADDRESS": "unix:path={}".format(sandbox_socket)},
     )
     return [
         # `[cert]` for the same reason a generated key has one: an image installs a certificate as a
@@ -341,11 +415,6 @@ def _pkcs11_signing_key_impl(ctx: AnalysisContext) -> list[Provider]:
 _pkcs11_signing_key = rule(
     impl = _pkcs11_signing_key_impl,
     attrs = {
-        "box": attrs.exec_dep(
-            providers = [BoxInfo],
-            default = "tine//catalog:fedora.rawhide.box",
-            doc = "box providing keyutil and the PKCS#11 provider",
-        ),
         "certificate": attrs.option(
             attrs.source(),
             default = None,
@@ -369,6 +438,7 @@ _pkcs11_signing_key = rule(
         "section": attrs.string(doc = "the build configuration section the coordinates came from"),
         "socket": attrs.option(attrs.string(), default = None, doc = "host path of the p11-kit server socket"),
         "token": attrs.option(attrs.string(), default = None, doc = "the token label"),
+        "_box": attrs.exec_dep(providers = [box.Info], default = "tine//distribution:tools.box"),
     },
     doc = """Address a key held by a PKCS#11 token reachable over a p11-kit server socket.
 

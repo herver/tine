@@ -22,8 +22,10 @@ import libdnf5.rpm
 import specs
 from util import fail
 
-import rootfs
+import macros
+import storage
 import transaction
+import uapi16
 
 # A multilib package in a pinned-arch transaction indicates a bad solve.
 MULTILIB_ARCHES = ("i686", "i386", "i586")
@@ -33,6 +35,7 @@ CACHEDIR = Path("/var/tmp/plan-cache")
 
 class SolveSpec(transaction.Spec):
     install: list[str]
+    install_files: list[str]
     lower: list[str]
     # Prebuilt repository caches (make-cache outputs) seeding this solve.
     cache: list[str]
@@ -75,7 +78,12 @@ def load_base(
     # Do not let host detection affect provider selection.
     base.get_vars().set("arch", arch)
     base.get_vars().set("basearch", arch)
+    # Each distribution's dnf5 package enables its own set of libdnf5 plugins in the box. Arch's
+    # enables one whose library it does not install, and setup() then fails.
+    cfg.plugins = False
     base.setup()
+    # libdnf5 reads the rpm database of `installroot` through the box's rpm.
+    macros.define()
 
     sack = base.get_repo_sack()
     for repo in repos:
@@ -126,6 +134,11 @@ def undelivered(
         if spec.startswith("@"):
             if spec.removeprefix("@") not in groups:
                 missing.append(spec)
+            continue
+        # resolve_pkg_spec() doesn't evaluate rich dependencies. For (A if B), it would report A as missing
+        # while B is absent, although the dependency holds. The solve still requests every rich dependency,
+        # and it fails when no package satisfies one, such as (A or B) with neither A nor B available.
+        if spec.startswith("("):
             continue
         wanted = libdnf5.rpm.PackageQuery(base)
         wanted.resolve_pkg_spec(spec, settings, False)
@@ -227,19 +240,20 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     solve_spec = specs.load(SolveSpec, args.spec, prog="plan")
-    if not solve_spec["install"]:
-        fail("plan: a solve needs at least one install spec")
+    install = transaction.install_specs(solve_spec["install"], solve_spec["install_files"])
     repos = load_repositories(solve_spec)
     seeds = [Path(cache_dir).absolute() for cache_dir in solve_spec["cache"]]
+    if not install:
+        transaction.write(Path(args.out), [], repos)
+        return
 
     with ExitStack() as stack:
         installroot = None
         if solve_spec["lower"]:
-            # An ephemeral upper keeps the lower stack unchanged.
-            installroot = stack.enter_context(rootfs.rootfs("/installroot", lowers=solve_spec["lower"]))
+            installroot = stack.enter_context(storage.root(uapi16.Snapshot(solve_spec["lower"]))).path
         tx = plan(
             repos,
-            solve_spec["install"],
+            install,
             CACHEDIR,
             installroot,
             solve_spec["arch"],

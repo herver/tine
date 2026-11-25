@@ -9,11 +9,9 @@ The same driver bootstraps boxes, assembles buildroots, and extends image
 layers. It parks the rpmdb and removes nondeterministic bookkeeping before capture.
 """
 
-import os
 import shutil
 import sqlite3
 import sys
-import tempfile
 from pathlib import Path
 from typing import override
 
@@ -21,8 +19,8 @@ import libdnf5
 from util import fail
 
 import installer
-
-DBPATH = "usr/lib/sysimage/rpm"
+import macros
+from macros import DBPATH
 
 CACHEDIR = Path("/var/tmp/install-cache")
 
@@ -56,32 +54,16 @@ class TransactionCallbacks(libdnf5.rpm.TransactionCallbacks):
         print(error, file=sys.stderr)
 
 
-def limit_langs(langs: list[str]) -> None:
-    """Restrict the `%lang()`-marked files rpm installs to the given languages.
-
-    libdnf5 exposes neither a macro API nor an equivalent option, so this has to arrive through
-    rpm's own macro path. XDG_CONFIG_HOME is the entry that keeps it inside this driver: writing
-    /etc/rpm/macros.* instead would need a bind mount arranged by the action, outside the
-    package system. The directory lives in the action's temporary space, which Buck clears
-    before that action next runs.
-    """
-    config = Path(tempfile.mkdtemp(prefix="rpmconfig.")) / "rpm"
-    config.mkdir()
-    (config / "macros").write_text("%_install_langs {}\n".format(":".join(langs)))
-    os.environ["XDG_CONFIG_HOME"] = str(config.parent)
-
-
 def install(
     rpms_dir: Path,
     installroot: Path,
     cachedir: Path,
     *,
+    arch: str,
     system: bool = False,
     langs: list[str] | None = None,
     docs: bool = True,
 ) -> None:
-    if langs:
-        limit_langs(langs)
     base = libdnf5.base.Base()
     cfg = base.get_config()
     cfg.installroot = str(installroot)
@@ -95,7 +77,16 @@ def install(
     # rpmdb, which is deliberately not where they live.
     cfg.pkg_gpgcheck = False
     cfg.localpkg_gpgcheck = False
+    # libdnf5 and rpm expect packages for the architecture of the machine that the box runs on. Without
+    # these options, they refuse the packages of an image for another architecture. dnf5's --forcearch
+    # also sets ignorearch and arch.
+    cfg.ignorearch = True
+    base.get_vars().set("arch", arch)
+    base.get_vars().set("basearch", arch)
+    # The box's libdnf5 plugins differ by distribution, as in plan.py.
+    cfg.plugins = False
     base.setup()
+    macros.define(langs)
 
     sack = base.get_repo_sack()
     paths = [str(p) for p in sorted(rpms_dir.glob("*.rpm"))]
@@ -110,7 +101,7 @@ def install(
         query.filter_repo_id(["@commandline"])
     goal = libdnf5.base.Goal(base)
     # SWIG exposes iteration at runtime but not in its type information.
-    packages: list[libdnf5.rpm.Package] = list(query)  # ty: ignore[invalid-argument-type]
+    packages = list[libdnf5.rpm.Package](query)  # ty: ignore[invalid-argument-type]
     for pkg in packages:
         goal.add_rpm_install(pkg)
     tx = goal.resolve()
@@ -164,23 +155,24 @@ def install_into_root(
     packages_dir: Path,
     installroot: Path,
     *,
+    arch: str,
     system: bool,
     langs: list[str] | None = None,
     docs: bool = True,
 ) -> None:
     with installer.fresh_machine_id(installroot):
-        install(packages_dir, installroot, CACHEDIR, system=system, langs=langs, docs=docs)
+        install(packages_dir, installroot, CACHEDIR, arch=arch, system=system, langs=langs, docs=docs)
     parkdb(installroot)
     scrub(installroot)
 
 
-def _install(packages_dir: Path, installroot: Path, spec: installer.InstallSpec, layered: bool) -> None:
+def _install(packages_dir: Path, installroot: Path, spec: installer.InstallSpec) -> None:
     install_into_root(
         packages_dir,
         installroot,
-        # Installed packages satisfy dependencies for an incremental install; a root the caller
-        # mounted says so by already carrying an rpmdb.
-        system=layered or (installroot / DBPATH / "rpmdb.sqlite").exists(),
+        arch=spec["arch"],
+        # Installed packages satisfy dependencies for an install over a root that contains an rpmdb.
+        system=(installroot / DBPATH / "rpmdb.sqlite").exists(),
         langs=spec["langs"],
         docs=spec["docs"],
     )

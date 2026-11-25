@@ -4,11 +4,34 @@
 """The axis an image's distribution is selected on."""
 
 load("@prelude//:rules.bzl", "constraint_setting", "constraint_value")
+load("@settings//:settings.bzl", "SETTINGS")
+load("//box:defs.bzl", "box")
+load("//platform:architecture.bzl", "architecture")
+load(":defs.bzl", "distribution")
+
+# Buck fails to load this package when it reads a field that `SETTINGS` doesn't have. A project's
+# settings.bzl can predate a field, so read every field with a default.
+_TOOLS_BOX = getattr(SETTINGS, "tools_box", struct())
 
 constraint_setting(
     name = "distribution",
     visibility = ["PUBLIC"],
 )
+
+# Distributions of one family name their packages alike, so a package list selects on the family.
+constraint_setting(
+    name = "family",
+    visibility = ["PUBLIC"],
+)
+
+[
+    constraint_value(
+        name = family,
+        constraint_setting = ":family",
+        visibility = ["PUBLIC"],
+    )
+    for family in distribution.FAMILIES
+]
 
 # No platform ever carries this value, so requiring it is how a target says it cannot be built.
 # It exists to be named in an error: an image asks for it wherever no distribution has been chosen,
@@ -18,5 +41,151 @@ constraint_setting(name = "choice")
 constraint_value(
     name = "no-distribution-chosen",
     constraint_setting = ":choice",
+    visibility = ["PUBLIC"],
+)
+
+# The test runs once per release of the catalog. Buck picks a release's key over its family's key, and
+# `DEFAULT` applies to a release whose family has no key. The expected value comes from a plain
+# select() on the three releases. Only one of its keys matches in any configuration, so the expected
+# value doesn't depend on which key wins.
+box.sh_test(
+    name = "select-test",
+    box = "//tools:dev.box",
+    script = '[[ "$1" == "$2" ]]',
+    args = [
+        distribution.select({
+            "DEFAULT": "default",
+            "debian": "family",
+            "fedora": "family",
+            "fedora.rawhide": "release",
+        }),
+        select({
+            "catalog//:arch.rolling.distribution": "default",
+            "catalog//:debian.testing.distribution": "family",
+            "catalog//:fedora.rawhide.distribution": "release",
+        }),
+    ],
+)
+
+# A box whose release is a select() on the distribution takes this as its incoming transition.
+distribution.box_host(name = "release.host")
+
+# Images and VMs run in the tools box of the release that the build chooses. An execution
+# dependency, and a build that chooses no release, get the tools box of the catalog's default release.
+# Images of every family sign and boot in the tools box of their release, so the package list names the
+# VM stack and the PKCS#11 client for every family. An image runs its package operations in the tools box
+# of its own release, and the root box of that release contains the package system of its family.
+# catalog//:releases.bzl has to list every release that images build for. A release missing from it gets
+# the root box of the default release.
+box.new(
+    name = "tools.box",
+    additional_repositories = getattr(_TOOLS_BOX, "additional_repositories", []),
+    packages = (
+        [
+            "ca-certificates",
+            "dosfstools",
+            "e2fsprogs",
+            "erofs-utils",
+            "mtools",
+            "systemd-ukify",
+            "zstd",
+            # Signing with a PKCS#11 token loads pkcs11-provider, which loads p11-kit's client module.
+            "pkcs11-provider",
+            # image.vm runs in this box. systemd-vmspawn runs the guest, virtiofsd shares the image's
+            # extensions with it, and swtpm gives it a vTPM for measured boot. vmspawn forwards the
+            # guest's journal through systemd-journal-remote, and ssh logs in to the guest.
+            "swtpm",
+            "virtiofsd",
+        ]
+        + distribution.select({
+            "arch": [
+                # cryptsetup contains veritysetup.
+                "cryptsetup",
+                # kmod contains depmod, which image.ops.depmod() runs against the image. The uki driver
+                # resolves module dependencies through libkmod, which kmod contains as well.
+                "kmod",
+                # libp11-kit contains p11-kit's PKCS#11 client module.
+                "libp11-kit",
+                "openssh",
+                # ukify needs python-cryptography and python-pefile to sign UKIs and parse PEs, but
+                # systemd-ukify only lists them as optional dependencies.
+                "python-cryptography",
+                "python-pefile",
+                # An image's qcow2 subtarget runs qemu-img.
+                "qemu-img",
+                # The systemd package contains udev, repart, tmpfiles, sysusers, bootctl, vmspawn and
+                # journal-remote.
+                "systemd",
+            ],
+            "debian": [
+                "cryptsetup-bin",
+                # kmod contains depmod, which image.ops.depmod() runs against the image.
+                "kmod",
+                # kmod/kmod.py loads libkmod.so.2 with dlopen(), and no package in this list depends on it.
+                "libkmod2",
+                "openssh-client",
+                # p11-kit-modules contains p11-kit's PKCS#11 client module.
+                "p11-kit-modules",
+                # ukify imports `cryptography` and `pefile`. systemd-ukify only recommends their packages,
+                # and the install skips recommended packages.
+                "python3-cryptography",
+                "python3-pefile",
+                "qemu-utils",
+                "swtpm-tools",
+                "systemd",
+                "systemd-boot-efi",
+                "systemd-boot-tools",
+                "systemd-container",
+                "systemd-journal-remote",
+                "systemd-repart",
+                # systemd-tpm contains systemd-measure, which ukify runs to sign the policy for the
+                # expected PCRs.
+                "systemd-tpm",
+                "udev",
+            ],
+            "fedora": [
+                # kmod contains depmod, which image.ops.depmod() runs against the image.
+                "kmod",
+                # The uki driver resolves module dependencies through libkmod.
+                "kmod-libs",
+                "openssh-clients",
+                "p11-kit-client",
+                # ukify needs python3-cryptography and python3-pefile to sign UKIs and parse PEs, but
+                # systemd-ukify only weakly depends on them.
+                "python3-cryptography",
+                "python3-pefile",
+                "qemu-img",
+                # swtpm-tools contains swtpm_setup, which vmspawn runs to initialize the TPM state.
+                "swtpm-tools",
+                "systemd-container",
+                "systemd-journal-remote",
+                "systemd-udev",
+                "veritysetup",
+            ],
+        })
+        # qemu and its EDK2 firmware are packaged per guest architecture. A box only runs guests of its
+        # own architecture.
+        + distribution.select({
+            "arch": architecture.select({
+                "arm64": [],
+                "x86_64": ["edk2-ovmf", "qemu-system-x86"],
+            }),
+            "debian": architecture.select({
+                "arm64": ["qemu-efi-aarch64", "qemu-system-arm"],
+                "x86_64": ["ovmf", "qemu-system-x86"],
+            }),
+            "fedora": architecture.select({
+                "arm64": ["edk2-aarch64", "qemu-system-aarch64-core", "qemu-device-uefi-vars"],
+                "x86_64": ["edk2-ovmf", "qemu-system-x86-core"],
+            }),
+        })
+        + getattr(_TOOLS_BOX, "packages", [])
+    ),
+    release = distribution.release_target("release"),
+    parent = distribution.release_target("box"),
+    # The Fedora root box installs systemd-standalone-sysusers, and the tools box needs systemd, which
+    # conflicts with it. The tools box therefore installs its parent's packages again rather than
+    # layering over the root box.
+    layered = False,
     visibility = ["PUBLIC"],
 )

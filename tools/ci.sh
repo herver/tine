@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
 # SPDX-License-Identifier: MPL-2.0
@@ -82,23 +82,35 @@ if [ "$mode" = github ]; then
     trap 'printf "::endgroup::\n::error::ci group %s failed\n" "$groupname"' ERR
 fi
 
-# The catalog pins Arch repositories for x86_64 only. On another architecture, the Arch root box
-# cannot be built and the catalog cannot be verified.
-x86_only_catalog() { [ "$(uname -m)" = x86_64 ]; }
+# TINE_TEST_DISTRO names the release whose boxes every group builds with, such as arch.rolling. Nested
+# Buck runs, such as the ones `check` starts, take no command-line configuration, so the setting goes
+# into the project's configuration for as long as this script runs.
+box_config=.buckconfig.d/tine-box
+box_cleanup() { rm -f "$box_config"; }
+box_cleanup
+if [ -n "${TINE_TEST_DISTRO:-}" ]; then
+    mkdir -p .buckconfig.d
+    printf '[tine]\nbox = %s\n' "$TINE_TEST_DISTRO" > "$box_config"
+    trap box_cleanup EXIT
+fi
 
-# All available build targets; see tools/dev.py for why that is not always `tine//...`.
+# A run builds and tests one distro release (TINE_TEST_DISTRO, or else the catalog's default release
+# Fedora): its images, and tine's own targets with its boxes. It needs only that release's mirrors, so a
+# release whose mirror is down fails its own job only.
+release=$("${buck[@]}" run tine//tools:dev -- release)
+
+# `universe` lists the build targets of the tine and catalog cells. tools/dev.py explains which targets
+# it leaves out.
 universe() { "${buck[@]}" run tine//tools:dev -- universe; }
 
-# `build` and `test` take no query, so they get the universe target list explicitly.
+# `build` and `test` take no query, so they get the targets of the release explicitly, as
+# tools/release.bxl selects them. That leaves out the incompatible ones too.
 whole_cell() {
-    local verb=$1 query listing targets
+    local verb=$1 listing targets
     shift
-    query=$(universe)
-    listing=$("${buck[@]}" uquery "$query")
+    listing=$("${buck[@]}" run tine//tools:dev -- targets --release "$release")
     mapfile -t targets <<< "$listing"
-    # There are a lot of targets which are incompatible everywhere (image base without a chosen distribution, a
-    # signing token without config, etc.), don't fail on them.
-    "${buck[@]}" "$verb" --skip-incompatible-targets "${targets[@]}" "$@"
+    "${buck[@]}" "$verb" "${targets[@]}" "$@"
 }
 
 # The boot smokes need the host's KVM. Some CI envs (like GitHub's arm64 runners) don't have that.
@@ -136,7 +148,7 @@ secureboot_pkcs11() {
     pkcs11_dir=$(mktemp -d)
     "${buck[@]}" run tine//tools:signing-server -- "$pkcs11_dir" > "$pkcs11_dir/log" 2>&1 &
     server_pid=$!
-    trap pkcs11_cleanup EXIT
+    trap 'pkcs11_cleanup; box_cleanup' EXIT
     until [ -S "$pkcs11_dir/sock/pkcs11" ]; do
         # Any setup failure exits the server before it gets to listen; its log then says why.
         kill -0 "$server_pid" 2> /dev/null || return 1
@@ -155,7 +167,9 @@ token = PcrPolicy
 pin-file = $pkcs11_dir/pin
 socket = $pkcs11_dir/sock/pkcs11
 EOF
-    local config=(--config-file "$pkcs11_dir/signing.bcfg")
+    # The release's platform, rather than a per-distribution alias of the image, whose suffix is a key of
+    # catalog//:releases.bzl.
+    local config=(--config-file "$pkcs11_dir/signing.bcfg" --target-platforms "catalog//:$release.distribution")
 
     "${buck[@]}" build "${config[@]}" tine//examples/image-secureboot:image
     "${buck[@]}" build "${config[@]}" 'tine//examples/image-secureboot:image[uki]' --out "$pkcs11_dir/ukis"
@@ -179,29 +193,51 @@ EOF
 
 # Nothing here needs a box, so a graph that does not analyze is reported in seconds rather than
 # after two bootstraps. `check` runs it again, for anyone running that on its own.
-group graph             -- "${buck[@]}" bxl tine//tools/graph.bxl:analyze -- --pattern "$(universe)"
-# First invocation fetches buck's pinned tools and builds the shared box; kept its own group so
-# bootstrap time stays visible.
-group box               -- "${buck[@]}" build tine//catalog:fedora.rawhide.box
-# The Arch box and the Debian box are root boxes, so each box is bootstrapped from scratch and
-# gets its own group.
-if x86_only_catalog; then
-    group arch-box      -- "${buck[@]}" build tine//catalog:arch.rolling.box
+pattern=$(universe)
+group graph             -- "${buck[@]}" bxl tine//tools/graph.bxl:analyze -- --pattern "$pattern"
+# A build for another architecture, or for one distribution, skips what cannot be built for it. A target
+# that is compatible but depends on an incompatible one fails these analyses instead of being skipped.
+# `graph` already analyzes the graph for the host's architecture.
+case $(uname -m) in
+    x86_64) other=arm64 ;;
+    *) other=x86_64 ;;
+esac
+platforms=("catalog//:$release.distribution")
+# The catalog's default.* aliases have no architecture constraint. With TINE_TEST_DISTRO=arch.rolling,
+# the analysis for arm64 fails on catalog//:default.release, because Arch serves x86_64 only. The run
+# with the default boxes analyzes the other architecture.
+if [ -z "${TINE_TEST_DISTRO:-}" ]; then
+    platforms=("tine//platform:$other" "${platforms[@]}")
 fi
-group deb-box           -- "${buck[@]}" build tine//catalog:debian.testing.box
-group check             -- "${buck[@]}" run tine//tools:check
+for platform in "${platforms[@]}"; do
+    group "graph-${platform##*:}" -- "${buck[@]}" bxl --target-platforms "$platform" tine//tools/graph.bxl:analyze -- --pattern "$pattern"
+done
+# First invocation fetches buck's pinned tools and bootstraps the release's root box; kept its own
+# group so bootstrap time stays visible.
+group box               -- "${buck[@]}" build "catalog//:$release.box"
+group check             -- "${buck[@]}" run tine//tools:check -- --release "$release"
 # Every repository the catalog declares is pinned to a mirror serving immutable snapshots, so the whole
-# catalog is verifiable rather than the boxes that happen to be pinned.
-if x86_only_catalog; then
-    group verify-catalog -- "${buck[@]}" run tine//tools:verify-catalog
+# catalog is verifiable rather than the boxes that happen to be pinned. The root box of a release
+# reaches every repository of it. Every release serves x86_64, so its x86_64 run verifies its locks for
+# every architecture. The Go releases belong to no release, so the run with the default boxes verifies
+# them.
+if [ "$(uname -m)" = x86_64 ]; then
+    go=()
+    if [ -z "${TINE_TEST_DISTRO:-}" ]; then go=(--go); fi
+    group verify-catalog -- "${buck[@]}" run tine//tools:verify-catalog -- --box "$release.box" "${go[@]}"
 fi
-# Everything the cell declares, rather than the handful of targets someone remembered to name here:
-# every example image over every package system, the boxes, and the source-build demos.
+# Everything the cell declares for the release, rather than the handful of targets someone remembered to
+# name here: every example image, the boxes, and the source-build demos.
 group build             -- whole_cell build
-# Everything `check` left out: the boot smokes over every package system, which take minutes each,
-# and the assertions about what the images above produced. Adding one is declaring it, not naming it
-# here as well.
+# Everything `check` left out: the boot smokes, which take minutes each, and the assertions about what
+# the images above produced. Adding one is declaring it, not naming it here as well.
 group image-tests       -- whole_cell test --include image "${vm_filter[@]}"
 group secureboot-pkcs11 -- secureboot_pkcs11
-# The shared cache with a real Buck on both ends; in its own isolation dir.
-group remote-cache      -- "${buck[@]}" run tine//tests:cache-roundtrip
+# Expensive and distro independent.
+if [ -z "${TINE_TEST_DISTRO:-}" ]; then
+    # A change to the box must not change the Secure Boot example. The test builds in its own isolation dir.
+    # Builds Fedora regardless of $TINE_TEST_DISTRO.
+    group rebuild-reproducibility -- "${buck[@]}" run tine//tests:rebuild-reproducibility
+    # The shared cache with a real Buck on both ends; in its own isolation dir.
+    group remote-cache -- "${buck[@]}" run tine//tests:cache-roundtrip
+fi
