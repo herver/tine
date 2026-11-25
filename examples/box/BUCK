@@ -1,16 +1,73 @@
 # SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
 # SPDX-License-Identifier: MPL-2.0
 
-"""Development-box smoke target."""
+"""Development-box smoke targets."""
 
 load("@tine//box:defs.bzl", "box")
+load("@tine//distribution:defs.bzl", "distribution")
 
 box.new(
     name = "demo.box",
     packages = [
         "bash",
         "coreutils",
-        "fish",
     ],
-    release = "tine//catalog:fedora.rawhide.release",
+    release = "catalog//:default.release",
+)
+
+# Same repositories as its parent, so it is a layer over it.
+box.new(
+    name = "demo-with-parent.box",
+    packages = ["fish"],
+    parent = ":demo.box",
+    release = "catalog//:default.release",
+)
+
+box.new(
+    name = "demo-standalone.box",
+    layered = False,
+    packages = ["fish"],
+    parent = ":demo.box",
+    release = "catalog//:default.release",
+)
+
+# Each distribution family names the package of the Python yaml module differently.
+box.new(
+    name = "demo-per-family.box",
+    packages = distribution.select({
+        "arch": ["python-yaml"],
+        "debian": ["python3-yaml"],
+        "fedora": ["python3-pyyaml"],
+    }),
+    release = "catalog//:default.release",
+)
+
+box.sh_test(
+    name = "per-family-test",
+    distributed = False,
+    labels = ["image"],
+    box = ":demo-per-family.box",
+    script = "python3 -c 'import yaml'",
+)
+
+box.sh_test(
+    name = "layering-test",
+    distributed = False,
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    test = "layering.sh",
+    args = [
+        "$(location :demo.box)",
+        "$(location :demo-with-parent.box)",
+        "$(location :demo-standalone.box)",
+    ],
+)
+
+# The layered box runs: bash comes from its parent's layer, fish from its own.
+box.sh_test(
+    name = "layered-run-test",
+    distributed = False,
+    labels = ["image"],
+    box = ":demo-with-parent.box",
+    script = "test \"$(HOME=/tmp fish --command 'echo hello')\" = hello",
 )

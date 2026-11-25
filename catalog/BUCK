@@ -3,15 +3,16 @@
 
 """Default repositories, OS releases, boxes, package managers, and build profiles."""
 
-# Generated data lives under `snapshot/{repo,box,key}/`, named by target without its type suffix, and
-# by architecture.
+# Generated data lives under `snapshot/{repo,box,key,go}/`, named by target without its type suffix, and
+# by architecture where it differs per architecture.
 # Boxes with a resolver can derive their transaction during the build; refresh the catalog to freeze
 # one as a retained lock. Signing keys are fetched once, when a repository first declares them.
-load("//box:defs.bzl", "box")
-load("//distribution:arch.bzl", "arch_release", "arch_signing_keys")
-load("//distribution:debian.bzl", "debian_release", "debian_signing_keys")
-load("//distribution:fedora.bzl", "fedora_release", "fedora_signing_keys")
-load("//platforms:architecture.bzl", "architecture")
+
+load("@tine//distribution:arch.bzl", "arch")
+load("@tine//distribution:debian.bzl", "debian")
+load("@tine//distribution:defs.bzl", "distribution")
+load("@tine//distribution:fedora.bzl", "fedora")
+load("@tine//go:defs.bzl", "go")
 
 # What the mirror serves, and so what a box of this release keeps a committed lock for. A box only
 # ever takes architectures its release has, so state each release's once.
@@ -26,160 +27,46 @@ _DEBIAN_ARCHITECTURES = ["x86_64", "arm64"]
 
 # Pinned rpmrepo compose snapshot: packages never vanish underneath committed pins.
 # refresh-catalog --advance enumerates the mirror and moves the snapshot pin to the newest compose.
-fedora_release(
+fedora.release(
     name = "fedora.rawhide",
     version = "rawhide",
     architectures = _FEDORA_ARCHITECTURES,
-    box = ":fedora.rawhide.box",
     rpmrepo_mirror = "https://rpmrepo-gateway.amutable.workers.dev/v2/mirror/public/f46",
-    rpmrepo_snapshot = "f46-$basearch-rawhide-20261003",
+    rpmrepo_snapshot = "f46-$basearch-rawhide-20261122",
     # should be at most two; drop the previous version after the regular mass rebuild is done
-    signing_keys = fedora_signing_keys("46", "45"),
-    visibility = ["PUBLIC"],
-)
-
-# Shared RPM box plus the image assembly and VM tools. These tools stay out of images.
-box.new(
-    name = "fedora.rawhide.box",
-    architectures = _FEDORA_ARCHITECTURES,
-    packages = [
-        "rpm",
-        "python3-libdnf5",
-        "python3-createrepo_c",
-        "coreutils",
-        "libseccomp",
-        "ca-certificates",
-        # the uki driver resolves module dependencies through libkmod
-        "kmod-libs",
-        "systemd-udev",
-        "systemd-ukify",
-        # ukify needs these to sign UKIs and parse PEs, but they are only weak dependencies
-        "python3-cryptography",
-        "python3-pefile",
-        # remote signing with hardware keys
-        "pkcs11-provider",
-        "p11-kit-client",
-        "e2fsprogs",
-        "erofs-utils",
-        "veritysetup",
-        "dosfstools",
-        "mtools",
-        "systemd-container",
-        "qemu-img",
-        "zstd",
-        "virtiofsd",
-        # software TPM so systemd-vmspawn can offer the guest a vTPM for measured boot;
-        # swtpm-tools provides swtpm_setup, which vmspawn runs to initialize the TPM state
-        "swtpm",
-        "swtpm-tools",
-        "openssh",
-    ]
-    + architecture.select({
-        # qemu and its EDK2 firmware are packaged per guest architecture; a box only ever runs guests
-        # of its own.
-        "arm64": ["edk2-aarch64", "qemu-system-aarch64-core"],
-        "x86_64": ["edk2-ovmf", "qemu-system-x86-core"],
-    }),
-    release = ":fedora.rawhide.release",
-    root = True,
+    signing_keys = fedora.signing_keys("46", "45"),
     visibility = ["PUBLIC"],
 )
 
 # Arch has no numbered releases, so the catalog pins a day in the Arch Linux Archive: its dated
 # trees serve databases that never change under a committed pin, which a rolling mirror cannot.
 # refresh-catalog --advance moves every repository sharing this pin to the newest complete day.
-arch_release(
+arch.release(
     name = "arch.rolling",
     architectures = _ARCH_ARCHITECTURES,
-    archive_snapshot = "2026/10/03",
-    box = ":arch.rolling.box",
-    signing_keys = arch_signing_keys(),
+    archive_snapshot = "2026/11/22",
+    signing_keys = arch.signing_keys(),
     visibility = ["PUBLIC"],
 )
 
-# The alpm box. It is a root box: extracting alpm packages needs no package tooling, so it
-# bootstraps its own pacman rather than borrowing another box's. It carries the image assembly
-# tools every rule resolves through an image's own manager, under Arch's names for them. The VM
-# stack stays out: `image_vm` takes its box explicitly, so a second qemu/OVMF/swtpm userspace
-# would be built for nothing.
-box.new(
-    name = "arch.rolling.box",
-    architectures = _ARCH_ARCHITECTURES,
-    packages = [
-        "pacman",
-        # the keyring driver takes the packagers' keys and the main keys' certifications from here
-        "archlinux-keyring",
-        "bash",
-        "coreutils",
-        "libseccomp",
-        "ca-certificates",
-        # the uki driver resolves module dependencies through libkmod
-        "kmod",
-        # udev, repart, tmpfiles, sysusers and bootctl all ship here
-        "systemd",
-        "systemd-ukify",
-        # ukify needs these to sign UKIs and parse PEs, but they are only optional dependencies
-        "python-cryptography",
-        "python-pefile",
-        "e2fsprogs",
-        "erofs-utils",
-        # veritysetup
-        "cryptsetup",
-        "dosfstools",
-        "mtools",
-        "zstd",
-    ],
-    release = ":arch.rolling.release",
-    root = True,
-    visibility = ["PUBLIC"],
-)
-
-debian_release(
+debian.release(
     name = "debian.testing",
     architectures = _DEBIAN_ARCHITECTURES,
-    archive_snapshot = "20261003T204240Z",
-    box = ":debian.testing.box",
+    archive_snapshot = "20261122T143046Z",
     # The archive signs a Release with its current key and with the previous key.
-    signing_keys = debian_signing_keys("archive-key-12", "archive-key-13"),
+    signing_keys = debian.signing_keys("archive-key-12", "archive-key-13"),
     visibility = ["PUBLIC"],
 )
 
-box.new(
-    name = "debian.testing.box",
-    architectures = _DEBIAN_ARCHITECTURES,
-    packages = [
-        "apt",
-        "bash",
-        "ca-certificates",
-        "coreutils",
-        "cryptsetup-bin",
-        "dosfstools",
-        "dpkg",
-        "e2fsprogs",
-        "erofs-utils",
-        "kmod",
-        # image/kmod.py loads libkmod.so.2 with dlopen(), and no package in this list depends on it.
-        "libkmod2",
-        "libseccomp2",
-        "mtools",
-        "python3",
-        # ukify imports `cryptography` and `pefile`. systemd-ukify only recommends their packages, and
-        # the install skips recommended packages.
-        "python3-cryptography",
-        "python3-pefile",
-        # package_system/deb/verify.py runs sqv. apt depends on sqv today, but list it explicitly.
-        "sqv",
-        "systemd",
-        "systemd-boot-efi",
-        "systemd-boot-tools",
-        "systemd-repart",
-        # systemd-tpm ships systemd-measure, which ukify runs to sign the policy for the expected PCRs.
-        "systemd-tpm",
-        "systemd-ukify",
-        "udev",
-        "zstd",
-    ],
-    release = ":debian.testing.release",
-    root = True,
+# A go_package whose toolchain is go.releases builds with the release of the minor version that the
+# project's .go-version names. refresh-catalog --advance writes the newest patch release of every minor
+# version from Go 1.21 on into the snapshot.
+go.releases(
+    name = "go.releases",
     visibility = ["PUBLIC"],
 )
+
+# tine's own boxes, such as the boxes in tine//tools, build from the release that default_release()
+# names. A project's catalog has to call default_release() too, unless its releases.bzl lists one
+# release. It can name a release of any family.
+distribution.default_release("fedora.rawhide")

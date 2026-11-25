@@ -3,47 +3,73 @@
 
 """Native package systems, repositories, releases, managers, and buildroots."""
 
-load("//box:test.bzl", "box_python_test")
-load("//python:defs.bzl", "tine_python_library")
+load("//python:defs.bzl", "python")
 
-tine_python_library(
+python.library(
     name = "href",
     srcs = ["href.py"],
     visibility = ["PUBLIC"],
     deps = ["//:util"],
 )
 
-tine_python_library(
+python.library(
+    name = "builder",
+    srcs = ["builder.py"],
+    visibility = ["PUBLIC"],
+    deps = ["//:util", "//rootfs:rootfs"],
+)
+
+python.library(
     name = "extractor",
     srcs = ["extractor.py"],
     visibility = ["PUBLIC"],
-    deps = ["//:specs", "//:util", "//rootfs:rootfs"],
+    deps = ["//:specs", "//:util", "//rootfs:rootfs", "//rootfs:storage", "//uapi16:uapi16"],
 )
 
-tine_python_library(
+python.library(
     name = "installer",
     srcs = ["installer.py"],
-    deps = ["//:specs", "//:util", "//rootfs:rootfs"],
+    deps = ["//:specs", "//:util", "//rootfs:rootfs", "//rootfs:storage", "//uapi16:uapi16"],
     visibility = ["PUBLIC"],
 )
 
-tine_python_library(
+python.library(
     name = "snapshotter",
     srcs = ["snapshotter.py"],
     deps = ["//:specs", "//:util"],
     visibility = ["PUBLIC"],
 )
 
-tine_python_library(
+python.library(
+    name = "subpackage",
+    srcs = ["subpackage.py"],
+    deps = ["//:util"],
+    visibility = ["PUBLIC"],
+)
+
+python.library(
     name = "transaction",
     srcs = ["transaction.py"],
     deps = [":snapshotter", "//:util"],
     visibility = ["PUBLIC"],
 )
 
-box_python_test(
+python.test(
     name = "test",
-    box = "tine//catalog:fedora.rawhide.box",
-    srcs = ["installer_test.py", "transaction_test.py"],
-    deps = [":installer", ":transaction"],
+    # installer_test runs systemd-tmpfiles, which only the tools box contains.
+    box = "tine//distribution:tools.box",
+    srcs = ["extractor_test.py", "installer_test.py", "snapshotter_test.py", "transaction_test.py"],
+    deps = [":extractor", ":installer", ":snapshotter", ":transaction"],
+)
+
+# The driver runs in the box with network access. It reads a source checkout's packaging pin and writes the
+# tree of the pinned commit.
+python.binary(name = "packaging", main = "packaging.py", deps = ["//:specs", "//:util"], visibility = ["PUBLIC"])
+
+python.test(
+    name = "packaging-test",
+    # The test creates git repositories, and the dev box contains git.
+    box = "tine//tools:dev.box",
+    srcs = ["packaging.py", "packaging_test.py"],
+    deps = ["//:specs", "//:util"],
 )

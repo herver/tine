@@ -72,14 +72,14 @@ The importer names a package branch by its upstream distro (`fedora`, `centos`) 
 ```Starlark
 alias(
     name = "rawhide",
-    actual = "//catalog:fedora.rawhide.buildroot",
+    actual = "catalog//:fedora.rawhide.buildroot",
     visibility = ["PUBLIC"],
 )
 ```
 
-The alias can also point to tine's default catalog (`tine//catalog:fedora.rawhide.buildroot`), but it is
-recommended to declare the OS's own `//catalog` package(s): then the OS advances its repository pins in
-its own commits, instead of whenever it updates tine.
+We recommend that the OS declares its own `catalog` cell. The OS then advances its repository pins in
+its own commits, instead of whenever it updates tine. Without its own cell, `catalog//` is tine's catalog.
+See "Concepts" in [images.md](images.md) for how to declare one.
 
 To use locally built packages in an image build, its package manager has to attach the branch's
 `//packages/`_distro_`/`_branch_`:_local_packages` universe. See `local_packages` in
@@ -139,9 +139,8 @@ introduce a proper tool verb for that cleanup, but that can wait until the need 
 ## Branch build curation (`_properties.json`)
 
 A `packages/`_distro_`/`_branch_`/` directory may carry a `_properties.json` alongside the per-package
-`srcpkg.json` files. It holds hand-authored, branch-level build curation. The importer folds it into the
-generated branch `BUCK`'s `rpm_branch(...)` call (`regenerate_buck`); never hand-edit the `@generated`
-`BUCK` itself.
+`srcpkg.json` files. It holds hand-authored, branch-level build curation. The generated branch `BUCK`
+loads it and passes its properties to `rpm.branch()`. Never edit the `@generated` `BUCK` by hand.
 
 ### Buildroot-only packages
 
@@ -155,10 +154,10 @@ when the BuildRequires cycle-breaking drops an edge (background in [packages.md]
 
 Add a package when another package fails to build because a `BuildRequires` it needs is all three of:
 (a) produced by one of our own packages, (b) never present in the seed/compose, and (c) inside a
-BuildRequires cycle, so the lock drops the edge to it. `rpm_branch` validates the list on every load,
-failing loudly if either invariant breaks: every entry must have a local provider (else the claim is
-simply wrong), and the kept edges must still form a DAG (else that cycle needs a staged bootstrap instead,
-not a kept edge).
+BuildRequires cycle, so the lock drops the edge to it. `rpm.branch()` checks the list every time Buck loads
+the branch. Loading fails when an entry has no local provider, because then the entry is wrong. Loading
+also fails when the kept edges form a cycle, because then that cycle needs a staged bootstrap instead of a
+kept edge.
 
 ### Seed-only packages
 
@@ -197,12 +196,17 @@ Each imported package has a `<package>.source` checkout slot beside its imported
 When populated, this tree replaces the source archives: rpmbuild skips `%prep`, so the checkout must
 already contain any patches or generated files that step normally supplies. The build runs on an overlay
 of the tree, where `rename(2)` on one of its directories fails with `EXDEV`, as it does in a container;
-`mv` works, since it copies instead.
+`mv` works, since it copies instead. The build reads the tree as it is on disk, including the files that
+Buck ignores, and `%install` can copy them into the RPMs. See
+[Building from a local checkout instead](git.md#building-from-a-local-checkout-instead).
 
-Two per-package maps in `_properties.json` can adapt the build to that checkout. `in_place_specs` selects
+Three per-package maps in `_properties.json` can adapt the build to that checkout. `in_place_specs` selects
 an RPM spec by a path relative to the checkout root. The spec's directory also supplies its Source/Patch
-files and relative includes. `in_place_rpmbuild_options` adds CLI options after the common
-`rpmbuild_options` and any dev-mode defaults. The two properties can be used independently.
+files. rpm opens a relative `%include` from the checkout root. `in_place_packaging` takes the spec and its
+Source/Patch files from a dist-git commit that the checkout pins; see [Taking the packaging from a pin in the
+checkout](#taking-the-packaging-from-a-pin-in-the-checkout). A package cannot set both `in_place_specs` and
+`in_place_packaging`. `in_place_rpmbuild_options` adds CLI options after the common `rpmbuild_options` and
+any dev-mode defaults.
 
 For example, suppose an imported `hello` package has `rpm/hello.spec` in its developer checkout and
 supports `--with=upstream` for building from that tree. Its branch's `_properties.json` can contain:
@@ -220,7 +224,60 @@ Mount the checkout over the package's source slot:
 tine mount add packages/fedora/rawhide/hello.source ~/Projects/hello
 ```
 
-Without an `in_place_specs` entry, a source-tree build keeps the imported spec and its declared sources.
-Without a source-tree override, the normal archive build ignores both properties. These overrides do
-not change the imported BuildRequires or subpackage list; `rpm-metadata` uses only the common
-`rpmbuild_options`.
+Without an `in_place_specs` or `in_place_packaging` entry, a source-tree build keeps the imported spec and
+its declared sources. Without a source-tree override, the normal archive build ignores all three maps.
+These overrides do not change the imported BuildRequires or subpackage list; `rpm-metadata` uses only the
+common `rpmbuild_options`.
+
+#### Taking the packaging from a pin in the checkout
+
+A project such as systemd tests its main branch against a fixed commit of the distribution's dist-git
+repository. To build with the spec and Source/Patch files of that commit instead of the imported ones, map
+the package to the path of a pin file in its checkout:
+
+```json
+{ "in_place_packaging": { "systemd": "packaging.json" } }
+```
+
+The pin file is a JSON object that maps each distro to its pin. A branch under `packages/<distro>/` uses
+the entry of its distro, so the branches of every distro can share one pin file. An entry is a JSON object
+with the string keys `url`, `branch` and `commit`, and no other keys:
+
+```json
+{
+  "fedora": {
+    "url": "https://src.fedoraproject.org/rpms/systemd.git",
+    "branch": "rawhide",
+    "commit": "57cbcf979ce2dd872a871c59e87d2c65dfa996e6"
+  },
+  "centos": {
+    "url": "https://src.fedoraproject.org/rpms/systemd.git",
+    "branch": "rawhide",
+    "commit": "57cbcf979ce2dd872a871c59e87d2c65dfa996e6"
+  }
+}
+```
+
+The build fails if the pin file has no entry for the branch's distro. It checks only that entry, so an entry
+for another distro can have other keys. `commit` is a full commit hash in lowercase. The build fetches
+`branch` from `url` over the network and fails unless `commit` is on that branch. It then builds
+`<package>.spec` from that commit and copies every file at the top of the commit's tree into rpmbuild's
+`SOURCES`. The imported spec and its declared sources are not used. The fetch reads only the pin file: an
+edit elsewhere in the checkout does not fetch again, and a change to the pin file does, also when the change
+is in the entry of another distro. A missing pin file fails the build with Buck's message that the path does
+not exist in the checkout.
+
+The pinned spec can declare other subpackages than the imported metadata. A build with `in_place_packaging`
+prints the difference instead of failing on it, and emits the declared subpackages that it built. A build of
+a declared sub-target that the pinned spec does not produce, such as `:systemd[systemd-imds]`, fails. An
+image that installs a subpackage that the pinned spec does not produce gets the package of that name from
+the distribution's repositories, if the package exists there and its dependencies allow it. Archive builds
+and `in_place_specs` builds fail on any difference.
+
+The buildroot still contains the imported BuildRequires. If the pinned spec requires a package that the
+imported spec does not, rpmbuild fails with `Failed build dependencies:` until the package is imported again
+at a commit with that BuildRequires.
+
+The branch's generated `BUCK` passes `in_place_packaging` to the build only if its `rpm.branch()` call has
+an `in_place_packaging` line and a `distro` line. `import`, and an `update` that takes new commits,
+regenerate the `BUCK` with both lines.

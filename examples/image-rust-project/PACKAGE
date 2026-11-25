@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
+# SPDX-License-Identifier: MPL-2.0
+
+load("@tine//distribution:defs.bzl", "distribution")
+
+# The images here install Fedora packages, so they build only for Fedora.
+distribution.set_for_package({"fedora": {"release": "fedora.rawhide"}})

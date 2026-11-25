@@ -10,19 +10,19 @@ serves both, and nothing downstream of the keys knows which it got, since every 
 certificate whether it is held in the graph or by a token.
 
 The signed demo-ext system extension shows verity signing for a sysext DDI, with the image
-enforcing the signature through its sysext.conf image policy.
+enforcing the signature through its sysext.conf image policy. demo-ext signs with a key derived from
+its name, as an extension from another project would, so it uses the derived key with or without tokens.
+
+Every image here is built for each release in `catalog//:releases.bzl`, so a build names one of the
+per-distribution aliases, such as `:image.fedora`.
 """
 
 load("@tine//box:defs.bzl", "box")
+load("@tine//distribution:defs.bzl", "distribution")
 load("@tine//image:defs.bzl", "image")
-load("@tine//package:defs.bzl", "package")
-load("@tine//platforms:architecture.bzl", "ARCHITECTURES", "architecture")
+load("@tine//platform:architecture.bzl", "architecture")
+load("@tine//quarry:defs.bzl", "quarry")
 load("@tine//tests:defs.bzl", "tests")
-
-package.manager(
-    name = "image.package-manager",
-    base = "tine//catalog:fedora.rawhide.package-manager",
-)
 
 # This example serves two audiences, so it declares a key for each and picks: the tokens
 # `-c secure-boot-signing.{token,pin-file,socket}` configures, or pairs generated into buck-out for
@@ -48,11 +48,17 @@ image.generate_signing_key(name = "signing")
 
 image.generate_signing_key(name = "pcr-signing")
 
-# The two certificates this image reads back must say which key they belong to, and neither may fall
-# back to ukify's own name for a Secure Boot key.
+# demo-ext stands in for an extension that another project builds. Every project that declares a derived
+# key with this name gets the same pair, so the image trusts the extension without a copy of the other
+# project's certificate.
+image.derived_signing_key(name = "extension-signing")
+
+# Each certificate must say which key it belongs to. A generated certificate must not fall back to
+# ukify's own name for a Secure Boot key.
 [
     box.sh_test(
         name = "generated-key-name-test." + name,
+        distributed = False,
         args = ["$(location :{}[cert])".format(name), "tine.generated." + name],
         box = "@tine//tools:dev.box",
         script = """
@@ -63,7 +69,7 @@ if ! echo "$subject" | grep -qF "CN=$2"; then
 fi
 """,
     )
-    for name in ["signing", "pcr-signing"]
+    for name in ["signing", "pcr-signing", "extension-signing"]
 ]
 
 _SIGNING = ":signing.token" if SIGN_WITH_TOKEN else ":signing"
@@ -74,46 +80,36 @@ _PCR_SIGNING = ":pcr-signing.token" if SIGN_WITH_TOKEN else ":pcr-signing"
 # its packages, its operations, and how the cpio the UKI carries is compressed.
 image.initrd(
     name = "image.initrd",
-    package_manager = ":image.package-manager",
     compression = "none",
 )
 
-image.bootable_disk(
+image.disk(
     name = "image",
-    package_manager = ":image.package-manager",
     initrd = ":image.initrd",
     definitions = image.DEFAULT_SIGNED_USR_VERITY_PARTITIONS,
-    packages = [
-        "kernel-core",
-        "systemd",
-        "systemd-udev",
-        "systemd-boot-unsigned",
-        "fedora-release",
-        "bash",
-        "coreutils",
-        "util-linux",
-        "dbus-broker",
-    ],
+    package_sets = ["bootable"],
+    # The smoke checks run grep, which Arch's bootable package set does not install.
+    packages = ["grep"],
     ops = [
         # The smoke test compares this against the public key the stub hands the booted system, to
         # tell which key sealed the expected-PCR policy. Sealed under verity, so it cannot be
         # swapped.
-        image.copy(_SIGNING + "[cert]", "/usr/share/tine-example/secure-boot.crt"),
-        image.copy(_PCR_SIGNING + "[cert]", "/usr/share/tine-example/expected-pcr.crt"),
+        image.ops.copy(_SIGNING + "[cert]", "/usr/share/tine-example/secure-boot.crt"),
+        image.ops.copy(_PCR_SIGNING + "[cert]", "/usr/share/tine-example/expected-pcr.crt"),
         # demo-ext's signature verifies against this certificate; the sysext.conf policy next to
         # it makes that verification a requirement rather than opportunistic.
-        image.copy(_SIGNING + "[cert]", "/usr/lib/verity.d/demo-ext.crt"),
-        image.copy("sysext.conf", "/usr/lib/systemd/sysext.conf"),
+        image.ops.copy(":extension-signing[cert]", "/usr/lib/verity.d/demo-ext.crt"),
+        image.ops.copy("sysext.conf", "/usr/lib/systemd/sysext.conf"),
         # Plain data for the boot smoke's negative proof: a DDI the policy must refuse.
-        image.copy(":demo-ext-unsigned", "/usr/share/tine-example/demo-ext-unsigned.raw"),
+        image.ops.copy(":demo-ext-unsigned", "/usr/share/tine-example/demo-ext-unsigned.raw"),
+        # disk-manifest-test checks that the mode of a directory on the ESP reaches the disk listing.
+        image.ops.run(["mkdir", "-p", "-m", "0700", "/buildroot/boot/tine-private"]),
     ],
-    # An ESP-only path makes deferred metadata cross root, identity, and ESP before repart applies it.
-    tmpfiles = ["d /boot/tine-tmpfiles 0700 - -"],
     # This key signs the UKIs and systemd-boot, puts auto-enrollment files onto the ESP, and signs
     # the verity root hash. For a key that caches across workspaces, see image.pem_signing_key() under
     # "Secure Boot signing" in images.md.
     # `compression = "zstd"` on the partition only picks the algorithm; these are what actually make
-    # the erofs small, and they are the same options image_sysext builds a DDI with. --invariant keeps
+    # the erofs small, and they are the same options image.sysext builds a DDI with. --invariant keeps
     # the ESP byte-stable, which mkfs.fat is not by default.
     mkfs_options = {
         "erofs": [
@@ -131,23 +127,52 @@ image.bootable_disk(
     sign_expected_pcr_key = _PCR_SIGNING,
 )
 
+# The AMI's UEFI variable store enrolls the signing certificate as PK, KEK, and db, so EC2 instances start
+# out trusting it. See docs/user/aws.md.
+box.sh_test(
+    name = "uefi-data-test",
+    labels = ["image"],
+    args = ["$(location :image[ami])", "$(location {}[cert])".format(_SIGNING)],
+    box = "@tine//tools:aws.box",
+    script = """
+uefi_data=$(mktemp)
+python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["UefiData"])' "$1" > "$uefi_data"
+virt-fw-vars --input "$uefi_data" --output-json /dev/stdout | python3 -c '
+import json, ssl, sys
+cert = ssl.PEM_cert_to_DER_cert(open(sys.argv[1]).read())
+variables = {v["name"]: bytes.fromhex(v["data"]) for v in json.load(sys.stdin)["variables"]}
+for name in ("PK", "KEK", "db"):
+    if cert not in variables.get(name, b""):
+        sys.exit(f"ERROR: {name} does not hold the signing certificate")
+' "$2"
+""",
+)
+
 # System-extension DDI extending :image, signed so the strict policy in sysext.conf accepts the
-# merge. The image's own key, whose certificate it carries in /usr/lib/verity.d.
-image.sysext_image(
+# merge. The image carries the certificate of the derived key in /usr/lib/verity.d.
+image.sysext(
     name = "demo-ext",
-    base = ":image",
+    parent = ":image",
     packages = ["zsh"],
     install_docs = False,
-    verity_key = _SIGNING,
+    verity_key = ":extension-signing",
+)
+
+# The sysupdate definitions of the release, which its test compares with what the targets inline.
+export_file(
+    name = "sysupdate.d",
+    src = "sysupdate.d",
 )
 
 # Everything a release of this example publishes, gathered under the names it publishes them
 # under: the disk and its qcow2 encoding, the UKI, the kernel and initrd a direct kernel boot
 # needs, the signed extension, the /usr partitions an update transfers, and the SBOMs and
 # package database. Each name comes from the target that built the artifact, so nothing here
-# decides what anything is called.
-image.artifacts(
+# decides what anything is called. The release carries the TUF targets that quarry updates a machine
+# from, with the definition that updates the extension; :vm boots the disk and the extension.
+quarry.release(
     name = "release",
+    transfers = {"sysupdate.d": ":sysupdate.d"},
     targets = [
         ":demo-ext",
         ":demo-ext[sbom]",
@@ -163,10 +188,9 @@ image.artifacts(
 # (extension-release ID=_any) rather than based on :image, which carries this DDI as smoke test
 # data and may not depend on it circularly. Refusal happens at dissection, before content
 # matters; the marker is for the smoke test's permissive counter-check.
-image.sysext_image(
+image.sysext(
     name = "demo-ext-unsigned",
-    package_manager = ":image.package-manager",
-    ops = [image.mkdir("/usr/share/tine-unsigned")],
+    ops = [image.ops.mkdir("/usr/share/tine-unsigned")],
     install_docs = False,
 )
 
@@ -177,12 +201,11 @@ image.vm(
         "firstboot.locale": "C.UTF-8",
         "firstboot.timezone": "UTC",
     },
-    box = "tine//catalog:fedora.rawhide.box",
     image = ":image",
     # select setup-mode firmware, so sd-boot enrolls the keys from the ESP on first
     # boot; VM then enforces Secure Boot.
     secure_boot = True,
-    sysexts = [":demo-ext"],
+    extensions = [":demo-ext"],
 )
 
 # Boot smoke test: enrolls keys on first boot, settles under Secure Boot with a vTPM, then powers
@@ -198,9 +221,13 @@ tests.vm_smoke(
         # systemd-boot-update.service after an OS update) reinstalls from there, and an unsigned
         # binary would fail Secure Boot verification on the next reboot.
         "test -e /usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed",
-        # `strip_pkgdb` leaves the package database out of the partitions, so nothing under the
-        # signed /usr carries one; the path is the rpm package system's `database_paths`.
-        "test ! -e /usr/lib/sysimage/rpm",
+        # `strip_pkgdb` leaves the package database out of the partitions, so the booted system has
+        # none. Each path is the `database_paths` of the family's package system.
+        distribution.select({
+            "arch": "test ! -e /var/lib/pacman/local",
+            "debian": "test ! -e /var/lib/dpkg/status",
+            "fedora": "test ! -e /usr/lib/sysimage/rpm",
+        }),
         # The disk carries the signature over the verity root hash, which is what lets anything
         # receiving this image as an update verify it before trusting it.
         "test -e /dev/disk/by-designator/usr-verity-sig",
@@ -240,13 +267,24 @@ box.sh_test(
     labels = ["image"],
     box = "@tine//tools:dev.box",
     test = "@tine//tests:contains.sh",
-    args = [
-        "$(location :image[sbom][cyclonedx])",
-        "pkg:rpm/fedora/systemd@",
-        "pkg:rpm/fedora/kernel-core@",
-        "pkg:rpm/fedora/fedora-release@",
-        "pkg:rpm/fedora/filesystem@",
-    ],
+    args = ["$(location :image[sbom][cyclonedx])"]
+    + distribution.select({
+        "arch": [
+            "pkg:alpm/arch/systemd@",
+            "pkg:alpm/arch/linux@",
+            "pkg:alpm/arch/filesystem@",
+        ],
+        "debian": [
+            "pkg:deb/debian/systemd@",
+            "pkg:deb/debian/base-files@",
+        ],
+        "fedora": [
+            "pkg:rpm/fedora/systemd@",
+            "pkg:rpm/fedora/kernel-core@",
+            "pkg:rpm/fedora/fedora-release@",
+            "pkg:rpm/fedora/filesystem@",
+        ],
+    }),
 )
 
 box.sh_test(
@@ -254,8 +292,26 @@ box.sh_test(
     labels = ["image"],
     box = "@tine//tools:dev.box",
     test = "release-artifacts.sh",
-    args = ["$(location :release)", "$(location :image[roothash])"]
-    + architecture.select({name: [spellings.systemd] for name, spellings in ARCHITECTURES.items()}),
+    args = ["$(location :release.files)", "$(location :image[roothash])"]
+    + architecture.select({name: [spellings.systemd] for name, spellings in architecture.ARCHITECTURES.items()})
+    # Each package system publishes its package database in its own file format, and the release's
+    # description names the package system.
+    + distribution.select({
+        "arch": ["tar.zst", "pacman"],
+        "debian": ["tar.zst", "deb"],
+        "fedora": ["sqlite", "rpm"],
+    }),
+)
+
+box.sh_test(
+    name = "release-targets-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    test = "release-targets.sh",
+    args = ["$(location :release)"]
+    + architecture.select({name: [spellings.systemd] for name, spellings in architecture.ARCHITECTURES.items()})
+    + ["$(location :sysupdate.d)"],
+    target_compatible_with = quarry.compatible_with(),
 )
 
 # The disk's own listing is the union of its partitions': what an installation of it leaves behind,
@@ -264,13 +320,15 @@ box.sh_test(
     name = "disk-manifest-test",
     labels = ["image"],
     box = "@tine//tools:dev.box",
-    test = "@tine//tests:contains.sh",
-    args = [
-        "$(location :image[disk-manifest])",
-        '"name":"usr/bin/bash"',
-        '"name":"boot/tine-tmpfiles","type":"dir","mode":448',
-        '"name":"boot/EFI/Linux',
-    ],
+    args = ["$(location :image[disk-manifest])"],
+    script = """
+# The mode that an operation sets on an ESP directory must reach the disk's filesystem listing.
+jq --seq -es '
+    any(.[]; .name == "usr/bin/bash") and
+    any(.[]; .name == "boot/tine-private" and .type == "dir" and .mode == 448) and
+    any(.[]; .name | strings | startswith("boot/EFI/Linux"))
+' "$1"
+""",
 )
 
 # The kernel install hook is bypassed, it didn't generate its own initrd.
@@ -293,7 +351,7 @@ box.sh_test(
     labels = ["image"],
     box = "@tine//tools:dev.box",
     test = "extension-manifest.sh",
-    args = ["$(location :demo-ext[ddi-manifest])"],
+    args = ["$(location :demo-ext[disk-manifest])"],
 )
 
 # Each listing covers what its own artifact carries: a DDI holds the two merged hierarchies, and a
@@ -307,7 +365,7 @@ box.sh_test(
         args = [target] + hierarchies,
     )
     for name, target, hierarchies in [
-        ("ddi", "$(location :demo-ext[ddi-manifest])", ["usr", "opt"]),
+        ("ddi", "$(location :demo-ext[disk-manifest])", ["usr", "opt"]),
         ("disk", "$(location :image[disk-manifest])", ["boot", "efi", "usr"]),
         ("esp", "$(location :image[manifests][esp])", ["boot", "efi"]),
         ("usr", "$(location :image[manifests][usr])", ["usr"]),

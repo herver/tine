@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
 # SPDX-License-Identifier: MPL-2.0
 
-"""Tests for the Cargo.lock reader, the vendored crate tree, and the build driver's checks.
+"""Tests for the Cargo.lock reader and the vendored crate tree.
 
     buck test tine//cargo:test
 
@@ -19,9 +19,6 @@ import unittest
 from pathlib import Path
 from typing import override
 
-import util
-
-import build
 import lock
 import vendor
 
@@ -185,7 +182,7 @@ class TestGitSources(unittest.TestCase):
 class TestLockDriver(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory(prefix="cargo-lock-test.")
+        tmp = tempfile.TemporaryDirectory(prefix="cargo-lock-test.", dir="/var/tmp")
         self.addCleanup(tmp.cleanup)
         self.checkout = Path(tmp.name) / "checkout"
         self.checkout.mkdir()
@@ -195,88 +192,91 @@ class TestLockDriver(unittest.TestCase):
         (self.checkout / "Cargo.lock").write_text(LOCK, encoding="utf-8")
 
         self.assertEqual(
-            lock.resolve_workspace("hello", {"generated": str(self.checkout)}),
+            lock.resolve_workspace("hello", self.checkout),
             {
                 "crates": lock.crate_downloads("hello", _lock(LOCK)),
                 "git": {},
-                "root": "generated",
+                "root": "",
             },
         )
 
-    def test_finds_a_lockless_workspace_inside_a_directory_artifact(self) -> None:
+    def test_rejects_a_workspace_without_a_lock(self) -> None:
         (self.checkout / "Cargo.toml").write_text(DEPLESS_MANIFEST, encoding="utf-8")
 
+        with self.assertRaises(SystemExit) as caught:
+            lock.resolve_workspace("nodeps", self.checkout)
         self.assertEqual(
-            lock.resolve_workspace("nodeps", {"generated": str(self.checkout)}),
-            {"crates": [], "git": {}, "root": "generated"},
+            str(caught.exception),
+            "tine: cargo_package nodeps: src holds no Cargo.lock; commit the lock that cargo writes, "
+            "or fetch a revision that contains one",
         )
 
-    def test_rejects_several_locks_across_directory_artifacts(self) -> None:
-        other = self.checkout.parent / "other"
-        other.mkdir()
+    def test_finds_a_nested_workspace(self) -> None:
+        nested = self.checkout / "nested"
+        nested.mkdir()
+        (nested / "Cargo.toml").write_text(MANIFEST, encoding="utf-8")
+        (nested / "Cargo.lock").write_text(LOCK, encoding="utf-8")
+
+        self.assertEqual(
+            lock.resolve_workspace("hello", self.checkout),
+            {"crates": lock.crate_downloads("hello", _lock(LOCK)), "git": {}, "root": "nested"},
+        )
+
+    def test_rejects_locks_side_by_side(self) -> None:
+        for name in ("one", "other"):
+            (self.checkout / name).mkdir()
+            (self.checkout / name / "Cargo.lock").write_text(LOCK, encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "src holds several Cargo.lock files"):
+            lock.resolve_workspace("hello", self.checkout)
+
+    def test_locks_below_the_outermost_are_left_alone(self) -> None:
+        for directory in (self.checkout, self.checkout / "Vendored/other"):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "Cargo.toml").write_text(DEPLESS_MANIFEST, encoding="utf-8")
+            (directory / "Cargo.lock").write_text(
+                'version = 3\n\n[[package]]\nname = "nodeps"\nversion = "0.1.0"\n', encoding="utf-8"
+            )
+
+        self.assertEqual(
+            lock.resolve_workspace("nodeps", self.checkout),
+            {"crates": [], "git": {}, "root": ""},
+        )
+
+    def test_skips_the_target_directory(self) -> None:
+        packaged = self.checkout / "target/package/nodeps-0.1.0"
+        packaged.mkdir(parents=True)
+        for directory in (self.checkout, packaged):
+            (directory / "Cargo.toml").write_text(DEPLESS_MANIFEST, encoding="utf-8")
+        (packaged / "Cargo.lock").write_text(LOCK, encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "src holds no Cargo.lock"):
+            lock.resolve_workspace("nodeps", self.checkout)
+
+    def test_rejects_individual_files_and_missing_inputs(self) -> None:
+        (self.checkout / "Cargo.toml").write_text(DEPLESS_MANIFEST, encoding="utf-8")
+        for source in (self.checkout / "Cargo.toml", self.checkout / "missing"):
+            with self.subTest(source=source), self.assertRaisesRegex(SystemExit, "src must be a directory"):
+                lock.resolve_workspace("hello", source)
+
+    def test_rejects_a_directory_without_a_manifest(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            lock.resolve_workspace("hello", self.checkout)
+        self.assertEqual(
+            str(caught.exception),
+            "tine: cargo_package hello: src holds no Cargo.toml; by default the checkout is expected in the "
+            "hello/ directory, pass `src` when it lives elsewhere",
+        )
+
+    def test_rejects_a_lock_without_a_manifest_beside_it(self) -> None:
         (self.checkout / "Cargo.lock").write_text(LOCK, encoding="utf-8")
-        (other / "Cargo.lock").write_text(LOCK, encoding="utf-8")
-
-        with self.assertRaisesRegex(SystemExit, "srcs hold several Cargo.lock files"):
-            lock.resolve_workspace(
-                "hello",
-                {"first": str(self.checkout), "second": str(other)},
-            )
-
-
-class TestBuild(unittest.TestCase):
-    def _workspace(self, manifest: str) -> Path:
-        tmp = tempfile.TemporaryDirectory(prefix="cargo-build-test.")
-        self.addCleanup(tmp.cleanup)
-        (Path(tmp.name) / "Cargo.toml").write_text(manifest, encoding="utf-8")
-        return Path(tmp.name)
-
-    def test_a_manifest_with_nothing_to_resolve_needs_no_lock(self) -> None:
-        build._reject_unlocked_dependencies(self._workspace(DEPLESS_MANIFEST))
-
-    def test_rejects_a_missing_lock_when_dependencies_are_declared(self) -> None:
+        (self.checkout / "nested").mkdir()
+        (self.checkout / "nested/Cargo.toml").write_text(MANIFEST, encoding="utf-8")
         with self.assertRaises(SystemExit) as caught:
-            build._reject_unlocked_dependencies(self._workspace(MANIFEST))
+            lock.resolve_workspace("hello", self.checkout)
         self.assertEqual(
             str(caught.exception),
-            "tine: cargo-build: [dependencies] without a Cargo.lock; commit the lock cargo writes",
-        )
-
-    def test_cargo_config(self) -> None:
-        """The registry points at the vendored tree, each git source at its fetched repository."""
-        git: dict[str, build.GitSource] = {
-            SD_CONF_COMMIT: {
-                "fields": {"git": SD_CONF_URL, "rev": "f8f381fe"},
-                "repo": "/repos/sd-conf/.git",
-            }
-        }
-        self.assertEqual(
-            build._cargo_config(Path("/vendor"), git),
-            '[source.crates-io]\nreplace-with = "vendored-sources"\n'
-            "\n"
-            '[source."git-f8f381feee21-upstream"]\n'
-            f'git = "{SD_CONF_URL}"\n'
-            'rev = "f8f381fe"\n'
-            'replace-with = "git-f8f381feee21"\n'
-            "\n"
-            "[source.git-f8f381feee21]\n"
-            'git = "file:///repos/sd-conf/.git"\n'
-            f'rev = "{SD_CONF_COMMIT}"\n'
-            "\n"
-            '[source.vendored-sources]\ndirectory = "/vendor"\n',
-        )
-
-    def test_rejects_a_binary_the_build_did_not_produce(self) -> None:
-        built = self._workspace(DEPLESS_MANIFEST)
-        (built / "hello-cli").write_text("elf", encoding="utf-8")
-        (built / "hello-cli").chmod(0o755)
-        with self.assertRaises(SystemExit) as caught:
-            util.take_binaries(
-                built, {"hello": str(built / "out")}, tool="cargo-build", where="target/release"
-            )
-        self.assertEqual(
-            str(caught.exception),
-            "tine: cargo-build: no hello in target/release, which holds: hello-cli",
+            "tine: cargo_package hello: src holds no Cargo.toml beside the Cargo.lock",
         )
 
 

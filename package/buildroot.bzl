@@ -3,12 +3,15 @@
 
 """Shared native package buildroots."""
 
+load("//box:runtime.bzl", "BoxInfo")
 load(":install.bzl", "install_packages")
 load(":manager.bzl", "PackageManagerInfo")
+load(":repository.bzl", "LocalPackageInfo")
 
 BuildrootInfo = provider(
-    doc = "A base root and package manager used to build native packages.",
+    doc = "A base root, and the package manager and box that build native packages on it.",
     fields = {
+        "box": provider_field(Dependency),
         "package_manager": provider_field(Dependency),
         "root": provider_field(Artifact),
     },
@@ -30,10 +33,11 @@ def _buildroot_impl(ctx: AnalysisContext) -> list[Provider]:
             fail("buildroot: unknown package set {!r}".format(ctx.attrs.package_set))
     if not packages:
         fail("buildroot: packages or package_set must be specified")
-    root = install_packages(ctx, ctx.attrs.package_manager, packages)
+    root = install_packages(ctx, ctx.attrs.package_manager, ctx.attrs.box, packages)
     return [
         DefaultInfo(default_output = root),
         BuildrootInfo(
+            box = ctx.attrs.box,
             root = root,
             package_manager = ctx.attrs.package_manager,
         ),
@@ -41,7 +45,9 @@ def _buildroot_impl(ctx: AnalysisContext) -> list[Provider]:
 
 _buildroot = rule(
     impl = _buildroot_impl,
+    supports_incoming_transition = True,
     attrs = {
+        "box": attrs.dep(providers = [BoxInfo], doc = "the box that installs the buildroot and builds packages on it"),
         "package_manager": attrs.dep(providers = [PackageManagerInfo]),
         "package_set": attrs.option(
             attrs.string(),
@@ -55,6 +61,79 @@ _buildroot = rule(
         ),
     },
 )
+
+def _extra_packages(owner: str, base: BuildrootInfo, buildroot_packages: list[Dependency]) -> list[Artifact]:
+    package_system = base.package_manager[PackageManagerInfo].package_system
+    extra_packages = []
+    for dependency in buildroot_packages:
+        info = dependency[LocalPackageInfo]
+        if info.package_system.label.raw_target() != package_system.label.raw_target():
+            fail(
+                "{}: buildroot dependency {} uses package system {}, expected {}".format(
+                    owner,
+                    dependency.label,
+                    info.package_system.label.raw_target(),
+                    package_system.label.raw_target(),
+                ),
+            )
+        extra_packages.append(info.packages)
+    return extra_packages
+
+def package_buildroot(
+    ctx: AnalysisContext,
+    owner: str,
+    base: BuildrootInfo,
+    build_requires: list[str],
+    buildroot_packages: list[Dependency],
+) -> list[Artifact]:
+    """Return the snapshot stores, bottom to top, that one package builds on.
+
+    The stack is the shared base root, plus a snapshot that installs `build_requires`. The solve of the
+    snapshot prefers the packages of `buildroot_packages` over the repositories of the package manager.
+    `owner` starts a failure message.
+    """
+    extra_packages = _extra_packages(owner, base, buildroot_packages)
+    stack = [base.root]
+
+    # The packages of buildroot_packages are only candidates for the solve, so they install nothing on
+    # their own. rpm.branch() derives them from the BuildRequires of every architecture, so a package can
+    # have them without any BuildRequires on this architecture.
+    if not build_requires:
+        return stack
+    return stack + [
+        install_packages(
+            ctx,
+            base.package_manager,
+            base.box,
+            build_requires,
+            stack = stack,
+            extra_packages = extra_packages,
+        ),
+    ]
+
+def recipe_snapshot(
+    ctx: AnalysisContext,
+    owner: str,
+    base: BuildrootInfo,
+    stack: list[Artifact],
+    buildroot_packages: list[Dependency],
+    requires: Artifact,
+) -> Artifact:
+    """Return a snapshot over `stack` that installs the JSON list `requires` of build dependencies.
+
+    The solve of the snapshot prefers the packages of `buildroot_packages` over the repositories of the
+    package manager. `owner` starts a failure message.
+    """
+    return install_packages(
+        ctx,
+        base.package_manager,
+        base.box,
+        [],
+        stack = stack,
+        extra_packages = _extra_packages(owner, base, buildroot_packages),
+        install_files = [requires],
+        identifier = "recipe",
+    )
 
 def buildroot(name: str, **kwargs) -> None:
     if not name.endswith(".buildroot"):

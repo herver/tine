@@ -87,6 +87,15 @@ def wrapper_command(cell: Path) -> Path:
     return command
 
 
+def read_generated_buckconfig(path: Path) -> dict[str, dict[str, str]]:
+    """What the generated block in a config says, for asserting on it."""
+    config: dict[str, dict[str, str]] = {}
+    tine._parse_buckconfig_lines(
+        tine._logical_buckconfig_lines(tine._split_generated_block(path)[1]), config, "", path.parent
+    )
+    return config
+
+
 def scratch(case: unittest.TestCase, prefix: str = "tine-test.") -> Path:
     tmp = tempfile.TemporaryDirectory(prefix=prefix)
     case.addCleanup(tmp.cleanup)
@@ -338,7 +347,7 @@ class TestRenderLocalConfigBlock(RepositoryTestCase):
         (self.repo / ".buckconfig").write_text("[project]\nignore = .git\n")
         tine.refresh_local_buckconfig(self.repo, [".git", "packages/demo/BUCK", "packages/demo/**/BUCK"])
         self.assertEqual(
-            tine.read_generated_buckconfig(self.repo / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
+            read_generated_buckconfig(self.repo / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
             ".git, packages/demo/BUCK, packages/demo/**/BUCK",
         )
         self.assertEqual(tine.read_project_buckconfig(self.repo)["project"][tine.PROJECT_IGNORE], ".git")
@@ -377,7 +386,7 @@ class TestRenderLocalConfigBlock(RepositoryTestCase):
         self.commit()
         cache = self.cache()
         tine.refresh_local_buckconfig(self.repo, [], cache)
-        generated = tine.read_generated_buckconfig(self.repo / tine.LOCAL)
+        generated = read_generated_buckconfig(self.repo / tine.LOCAL)
         self.assertEqual(generated[tine.RE_CLIENT]["address"], f"127.0.0.1:{cache.port}")
         # The project's own view of its configuration excludes what tine wrote there.
         self.assertNotIn(tine.RE_CLIENT, tine.read_project_buckconfig(self.repo))
@@ -760,16 +769,6 @@ class TestMountAdd(MountTestCase):
             with self.subTest(target=name), self.assertRaisesRegex(SystemExit, "whitespace or commas"):
                 self.mount("add", str(self.root / name), str(self.source))
 
-    def test_add_rejects_project_mount_settings(self) -> None:
-        for section, key in (("buck2", tine.DAEMON_BUSTER), (tine.SECTION, tine.DEV)):
-            with self.subTest(section=section, key=key):
-                (self.root / ".buckconfig").write_text(
-                    f"[cells]\nroot = .\nsub = sub\n[{section}]\n{key} = project-owned\n"
-                )
-                with self.assertRaisesRegex(SystemExit, f"{key} is reserved"):
-                    self.mount("add", str(self.root / "sub"), str(self.source))
-                self.assertEqual(self.declared(), {})
-
     def test_add_rejects_overlapping_mounts(self) -> None:
         (self.root / "sub" / "inner").mkdir()
         for existing, target in (("sub", "sub/inner"), ("sub/inner", "sub")):
@@ -975,7 +974,7 @@ class TestDeclaredMounts(MountTestCase):
 
 class TestMountUpdates(MountTestCase):
     @contextlib.contextmanager
-    def process(self, code: str, *args: str) -> collections.abc.Iterator[subprocess.Popen[str]]:
+    def process(self, code: str, *args: str) -> collections.abc.Generator[subprocess.Popen[str]]:
         prefix = f"import sys\nsys.path[:] = {sys.path!r}\nimport tine\n"
         with subprocess.Popen(
             [sys.executable, "-c", prefix + textwrap.dedent(code), str(self.root), *args],
@@ -1044,12 +1043,6 @@ class TestMountUpdates(MountTestCase):
             self.assertIn("mount sub: not a valid target", stderr)
         self.assertEqual(self.declared(), {})
 
-    def test_builds_can_update_mount_declarations(self) -> None:
-        # Builds hold no lock, so their nested mount commands must remain allowed.
-        with unittest.mock.patch.dict(os.environ, {"BUCK2_BINARY": "buck2"}):
-            self.mount("add", str(self.root / "sub"), str(self.source))
-        self.assertEqual(self.declared(), {"sub": str(self.source)})
-
     def test_lock_parent_creation_error_is_reported(self) -> None:
         (self.root / tine.HOME).touch()
         with self.assertRaisesRegex(SystemExit, "cannot prepare .* for locking"):
@@ -1063,11 +1056,8 @@ class TestMountUpdates(MountTestCase):
                 self.fail("lock unexpectedly acquired")
 
 
-class TestMountDigest(MountTestCase):
-    """Mount digests identify equivalent namespaces to Buck's daemon constraint."""
-
-    def digest(self, mounts: dict[str, str]) -> str:
-        return tine.mount_digest(self.root, mounts)
+class TestMountPrivacy(MountTestCase):
+    """Mount declarations stay machine-local."""
 
     def test_refresh_does_not_publish_mount_state(self) -> None:
         path = self.root / ".buckconfig"
@@ -1075,26 +1065,90 @@ class TestMountDigest(MountTestCase):
         declare(self.root, {"sub": str(self.source)})
         refresh_project(self.root)
         self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(tine.read_generated_buckconfig(path), {})
-        self.assertFalse((self.root / tine.PRIVATE_CONFIG).exists())
+        self.assertEqual(read_generated_buckconfig(path), {})
 
-    def test_replaced_target_changes_the_digest(self) -> None:
-        before = self.digest({"sub": str(self.source)})
-        (self.root / "sub").rename(self.root / "retired")
-        (self.root / "sub").mkdir()
-        self.assertNotEqual(self.digest({"sub": str(self.source)}), before)
 
-    def test_target_changes_the_digest(self) -> None:
-        (self.root / "other").mkdir()
-        self.assertNotEqual(
-            self.digest({"sub": str(self.source)}),
-            self.digest({"other": str(self.source)}),
-        )
+def loader(path: Path, code: int) -> Path:
+    """Write a script at `path` that stands in for a loader and exits with `code`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\nexit {code}\n")
+    path.chmod(0o755)
+    return path
 
-    def test_unreadable_target_is_rejected(self) -> None:
-        message = re.escape(f"mount nonexistent: cannot read {self.root / 'nonexistent'}")
-        with self.assertRaisesRegex(SystemExit, message):
-            self.digest({"nonexistent": str(self.source)})
+
+class TestGlibcLoader(unittest.TestCase):
+    """Find the host's glibc loader when no loader runs from the standard path."""
+
+    @override
+    def setUp(self) -> None:
+        self.dir = scratch(self)
+        machine = os.uname().machine
+        self.name = tine.GLIBC_LOADERS[machine].name
+        self.standard = self.dir / "lib" / self.name
+        self.standard.parent.mkdir()
+        self.host = loader(self.dir / "store" / self.name, 0)
+        patched = unittest.mock.patch.dict(tine.GLIBC_LOADERS, {machine: self.standard})
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def mapped(self, path: Path | None) -> None:
+        """Make glibc_loader() see `path` as the loader of the running python3."""
+        patched = unittest.mock.patch.object(tine, "mapped_loader", return_value=path)
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def test_finds_the_loader_of_this_process(self) -> None:
+        # The interpreter that runs the tests uses the glibc loader of its platform.
+        mapped = tine.mapped_loader(self.name)
+        assert mapped is not None
+        self.assertEqual(mapped.name, self.name)
+        self.assertTrue(tine.loader_runs(mapped))
+        self.assertIsNone(tine.mapped_loader("ld-missing.so.1"))
+
+    def test_the_standard_loader_needs_no_bind(self) -> None:
+        # A host whose python3 uses the loader at the standard path needs no bind. The kernel maps the
+        # loader under its resolved path, such as /usr/lib/ld-linux-x86-64.so.2 on Arch, so the mapped
+        # path is a symlink to the standard path here. The loader exits with 127, so only the samefile()
+        # check makes glibc_loader() return None.
+        loader(self.standard, 127)
+        mapped = self.dir / "usr" / "lib" / self.standard.name
+        mapped.parent.mkdir(parents=True)
+        mapped.symlink_to(self.standard)
+        self.mapped(mapped)
+        self.assertIsNone(tine.glibc_loader())
+
+    def test_a_working_loader_stays_in_place(self) -> None:
+        # A python3 from Nix on another distribution uses a loader in the Nix store. The loader of
+        # the distribution at the standard path runs, so its programs keep it.
+        self.mapped(self.host)
+        loader(self.standard, 0)
+        self.assertIsNone(tine.glibc_loader())
+
+    def test_a_stub_is_replaced(self) -> None:
+        # On NixOS, python3 uses a loader in the Nix store, and the standard path is a symlink to a
+        # stub that exits with 127.
+        self.mapped(self.host)
+        self.standard.symlink_to(loader(self.dir / "stub" / "stub-ld", 127))
+        self.assertEqual(tine.glibc_loader(), (self.host, self.standard))
+
+    def test_a_dangling_symlink_is_replaced(self) -> None:
+        # glibc_loader() returns a dangling symlink at the standard path as the target of the bind.
+        # test_loader_is_bound_over_a_dangling_symlink checks that the bind covers such a symlink.
+        self.mapped(self.host)
+        self.standard.symlink_to(self.dir / "missing")
+        self.assertEqual(tine.glibc_loader(), (self.host, self.standard))
+
+    def test_a_musl_host_is_left_alone(self) -> None:
+        # A musl python3 maps no glibc loader, and a musl loader cannot start the pinned glibc Python.
+        self.mapped(None)
+        self.assertIsNone(tine.glibc_loader())
+
+    def test_no_file_to_bind_over(self) -> None:
+        # Without a file at the standard path, there is no mount point, and the wrapper fails with a
+        # hint instead of letting every action fail to start.
+        self.mapped(self.host)
+        with self.assertRaisesRegex(SystemExit, "no file there to bind"):
+            tine.glibc_loader()
 
 
 class TestNamespaces(MountTestCase):
@@ -1201,7 +1255,7 @@ class TestNamespaces(MountTestCase):
         self.assertEqual(original.read_text(), content)
         self.assertIn("materializations = deferred", content)
 
-    def test_mount_config_is_private_and_does_not_change_shared_layers(self) -> None:
+    def test_mount_table_recovers_mounts_and_shared_layers_stay(self) -> None:
         local = self.root / tine.LOCAL
         local.write_text("[build]\nthreads = 4\n")
         layer = self.root / ".buckconfig.d" / "settings"
@@ -1211,22 +1265,53 @@ class TestNamespaces(MountTestCase):
         mounts = {"sub": str(self.source)}
 
         def mounted() -> str:
-            digest = tine.create_mount_namespace(self.root, mounts)
-            config = tine.read_generated_buckconfig(self.root / tine.PRIVATE_CONFIG)
-            self.assertEqual(config["buck2"][tine.DAEMON_BUSTER], tine.BUSTER_PREFIX + digest)
-            self.assertEqual(config["tine"][tine.DEV], "sub")
-            self.assertNotIn(tine.DAEMON_BUSTER, tine.read_project_buckconfig(self.root).get("buck2", {}))
-            with unittest.mock.patch.dict(os.environ, {tine.MARKER: tine.mount_namespace_marker(digest)}):
-                self.assertEqual(tine.namespace_mount_targets(self.root), ["sub"])
-            self.assertNotIn(tine.MOUNTS, config["tine"])
+            table = tine.create_mount_namespace(self.root, mounts)
+            with unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}):
+                self.assertEqual(tine.namespace_mount_targets(), ["sub"])
+                self.assertEqual(tine.namespace_gitdirs(self.root), {})
             for path, content in before.items():
                 self.assertEqual(path.read_bytes(), content)
-            return "private"
+            return table
 
-        self.assertEqual(self.answer(mounted), "private")
-        self.assertFalse((self.root / tine.PRIVATE_CONFIG).exists())
+        self.answer(mounted)
         for path, content in before.items():
             self.assertEqual(path.read_bytes(), content)
+
+    def test_loader_is_bound_over_the_standard_path(self) -> None:
+        # bind_glibc_loader() binds the host's loader read-only over the file at the standard path, in
+        # a namespace of its own. The project mounts go into a nested namespace, which still sees the
+        # bound loader. The file outside both namespaces stays unchanged.
+        loader = scratch(self).resolve() / "ld-linux-x86-64.so.2"
+        loader.write_text("the host's loader")
+        stub = self.root / "ld-linux-x86-64.so.2"
+        stub.write_text("a stub")
+
+        def mounted() -> str:
+            with unittest.mock.patch.object(tine, "glibc_loader", return_value=(loader, stub)):
+                tine.bind_glibc_loader()
+            with self.assertRaises(OSError):
+                stub.write_text("changed")
+            self.create({"sub": str(self.source)})
+            return stub.read_text() + ", " + (self.root / "sub" / "witness").read_text()
+
+        self.assertEqual(self.answer(mounted), "the host's loader, the mounted directory's")
+        self.assertEqual(stub.read_text(), "a stub")
+
+    def test_loader_is_bound_over_a_dangling_symlink(self) -> None:
+        # The bind covers a symlink at the standard path itself, so a symlink whose target is missing
+        # still gets the host's loader.
+        loader = scratch(self).resolve() / "ld-linux-x86-64.so.2"
+        loader.write_text("the host's loader")
+        standard = self.root / "ld-linux-x86-64.so.2"
+        standard.symlink_to(self.root / "missing")
+
+        def mounted() -> str:
+            with unittest.mock.patch.object(tine, "glibc_loader", return_value=(loader, standard)):
+                tine.bind_glibc_loader()
+            return standard.read_text()
+
+        self.assertEqual(self.answer(mounted), "the host's loader")
+        self.assertTrue(standard.is_symlink())
 
     def check_mount_change(self, *, replace_source: bool) -> None:
         mounts = {"sub": str(self.source)}
@@ -1236,8 +1321,7 @@ class TestNamespaces(MountTestCase):
         retired = scratch(self) / "retired"
 
         def first() -> str:
-            first_digest = tine.create_mount_namespace(self.root, mounts)
-            first_config = (self.root / tine.PRIVATE_CONFIG).read_bytes()
+            first_table = tine.create_mount_namespace(self.root, mounts)
             if replace_source:
                 self.source.rename(retired)
                 replacement.rename(self.source)
@@ -1246,25 +1330,19 @@ class TestNamespaces(MountTestCase):
 
             def second() -> str:
                 second_mounts = tine.declared_mounts(self.root)
-                digest = tine.create_mount_namespace(self.root, second_mounts)
-                with unittest.mock.patch.dict(
-                    os.environ, {tine.MARKER: tine.mount_namespace_marker(digest)}
-                ):
+                table = tine.create_mount_namespace(self.root, second_mounts)
+                with unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}):
                     _, prepared = tine.prepare_buck(self.root, {}, ["buck", "build"])
                 self.assertEqual(prepared, sorted(second_mounts))
                 self.assertEqual((self.root / "sub" / "witness").read_text(), "replacement")
-                return digest
+                return table
 
-            second_digest = self.answer(second)
-            self.assertNotEqual(first_digest, second_digest)
+            self.answer(second)
             # Resume A only after B has prepared its replacement, at the point where a shared
-            # buster used to make A advertise B's digest while retaining A's checkout.
-            with unittest.mock.patch.dict(
-                os.environ, {tine.MARKER: tine.mount_namespace_marker(first_digest)}
-            ):
+            # carrier used to make A advertise B's mounts while retaining A's checkout.
+            with unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: first_table}):
                 _, prepared = tine.prepare_buck(self.root, {}, ["buck", "build"])
             self.assertEqual(prepared, sorted(mounts))
-            self.assertEqual((self.root / tine.PRIVATE_CONFIG).read_bytes(), first_config)
             self.assertEqual((self.root / "sub" / "witness").read_text(), "the mounted directory's")
             return "separate"
 
@@ -1276,40 +1354,11 @@ class TestNamespaces(MountTestCase):
     def test_mount_update_cannot_relabel_an_existing_namespace(self) -> None:
         self.check_mount_change(replace_source=False)
 
-    def test_digest_uses_the_directory_that_was_actually_mounted(self) -> None:
-        mounts = {"sub": str(self.source)}
-        expected = hashlib.sha256(f"sub\0{self.source}\0{self.source.stat().st_ino}\0".encode()).hexdigest()[
-            :16
-        ]
-        retired = scratch(self) / "retired"
-
-        def mounted() -> str:
-            mount = tine.isolation.mount
-
-            def replace_after_mount(
-                source: Path | None,
-                target: Path,
-                filesystem: str | None = None,
-                flags: int = 0,
-                options: str | None = None,
-            ) -> None:
-                mount(source, target, filesystem, flags, options)
-                if target == self.root / "sub":
-                    self.source.rename(retired)
-                    self.source.mkdir()
-
-            with unittest.mock.patch.object(tine.isolation, "mount", side_effect=replace_after_mount):
-                digest = tine.create_mount_namespace(self.root, mounts)
-            self.assertEqual(digest, tine.mount_digest(self.root, mounts))
-            return digest
-
-        self.assertEqual(self.answer(mounted), expected)
-
     def test_defaults_come_from_the_mounted_cell(self) -> None:
         def mounted() -> str:
-            digest = tine.create_mount_namespace(self.root, {"sub": str(self.source)})
+            table = tine.create_mount_namespace(self.root, {"sub": str(self.source)})
             with (
-                unittest.mock.patch.dict(os.environ, {tine.MARKER: tine.mount_namespace_marker(digest)}),
+                unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}),
                 unittest.mock.patch.object(tine, "COMMAND_PATH", self.root / cell / tine.COMMAND),
             ):
                 config, targets = tine.prepare_buck(
@@ -1368,14 +1417,14 @@ class TestNamespaces(MountTestCase):
         retired = scratch(self) / "retired"
 
         def mounted() -> str:
-            digest = tine.create_mount_namespace(self.root, {"sub": str(self.source)})
+            table = tine.create_mount_namespace(self.root, {"sub": str(self.source)})
             self.source.rename(retired)
             replacement.rename(self.source)
-            with unittest.mock.patch.dict(os.environ, {tine.MARKER: tine.mount_namespace_marker(digest)}):
+            with unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}):
                 config, targets = tine.prepare_buck(self.root, {}, ["buck", "build"])
-            ignores = tine.collect_project_ignores(
-                self.root, config, targets, tine.namespace_gitdirs(self.root)
-            )
+                ignores = tine.collect_project_ignores(
+                    self.root, config, targets, tine.namespace_gitdirs(self.root)
+                )
             self.assertIn("sub/original-output", ignores)
             self.assertNotIn("sub/replacement-output", ignores)
             return "mounted ignores"
@@ -1401,15 +1450,15 @@ class TestNamespaces(MountTestCase):
         retired = scratch(self) / "retired"
 
         def mounted() -> str:
-            digest = tine.create_mount_namespace(self.root, {"sub": str(self.source)})
+            table = tine.create_mount_namespace(self.root, {"sub": str(self.source)})
             self.source.rename(retired)
             replacement.rename(self.source)
             declare(self.root, {})
-            with unittest.mock.patch.dict(os.environ, {tine.MARKER: tine.mount_namespace_marker(digest)}):
+            with unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}):
                 _, targets = tine.prepare_buck(self.root, {}, ["buck", "build"])
-            ignores = tine.collect_project_ignores(
-                self.root, {"cells": {"root": "."}}, targets, tine.namespace_gitdirs(self.root)
-            )
+                ignores = tine.collect_project_ignores(
+                    self.root, {"cells": {"root": "."}}, targets, tine.namespace_gitdirs(self.root)
+                )
             self.assertIn("sub/original-output", ignores)
             self.assertIn("sub/metadata-output", ignores)
             self.assertNotIn("sub/tracked-output", ignores)
@@ -1453,28 +1502,26 @@ class TestNamespaces(MountTestCase):
         (source / "generated").mkdir()
         (source / ".buckconfig").write_text(CELL_BUCKCONFIG)
         wrapper_command(source)
-        # The checkout's private config belongs to another project, not this invocation.
-        private = source / tine.PRIVATE_CONFIG
-        private.parent.mkdir(parents=True)
-        private.write_text(f"{tine.BLOCK_BEGIN}\n[tine]\ngitdirs = invalid\n{tine.BLOCK_END}\n")
         configure_cells(self.root, "sub")
 
         def mounted() -> str:
-            digest = tine.create_mount_namespace(self.root, {"sub": str(source)})
+            table = tine.create_mount_namespace(self.root, {"sub": str(source)})
             with (
                 contextlib.chdir(self.root),
-                unittest.mock.patch.dict(os.environ, {tine.MARKER: tine.mount_namespace_marker(digest)}),
+                unittest.mock.patch.dict(
+                    os.environ, {tine.TINE_MOUNTS_ENV: table, "BUCK2_BINARY": str(self.root / "buck2")}
+                ),
                 unittest.mock.patch.object(tine, "COMMAND_PATH", self.root / "sub" / tine.COMMAND),
-                unittest.mock.patch.object(tine, "buck2_binary", return_value=self.root / "buck2"),
+                unittest.mock.patch.object(tine, "ensure_buck2_binary", return_value=True),
                 unittest.mock.patch.object(
                     tine, "namespace_gitdirs", wraps=tine.namespace_gitdirs
                 ) as gitdirs,
-                unittest.mock.patch.object(os, "execve") as execve,
+                unittest.mock.patch.object(os, "execv") as execve,
             ):
                 tine.buck_command(["build", "tine//..."])
             execve.assert_called_once()
             gitdirs.assert_called_once_with(self.root)
-            config = tine.read_generated_buckconfig(self.root / "sub" / tine.LOCAL)
+            config = read_generated_buckconfig(self.root / "sub" / tine.LOCAL)
             self.assertEqual(
                 config["project"][tine.PROJECT_IGNORE], ", ".join([*tine.VCS_IGNORES, "generated"])
             )
@@ -1482,14 +1529,7 @@ class TestNamespaces(MountTestCase):
 
         self.assertEqual(self.answer(mounted), "submodule ignores")
 
-    def test_private_config_directory_cannot_be_a_symlink(self) -> None:
-        private = self.root / tine.PRIVATE_MOUNTS
-        private.parent.mkdir()
-        private.symlink_to(scratch(self), target_is_directory=True)
-        with self.assertRaisesRegex(SystemExit, "must not be a symlink"):
-            tine.create_mount_namespace(self.root, {"sub": str(self.source)})
-
-    def test_private_mount_metadata_does_not_make_version_dirty(self) -> None:
+    def test_mounting_does_not_make_version_dirty(self) -> None:
         isolate_git(self)
         (self.root / "sub" / "witness").write_text((self.source / "witness").read_text())
         git("init", "--quiet", "--initial-branch=main", cwd=self.root)
@@ -1553,27 +1593,25 @@ class TestReexecConfiguredWrapper(MountTestCase):
             tine,
             "create_mount_namespace",
             side_effect=lambda root, mounts: (
-                self.made.append((root, mounts)) or tine.mount_digest(root, mounts)
+                self.made.append((root, mounts)) or tine.encode_mount_table(sorted(mounts), {})
             ),
         )
         created.start()
         self.addCleanup(created.stop)
         patched = unittest.mock.patch.dict(os.environ)
         patched.start()
-        os.environ.pop("BUCK2_BINARY", None)
-        os.environ.pop(tine.MARKER, None)
+        os.environ.pop(tine.TINE_MOUNTS_ENV, None)
         self.addCleanup(patched.stop)
 
     @contextlib.contextmanager
-    def running(self) -> collections.abc.Iterator[list[object]]:
+    def running(self) -> collections.abc.Generator[list[object]]:
         execve: list[object] = []
         with unittest.mock.patch.object(os, "execve", side_effect=lambda *a: execve.extend(a)):
             yield execve
 
     def declare_one(self) -> str:
         self.mount("add", str(self.root / "sub"), str(self.source))
-        digest = tine.mount_digest(self.root, self.declared())
-        return digest
+        return tine.encode_mount_table(["sub"], {})
 
     def prepare(self) -> None:
         tine.prepare_buck(self.root, {}, ["buck", "build"])
@@ -1593,7 +1631,9 @@ class TestReexecConfiguredWrapper(MountTestCase):
         with (
             contextlib.chdir(self.root),
             unittest.mock.patch.object(os, "execve", side_effect=SystemExit("handover")) as execve,
-            unittest.mock.patch.object(tine, "buck2_binary", side_effect=AssertionError("read outer pin")),
+            unittest.mock.patch.object(
+                tine, "ensure_buck2_binary", side_effect=AssertionError("read outer pin")
+            ),
             self.assertRaisesRegex(SystemExit, "handover"),
         ):
             tine.main(arguments)
@@ -1623,25 +1663,20 @@ class TestReexecConfiguredWrapper(MountTestCase):
                     tine.prepare_buck(self.root, {}, ["buck", "build"], refresh_config=False)
                 self.assertEqual((self.made, execve), ([], []))
 
-    def test_nested_and_mounted_invocations_still_select_the_wrapper(self) -> None:
+    def test_mounted_invocations_still_select_the_wrapper(self) -> None:
         command = wrapper_command(self.root / "sub")
         (self.root / ".buckconfig").write_text("[cells]\nroot = .\ntine = sub\n")
-        for environment, targets in (
-            ({"BUCK2_BINARY": "/somewhere/buck2"}, None),
-            ({tine.MARKER: tine.mount_namespace_marker("a" * 16)}, ["sub"]),
+        with (
+            unittest.mock.patch.dict(
+                os.environ, {tine.TINE_MOUNTS_ENV: tine.encode_mount_table(["sub"], {})}
+            ),
+            unittest.mock.patch.object(tine, "namespace_mount_targets", return_value=["sub"]),
+            unittest.mock.patch.object(tine, "declared_mounts", side_effect=AssertionError("reread mounts")),
+            unittest.mock.patch.object(os, "execve", side_effect=SystemExit("handover")) as execve,
         ):
-            with (
-                self.subTest(environment=environment),
-                unittest.mock.patch.dict(os.environ, environment),
-                unittest.mock.patch.object(tine, "namespace_mount_targets", return_value=targets),
-                unittest.mock.patch.object(
-                    tine, "declared_mounts", side_effect=AssertionError("reread mounts")
-                ),
-                unittest.mock.patch.object(os, "execve", side_effect=SystemExit("handover")) as execve,
-            ):
-                with self.assertRaisesRegex(SystemExit, "handover"):
-                    self.prepare()
-                execve.assert_called_once_with(command, [str(command), "buck", "build"], dict(os.environ))
+            with self.assertRaisesRegex(SystemExit, "handover"):
+                self.prepare()
+            execve.assert_called_once_with(command, [str(command), "buck", "build"], dict(os.environ))
         self.assertEqual(self.made, [])
 
     def test_completion_uses_the_configured_wrapper(self) -> None:
@@ -1688,57 +1723,34 @@ class TestReexecConfiguredWrapper(MountTestCase):
         ):
             self.prepare()
 
-    def test_buck_child_process_is_already_inside(self) -> None:
-        self.declare_one()
-        with (
-            unittest.mock.patch.dict(os.environ, {"BUCK2_BINARY": "/somewhere/buck2"}),
-            unittest.mock.patch.object(tine, "declared_mounts", side_effect=AssertionError("reread mounts")),
-            self.running() as execve,
-        ):
-            self.prepare()
-        self.assertEqual((self.made, execve), ([], []))
-
     def test_matching_current_namespace_needs_no_handover(self) -> None:
-        digest = self.declare_one()
+        table = self.declare_one()
         with (
-            unittest.mock.patch.dict(os.environ, {tine.MARKER: tine.mount_namespace_marker(digest)}),
+            unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}),
             unittest.mock.patch.object(tine, "namespace_mount_targets", return_value=["sub"]),
             self.running() as execve,
         ):
             self.prepare()
         self.assertEqual((self.made, execve), ([], []))
 
-    def test_prepare_rejects_project_mount_settings(self) -> None:
+    def test_a_garbled_mount_table_fails_instead_of_remounting(self) -> None:
+        # Quietly rebuilding the namespace would reread declarations the marked command froze.
         self.declare_one()
-        for section, key in (("buck2", tine.DAEMON_BUSTER), (tine.SECTION, tine.DEV)):
-            with self.subTest(section=section, key=key):
-                (self.root / tine.LOCAL).write_text(f"[{section}]\n{key} = project-owned\n")
-                with (
-                    unittest.mock.patch.object(tine, "namespace_mount_targets", return_value=["sub"]),
-                    self.assertRaisesRegex(SystemExit, f"{key} is reserved"),
-                ):
-                    self.prepare()
-
-    def test_stale_marker_does_not_skip_namespace_creation(self) -> None:
-        # A manually exported or inherited marker does not prove that this process is in its namespace.
-        digest = self.declare_one()
         with (
-            unittest.mock.patch.dict(os.environ, {tine.MARKER: f"{digest} wrong-namespace"}),
-            self.running() as execve,
+            unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: "not json"}),
+            self.assertRaises(SystemExit),
         ):
             self.prepare()
-        self.assertEqual(len(self.made), 1)
-        self.assertTrue(execve)
 
     def test_mounts_create_an_equivalent_namespace_and_handover(self) -> None:
-        digest = self.declare_one()
+        table = self.declare_one()
         with self.running() as execve:
             self.prepare()
         self.assertEqual(self.made, [(self.root, {"sub": str(self.source)})])
         _, argv, environment = execve
         self.assertEqual(argv, [str(TOOL_PATH.absolute()), "buck", "build"])
         assert isinstance(environment, dict)
-        self.assertEqual(environment[tine.MARKER], tine.mount_namespace_marker(digest))
+        self.assertEqual(environment[tine.TINE_MOUNTS_ENV], table)
 
 
 class TestBuck2Binary(unittest.TestCase):
@@ -1768,18 +1780,20 @@ class TestBuck2Binary(unittest.TestCase):
 
     def test_the_cell_declares_the_pin(self) -> None:
         home = self.cache("a" * 64)
+        binary = home / "tine" / "buck2" / ("a" * 64) / "buck2"
         with unittest.mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(home)}):
-            self.assertEqual(
-                tine.buck2_binary({}, self.cell()), home / "tine" / "buck2" / ("a" * 64) / "buck2"
-            )
+            self.assertTrue(tine.ensure_buck2_binary({}, self.cell()))
+            self.assertEqual(os.environ["BUCK2_BINARY"], str(binary))
+            self.assertEqual(os.environ["BUCK2_ARG0"], "tine buck")
 
     def test_a_project_pin_overrides_the_cell_key_by_key(self) -> None:
         platform = tine._host_platform()
         home = self.cache("b" * 64)
         config = {"buck2": {"platforms": {platform: {"sha256": "b" * 64}}}}
         with unittest.mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(home)}):
-            binary = tine.buck2_binary(config, self.cell())
-        self.assertEqual(binary, home / "tine" / "buck2" / ("b" * 64) / "buck2")
+            self.assertTrue(tine.ensure_buck2_binary(config, self.cell()))
+            binary = os.environ["BUCK2_BINARY"]
+        self.assertEqual(binary, str(home / "tine" / "buck2" / ("b" * 64) / "buck2"))
 
     def test_the_override_is_read_from_tine_toml(self) -> None:
         platform = tine._host_platform()
@@ -1830,25 +1844,25 @@ sha256 = "{"b" * 64}"
 
     def test_an_uncached_pin_is_nothing_to_complete_with(self) -> None:
         with unittest.mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(scratch(self))}):
-            self.assertIsNone(tine.buck2_binary(self.pin(), self.cell(), fetch=False))
+            self.assertFalse(tine.ensure_buck2_binary(self.pin(), self.cell(), fetch=False))
 
     def test_a_cell_declaring_no_buck2(self) -> None:
         with self.assertRaisesRegex(SystemExit, "declares no buck2"):
-            tine.buck2_binary({}, self.cell({"ruff": {}}))
+            tine.ensure_buck2_binary({}, self.cell({"ruff": {}}))
 
     def test_a_cell_with_no_pins(self) -> None:
         with self.assertRaisesRegex(SystemExit, "cannot read .*tine.lock.json"):
-            tine.buck2_binary({}, scratch(self, "tine-test-cell."))
+            tine.ensure_buck2_binary({}, scratch(self, "tine-test-cell."))
 
     def test_a_machine_buck2_is_not_published_for(self) -> None:
         uname = os.uname_result(("Linux", "host", "7.0", "#1", "m68k"))
         with unittest.mock.patch.object(os, "uname", return_value=uname):
             with self.assertRaisesRegex(SystemExit, "unsupported platform: Linux-m68k"):
-                tine.buck2_binary(self.pin(), scratch(self, "tine-test-cell."))
+                tine.ensure_buck2_binary(self.pin(), scratch(self, "tine-test-cell."))
 
     def test_a_pin_that_is_not_a_sha256(self) -> None:
         with self.assertRaisesRegex(SystemExit, "64 lowercase hexadecimal"):
-            tine.buck2_binary(self.pin("abc"), self.cell())
+            tine.ensure_buck2_binary(self.pin("abc"), self.cell())
 
 
 class TestDownload(unittest.TestCase):
@@ -1862,7 +1876,6 @@ class TestDownload(unittest.TestCase):
         return path.as_uri()
 
     def test_a_download_that_matches_its_pin(self) -> None:
-        import hashlib
 
         url = self.artifact(b"binary")
         digest = hashlib.sha256(Path(url.removeprefix("file://")).read_bytes()).hexdigest()
@@ -1877,7 +1890,6 @@ class TestDownload(unittest.TestCase):
                 self.assertEqual(fetched.read_bytes(), b"binary")
 
     def test_an_artifact_that_is_the_binary_itself(self) -> None:
-        import hashlib
 
         path = scratch(self) / "tool"
         path.write_bytes(b"binary")
@@ -1898,7 +1910,6 @@ class TestDownload(unittest.TestCase):
         self.assertFalse(into.exists())
 
     def test_an_artifact_that_is_not_what_the_pin_says_it_is(self) -> None:
-        import hashlib
 
         # Wrong magic, and a stream that ends early: a pin can match either.
         compressed = Path(self.artifact(b"binary").removeprefix("file://")).read_bytes()
@@ -1926,21 +1937,27 @@ class TestBuckCommand(unittest.TestCase):
         os.chdir(self.root)
         self.binary = self.root / "buck2"
         self.binary.write_text("")
+        # As under a real wrapper run: resolution exported the environment before anything here runs.
+        environment = unittest.mock.patch.dict(os.environ, {"BUCK2_BINARY": str(self.binary)})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     @contextlib.contextmanager
-    def running(self) -> collections.abc.Iterator[list[object]]:
+    def running(self) -> collections.abc.Generator[list[object]]:
         execve: list[object] = []
-        self.killed: list[object] = []
         self.served: list[object] = []
+        self.bound: list[object] = []
         with contextlib.ExitStack() as patches:
             patch = unittest.mock.patch.object
-            patches.enter_context(patch(tine, "kill_daemon", side_effect=lambda *a: self.killed.append(a)))
+            patches.enter_context(
+                patch(tine, "bind_glibc_loader", side_effect=lambda: self.bound.append(len(self.served)))
+            )
             # Like the real one with nothing serving yet: what it readies is what Buck would start.
             patches.enter_context(
                 patch(cache_shim, "ensure", side_effect=lambda _, ready: self.served.append(ready()))
             )
-            patches.enter_context(patch(tine, "buck2_binary", return_value=self.binary))
-            patches.enter_context(patch(os, "execve", side_effect=lambda *a: execve.extend(a)))
+            patches.enter_context(patch(tine, "ensure_buck2_binary", return_value=True))
+            patches.enter_context(patch(os, "execv", side_effect=lambda *a: execve.extend(a)))
             yield execve
 
     def configure_cache(self) -> cache_shim.CacheSettings:
@@ -1954,7 +1971,6 @@ class TestBuckCommand(unittest.TestCase):
         with self.running():
             tine.buck_command(["build", "//..."])
         self.assertEqual(self.served, [])
-        self.assertEqual(self.killed, [])
 
     def test_a_subcommand_that_runs_no_action_starts_nothing(self) -> None:
         """`tine buck kill` starting a cache that then idles for fifteen minutes reads as a fault."""
@@ -1971,47 +1987,58 @@ class TestBuckCommand(unittest.TestCase):
             with self.subTest(argv=argv), self.running():
                 tine.buck_command(argv)
                 self.assertEqual(self.served, [])
+                # The subcommands skip the loader bind, so they work on a host with no file at the
+                # standard path.
+                self.assertEqual(self.bound, [])
 
     def test_a_configured_cache_reaches_the_generated_block(self) -> None:
         cache = self.configure_cache()
         with self.running():
             tine.buck_command(["build", "//..."])
             self.assertEqual(len(self.served), 1, "the shim buck is about to talk to has to exist")
-            self.assertEqual(len(self.killed), 1, "a daemon predating the address has to go")
-            self.killed.clear()
-            tine.buck_command(["build", "//..."])
-            self.assertEqual(self.killed, [], "an unchanged address is no reason to kill anything")
         self.assertEqual(
-            tine.read_generated_buckconfig(self.root / tine.LOCAL)[tine.RE_CLIENT], tine.cache_client(cache)
+            read_generated_buckconfig(self.root / tine.LOCAL)[tine.RE_CLIENT], tine.cache_client(cache)
         )
 
-    def test_starting_the_shim_leaves_the_address_where_it_is(self) -> None:
-        """The build that produces the shim is the one told not to use the cache, on its own line."""
-        cache = self.configure_cache()
-        tine.refresh_local_buckconfig(self.root, [], cache)
-        with self.running():
-            buck = tine.before_shim(
-                self.root,
-                tine.read_project_buckconfig(self.root),
-                tine.project_settings(self.root),
-                cache,
-                "x",
-            )
-        self.assertEqual(buck, [str(self.binary), tine.FLAG_ISOLATION, "x"])
-        self.assertEqual(self.killed, [])
-        self.assertEqual(
-            tine.read_generated_buckconfig(self.root / tine.LOCAL)[tine.RE_CLIENT], tine.cache_client(cache)
-        )
-
-    def test_a_changed_address_replaces_the_daemon_holding_the_old_one(self) -> None:
-        """Starting a shim writes the new address, so what a daemon could have read is taken first."""
+    def test_the_loader_is_bound_before_the_shim_starts(self) -> None:
+        # The build of the shim and the shim itself run the pinned Python, so the command binds the
+        # host's glibc loader before it starts the shim. No shim has started when the bind runs.
         self.configure_cache()
         with self.running():
             tine.buck_command(["build", "//..."])
-            self.killed.clear()
+        self.assertEqual(self.bound, [0])
+        self.assertEqual(len(self.served), 1)
+
+    def test_starting_the_shim_takes_the_address_out(self) -> None:
+        """Buck tries a configured cache despite `--no-remote-cache`, and nothing answers it yet."""
+        cache = self.configure_cache()
+        tine.refresh_local_buckconfig(self.root, [], cache)
+        with self.running():
+            buck = tine.before_shim(self.root, tine.project_settings(self.root), "x")
+        self.assertEqual(buck, [str(self.binary), "--no-buckd", tine.FLAG_ISOLATION, "x"])
+        self.assertNotIn(tine.RE_CLIENT, read_generated_buckconfig(self.root / tine.LOCAL))
+
+    def test_the_shim_builds_with_the_defaults_of_the_current_checkout(self) -> None:
+        """The shim is a target of the tine cell, so it needs the cells that checkout declares now."""
+        configure_cells(self.root, "tine")
+        checkout = self.root / "tine"
+        checkout.mkdir()
+        (checkout / ".buckconfig").write_text("[cells]\ntine = .\ncatalog = catalog\n")
+        with self.running():
+            tine.before_shim(self.root, tine.project_settings(self.root), None)
+        self.assertEqual(tine.cells_of(tine.read_project_buckconfig(self.root))["catalog"], "tine/catalog")
+
+    def test_a_changed_address_reaches_the_next_invocation(self) -> None:
+        """Each command's daemon reads the current configuration, so a new address only needs writing."""
+        self.configure_cache()
+        with self.running():
+            tine.buck_command(["build", "//..."])
             (self.root / tine.LOCAL_SETTINGS).write_text("[cache]\nunsigned = true\nport = 21000\n")
             tine.buck_command(["build", "//..."])
-        self.assertEqual(self.killed, [(self.binary, None)])
+        self.assertEqual(
+            read_generated_buckconfig(self.root / tine.LOCAL)[tine.RE_CLIENT]["address"],
+            "127.0.0.1:21000",
+        )
 
     def test_a_project_may_not_name_the_cache_address_itself(self) -> None:
         self.configure_cache()
@@ -2024,29 +2051,56 @@ class TestBuckCommand(unittest.TestCase):
         with self.running() as execve:
             tine.buck_command(["build", "//..."])
         self.assertTrue(execve)
-        self.assertEqual(self.killed, [])
 
     def test_it_configures_then_hands_over(self) -> None:
         with self.running() as execve:
             tine.buck_command(["build", "//x"])
-        binary, argv, environment = execve
-        self.assertEqual((binary, argv), (self.binary, [str(self.binary), "build", "//x"]))
-        assert isinstance(environment, dict)
-        self.assertEqual(environment["BUCK2_BINARY"], str(self.binary))
-        self.assertEqual(environment["BUCK2_ARG0"], "tine buck")
+        binary, argv = execve
+        self.assertEqual(
+            (binary, argv), (str(self.binary), [str(self.binary), "--no-buckd", "build", "//x"])
+        )
         self.assertTrue((self.root / tine.LOCAL).is_file())
 
     def test_no_mounts_skip_private_git_metadata(self) -> None:
-        private = self.root / tine.PRIVATE_CONFIG
-        private.parent.mkdir(parents=True)
-        private.write_text(f"{tine.BLOCK_BEGIN}\n[tine]\ngitdirs = invalid\n{tine.BLOCK_END}\n")
+        table = tine.encode_mount_table([], {}).replace("{}", '"invalid"')
         with (
             self.running() as execve,
+            unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}),
             unittest.mock.patch.object(tine, "namespace_gitdirs", wraps=tine.namespace_gitdirs) as gitdirs,
         ):
             tine.buck_command(["build", "//x"])
         gitdirs.assert_not_called()
         self.assertTrue(execve)
+
+    def build_mounted(self, *targets: str) -> dict[str, dict[str, str]]:
+        table = tine.encode_mount_table(list(targets), {})
+        with self.running(), unittest.mock.patch.dict(os.environ, {tine.TINE_MOUNTS_ENV: table}):
+            tine.buck_command(["build", "//x"])
+        return read_generated_buckconfig(self.root / tine.LOCAL)
+
+    def test_mounted_targets_build_in_dev_mode(self) -> None:
+        self.assertEqual(
+            self.build_mounted("packages/b.source", "packages/a.source")[tine.SECTION][tine.DEV],
+            "packages/a.source, packages/b.source",
+        )
+
+    def test_the_projects_dev_targets_are_kept_beside_the_mounted_ones(self) -> None:
+        (self.root / ".buckconfig").write_text(
+            "[cells]\nroot = .\n[tine]\ndev = tools/app, packages/a.source\n"
+        )
+        self.assertEqual(
+            self.build_mounted("packages/a.source")[tine.SECTION][tine.DEV], "tools/app, packages/a.source"
+        )
+
+    def test_without_mounts_buck_reads_the_projects_dev_targets(self) -> None:
+        (self.root / ".buckconfig").write_text("[cells]\nroot = .\n[tine]\ndev = tools/app\n")
+        self.assertNotIn(tine.DEV, self.build_mounted().get(tine.SECTION, {}))
+
+    def test_local_dev_targets_would_drop_the_mounted_ones(self) -> None:
+        (self.root / tine.LOCAL).write_text("[tine]\ndev = tools/app\n")
+        with self.assertRaisesRegex(SystemExit, "would replace the mounted targets"):
+            self.build_mounted("packages/a.source")
+        self.assertNotIn(tine.DEV, self.build_mounted().get(tine.SECTION, {}))
 
     def test_completing_writes_no_shared_config(self) -> None:
         defaults = Path(__file__).with_name("tine.buckconfig")
@@ -2073,6 +2127,31 @@ class TestBuckCommand(unittest.TestCase):
                     ", ".join(tine.VCS_IGNORES),
                 )
 
+    def test_completing_runs_in_its_own_isolation_dir(self) -> None:
+        """A keypress must never queue on the daemon-less slot of a running build."""
+        with unittest.mock.patch.dict(os.environ, {"BUCK_ISOLATION_DIR": "elsewhere"}):
+            with self.running() as execve:
+                tine.buck_command(["complete", "--target=//x"])
+        self.assertEqual(
+            execve[1],
+            [
+                str(self.binary),
+                "--no-buckd",
+                tine.FLAG_ISOLATION,
+                tine.ISOLATION_COMPLETE,
+                "complete",
+                "--target=//x",
+            ],
+        )
+
+    def test_completing_respects_a_callers_own_isolation_dir(self) -> None:
+        with self.running() as execve:
+            tine.buck_command([tine.FLAG_ISOLATION, "x", "complete", "--target=//x"])
+        self.assertEqual(
+            execve[1],
+            [str(self.binary), "--no-buckd", tine.FLAG_ISOLATION, "x", "complete", "--target=//x"],
+        )
+
     def test_tine_cell_uses_its_own_gitignores(self) -> None:
         isolate_git(self)
         checkout = self.root / "vendor" / "tine"
@@ -2096,11 +2175,11 @@ class TestBuckCommand(unittest.TestCase):
         with self.running():
             tine.buck_command(["build", "tine//..."])
         self.assertEqual(
-            tine.read_generated_buckconfig(checkout / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
+            read_generated_buckconfig(checkout / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
             ", ".join([*tine.VCS_IGNORES, "ignored.generated"]),
         )
         self.assertEqual(
-            tine.read_generated_buckconfig(self.root / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
+            read_generated_buckconfig(self.root / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
             ", ".join(tine.VCS_IGNORES),
         )
 
@@ -2108,7 +2187,7 @@ class TestBuckCommand(unittest.TestCase):
         with self.running():
             tine.buck_command(["build", "tine//..."])
         self.assertEqual(
-            tine.read_generated_buckconfig(checkout / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
+            read_generated_buckconfig(checkout / tine.LOCAL)["project"][tine.PROJECT_IGNORE],
             ", ".join(tine.VCS_IGNORES),
         )
         self.assertNotIn("project", tine.read_project_buckconfig(checkout))
@@ -2123,7 +2202,7 @@ class TestBuckCommand(unittest.TestCase):
                     unittest.mock.patch.object(tine, "refresh_local_buckconfig") as refresh,
                 ):
                     tine.buck_command(["build", "tine//..."])
-                refresh.assert_called_once_with(self.root, list(tine.VCS_IGNORES), None)
+                refresh.assert_called_once_with(self.root, list(tine.VCS_IGNORES), None, [])
 
     def test_a_run_without_a_home_gets_one(self) -> None:
         environment = dict(os.environ)
@@ -2131,10 +2210,8 @@ class TestBuckCommand(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, environment, clear=True):
             with self.running() as execve:
                 tine.buck_command(["build", "//x"])
+            self.assertTrue(execve)
             self.assertEqual(os.environ["HOME"], str(self.root / tine.HOME))
-        home = execve[2]
-        assert isinstance(home, dict)
-        self.assertEqual(home["HOME"], str(self.root / tine.HOME))
         self.assertTrue((self.root / tine.HOME).is_dir())
 
     def test_a_run_with_a_home_keeps_it(self) -> None:
@@ -2151,6 +2228,8 @@ CELL_BUCKCONFIG = """# Standalone root cell. Consuming projects supply their own
 [cells]
 # Named `tine`, not `root`, so same-cell labels read `tine//...` as in a consuming project.
 tine = .
+catalog = catalog
+settings = settings
 prelude = prelude
 none = none
 
@@ -2164,10 +2243,11 @@ fbsource = none
 prelude = bundled
 
 [parser]
-target_platform_detector_spec = target:tine//...->tine//platforms:default
+target_platform_detector_spec = target:tine//...->tine//platform:default \\
+    target:catalog//...->tine//platform:default
 
 [build]
-execution_platforms = tine//platforms:default
+execution_platforms = tine//platform:default
 
 [custom]
 continued = one, \\
@@ -2205,12 +2285,41 @@ class TestRenderProjectBuckconfig(unittest.TestCase):
         detector = self.config()["parser"][tine.DETECTOR].split()
         # This cell's platform, not the prelude's: that is what gives the project the shared cache.
         self.assertEqual(
-            detector, [f"target:{cell}//...->tine//platforms:default" for cell in ("root", "tine")]
+            detector,
+            [f"target:{cell}//...->tine//platform:default" for cell in ("root", "tine", "catalog")],
         )
+
+    def test_a_project_without_a_catalog_gets_tine_s(self) -> None:
+        self.assertEqual(self.config("vendor/tine")["cells"]["catalog"], "vendor/tine/catalog")
+
+    def test_a_project_catalog_replaces_tine_s(self) -> None:
+        root = scratch(self, "tine-test-project.")
+        configure_cells(root, "vendor/tine").write_text(
+            '[buckconfig.cells]\nroot = "."\ntine = "vendor/tine"\ncatalog = "os/catalog"\n'
+        )
+        (root / ".buckconfig").write_text(self.written(root))
+        self.assertEqual(tine.read_project_buckconfig(root)["cells"]["catalog"], "os/catalog")
+
+    def test_a_project_without_settings_gets_tine_s(self) -> None:
+        # A project that declares no settings cell must get the settings cell of the tine checkout, at
+        # its path in the project.
+        self.assertEqual(self.config("vendor/tine")["cells"]["settings"], "vendor/tine/settings")
+
+    def test_project_settings_replace_tine_s_and_keep_tine_s_catalog(self) -> None:
+        # A project that declares only a settings cell must get its own settings cell and still build
+        # against the catalog of the tine checkout.
+        root = scratch(self, "tine-test-project.")
+        configure_cells(root, "vendor/tine").write_text(
+            '[buckconfig.cells]\nroot = "."\ntine = "vendor/tine"\nsettings = "tine-settings"\n'
+        )
+        (root / ".buckconfig").write_text(self.written(root))
+        cells = tine.read_project_buckconfig(root)["cells"]
+        self.assertEqual(cells["settings"], "tine-settings")
+        self.assertEqual(cells["catalog"], "vendor/tine/catalog")
 
     def test_the_project_runs_actions_on_the_cell_s_platform(self) -> None:
         # Copied rather than rewritten, and it is what gives the project the shared cache.
-        self.assertEqual(self.config()["build"]["execution_platforms"], "tine//platforms:default")
+        self.assertEqual(self.config()["build"]["execution_platforms"], "tine//platform:default")
 
     def test_defaults_and_continued_values_are_copied(self) -> None:
         written = self.written()
@@ -2281,6 +2390,21 @@ class TestRefreshProjectBuckconfig(unittest.TestCase):
                 self.assertEqual(config["cells"]["app"], "app")
                 self.assertEqual(config["buck2"], {"materializations": materializations or "deferred"})
 
+    def test_a_moved_checkout_takes_its_catalog_along(self) -> None:
+        moved = self.root / "third-party" / "tine"
+        moved.mkdir(parents=True)
+        (moved / ".buckconfig").write_text(CELL_BUCKCONFIG)
+        configure_cells(self.root, "third-party/tine")
+        self.enterContext(unittest.mock.patch.object(tine, "COMMAND_PATH", wrapper_command(moved)))
+        self.refresh()
+        self.assertEqual(self.config()["cells"]["catalog"], "third-party/tine/catalog")
+
+    def test_native_cell_declarations_keep_a_project_catalog(self) -> None:
+        self.cells.write_text("")
+        self.path.write_text("[cells]\nroot = .\ntine = vendor/tine\ncatalog = os/catalog\n")
+        self.refresh()
+        self.assertEqual(self.config()["cells"]["catalog"], "os/catalog")
+
     def test_unchanged_defaults_do_not_rewrite_the_file(self) -> None:
         before = self.path.stat()
         self.refresh()
@@ -2288,24 +2412,12 @@ class TestRefreshProjectBuckconfig(unittest.TestCase):
         self.assertEqual(self.path.stat().st_ino, before.st_ino)
         self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
 
-    def test_checkout_mount_metadata_is_not_copied_into_project_defaults(self) -> None:
+    def test_checkout_generated_block_is_not_copied_into_project_defaults(self) -> None:
         self.source.write_text(
-            CELL_BUCKCONFIG
-            + f"{tine.BLOCK_BEGIN}\n[buck2]\n{tine.DAEMON_BUSTER} = checkout-mounts\n"
-            + f"[tine]\n{tine.DEV} = checkout-source\n{tine.BLOCK_END}\n"
+            CELL_BUCKCONFIG + f"{tine.BLOCK_BEGIN}\n[tine]\nmounted = leftover\n{tine.BLOCK_END}\n"
         )
         self.refresh()
-        self.assertNotIn(tine.DAEMON_BUSTER, self.config().get("buck2", {}))
-        self.assertNotIn(tine.DEV, self.config().get("tine", {}))
-
-    def test_mount_add_rejects_a_new_daemon_buster_override(self) -> None:
-        self.cells.write_text(
-            self.cells.read_text() + f'\n[buckconfig.buck2]\n{tine.DAEMON_BUSTER} = "custom"\n'
-        )
-        checkout = scratch(self)
-        with self.assertRaisesRegex(SystemExit, "daemon_buster is reserved"):
-            tine.mount_command(self.root, ["add", str(self.cell), str(checkout)])
-        self.assertEqual(tine.local_mounts(self.root), {})
+        self.assertNotIn("mounted", self.config().get("tine", {}))
 
     def test_mount_add_does_not_require_checkout_defaults(self) -> None:
         self.source.unlink()
@@ -2456,18 +2568,16 @@ class TestRefreshProjectBuckconfig(unittest.TestCase):
             tine.collect_project_ignores(self.root, self.config(), [], {}), ["custom", *tine.VCS_IGNORES]
         )
 
-    def test_completion_and_nested_builds_do_not_refresh_defaults(self) -> None:
+    def test_completion_does_not_refresh_defaults(self) -> None:
         before = self.path.read_bytes()
         self.source.write_text(self.updated)
         with (
             contextlib.chdir(self.root),
-            unittest.mock.patch.object(tine, "buck2_binary", return_value=self.root / "buck2"),
-            unittest.mock.patch.object(os, "execve"),
+            unittest.mock.patch.dict(os.environ, {"BUCK2_BINARY": str(self.root / "buck2")}),
+            unittest.mock.patch.object(tine, "ensure_buck2_binary", return_value=True),
+            unittest.mock.patch.object(os, "execv"),
         ):
             tine.buck_command(["complete"])
-            self.assertEqual(self.path.read_bytes(), before)
-            with unittest.mock.patch.dict(os.environ, {"BUCK2_BINARY": "active"}):
-                tine.buck_command(["build", "tine//..."])
             self.assertEqual(self.path.read_bytes(), before)
             self.assertFalse((self.root / tine.LOCAL).exists())
 
@@ -2476,7 +2586,7 @@ class TestRefreshProjectBuckconfig(unittest.TestCase):
         self.source.write_text(self.updated)
         with (
             contextlib.chdir(self.root),
-            unittest.mock.patch.object(tine, "buck2_binary", return_value=self.root / "buck2"),
+            unittest.mock.patch.object(tine, "ensure_buck2_binary", return_value=True),
             unittest.mock.patch.object(tine, "_buck2_completion_script", return_value="script"),
             unittest.mock.patch.object(tine, "rewrite_completion_script", return_value="rendered"),
             contextlib.redirect_stdout(io.StringIO()) as output,
@@ -2485,25 +2595,6 @@ class TestRefreshProjectBuckconfig(unittest.TestCase):
         self.assertEqual(output.getvalue(), "rendered")
         self.assertEqual(self.path.read_bytes(), before)
         self.assertFalse((self.root / tine.LOCAL).exists())
-
-    def test_prepare_rejects_project_daemon_constraints(self) -> None:
-        declare(self.root, {"vendor/tine": str(scratch(self))})
-        local = self.root / tine.LOCAL
-        for section, key in (("buck2", tine.DAEMON_BUSTER), ("tine", tine.DEV)):
-            with self.subTest(key=key):
-                local.write_text(f"[{section}]\n{key} = custom\n")
-                with (
-                    unittest.mock.patch.object(
-                        tine, "namespace_mount_targets", return_value=["vendor/tine"]
-                    ),
-                    self.assertRaisesRegex(SystemExit, "reserved while mounts are declared"),
-                ):
-                    tine.prepare_buck(
-                        self.root,
-                        tine.project_settings(self.root),
-                        ["buck", "complete"],
-                        refresh_config=False,
-                    )
 
     def test_standalone_overrides_are_not_silently_discarded(self) -> None:
         self.path.write_text("[cells]\nroot = .\n")
@@ -2545,6 +2636,7 @@ class TestInit(unittest.TestCase):
         )
         gitignore = (self.into / ".gitignore").read_text()
         self.assertIn("/buck-out\n", gitignore)
+        self.assertIn("target/\n", gitignore)
         self.assertIn(f"/{tine.LOCAL}\n", gitignore)
         # The name an interrupted write leaves behind, which is nobody's to commit either.
         self.assertIn(f"/{tine.LOCAL}.*.tmp\n", gitignore)
@@ -2610,6 +2702,8 @@ class TestInit(unittest.TestCase):
         excluded = (self.into / ".git" / "info" / "exclude").read_text()
         for entry in tine.GITIGNORE.split():
             self.assertIn(f"{entry}\n", excluded)
+        # An exclude nobody reads must not hide a source directory that happens to have this name.
+        self.assertNotIn("target/", excluded)
 
     def test_it_takes_one_path(self) -> None:
         # `--help` is argparse's to answer, and neither it nor a second path writes a project.
@@ -3145,6 +3239,35 @@ class TestMain(unittest.TestCase):
             tine.main(["box", "--", "pytest", "-q"])
         buck.assert_called_once_with(["-v", "0", "run", "//:box", "--", "pytest", "-q"])
 
+    def test_bump_updates_the_pins_of_the_project(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tine-test.", dir="/var/tmp") as directory:
+            root = Path(directory)
+            (root / "ty.toml").touch()
+            with (
+                unittest.mock.patch.object(tine, "project_root", return_value=root),
+                unittest.mock.patch.object(tine, "prepare_buck") as prepare,
+                unittest.mock.patch("bump.main") as main,
+            ):
+                (root / "pyproject.toml").touch()
+                tine.main(["bump", "--all"])
+                (root / "ty.toml").unlink()
+                tine.main(["bump", "--tool", "ruff"])
+                (root / "pyproject.toml").unlink()
+                tine.main(["bump", "--tool", "go"])
+        self.assertEqual(
+            [call.args[2] for call in prepare.call_args_list],
+            [["bump", "--all"], ["bump", "--tool", "ruff"], ["bump", "--tool", "go"]],
+        )
+        data = root / "tine.lock.json"
+        self.assertEqual(
+            [call.args for call in main.call_args_list],
+            [
+                (data, root / "ty.toml", ["--all"]),
+                (data, root / "pyproject.toml", ["--tool", "ruff"]),
+                (data, None, ["--tool", "go"]),
+            ],
+        )
+
     def test_no_such_command(self) -> None:
         with self.assertRaisesRegex(SystemExit, "no such command: nope"):
             tine.main(["nope"])
@@ -3180,10 +3303,21 @@ class TestParseBuckCommand(unittest.TestCase):
         self.assertIsNone(tine.parse_buck_command([]).subcommand)
         self.assertIsNone(tine.parse_buck_command(["--", "build"]).subcommand)
 
+    def test_isolation_falls_back_to_bucks_environment_variable(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"BUCK_ISOLATION_DIR": "elsewhere"}):
+            self.assertEqual(tine.parse_buck_command(["build", "//x"]).isolation, "elsewhere")
+            self.assertEqual(tine.parse_buck_command(["--isolation-dir", "x", "build"]).isolation, "x")
+
     def test_option_separator(self) -> None:
         self.assertIsNone(
             tine.parse_buck_command(["run", "//x", "--", "--isolation-dir", "other"]).isolation
         )
+
+    def test_a_callers_own_isolation_dir(self) -> None:
+        """Only a flag in the vector itself is the caller's; the environment is a fallback."""
+        self.assertTrue(tine.parse_buck_command(["--isolation-dir", "x", "complete"]).own_isolation)
+        with unittest.mock.patch.dict(os.environ, {"BUCK_ISOLATION_DIR": "elsewhere"}):
+            self.assertFalse(tine.parse_buck_command(["complete", "--target=//x"]).own_isolation)
 
 
 class TestProjectIgnores(unittest.TestCase):
@@ -3360,6 +3494,20 @@ class TestProjectIgnores(unittest.TestCase):
 
         self.assertIn("packages/project/nested/ignored.tmp", ignores)
         self.assertNotIn("packages/project/nested/kept.tmp", ignores)
+
+    def test_gitignored_buck_configuration_remains_visible(self) -> None:
+        for ignore in ("/.buckconfig.d/tine-box\n", "/.buckconfig.d/\n"):
+            with self.subTest(ignore=ignore):
+                checkout = self.checkout()
+                (checkout / ".gitignore").write_text(f"/.buckconfig\n/.buckconfig.local\n{ignore}/output\n")
+                (checkout / ".buckconfig").write_text("")
+                (checkout / ".buckconfig.local").write_text("")
+                (checkout / ".buckconfig.d" / "nested").mkdir(parents=True)
+                (checkout / ".buckconfig.d" / "tine-box").write_text("")
+                (checkout / ".buckconfig.d" / "nested" / "settings").write_text("")
+                (checkout / "output").mkdir()
+
+                self.assertEqual(tine.git_ignored_paths(checkout), ["output"])
 
     def test_an_ignored_root_suppresses_its_reported_descendants(self) -> None:
         checkout = self.checkout()

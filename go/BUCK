@@ -3,43 +3,113 @@
 
 """Go source builds: one online, go.sum-verified module fetch, then an offline compile."""
 
-load("//box:test.bzl", "box_python_test")
-load("//python:defs.bzl", "tine_python_binary")
+load("//box:defs.bzl", "box")
+load("//distribution:defs.bzl", "distribution")
+load("//go:defs.bzl", "go")
+load("//python:defs.bzl", "python")
 
-# The project's source artifacts in, the module root its go.mod marks out.
-tine_python_binary(
+# The box that go.package() builds in unless a project names its own. Fedora's golang package depends on
+# gcc, so go enables cgo in the Fedora box. The Arch and Debian boxes contain no C compiler, so go disables
+# cgo there and links static binaries. A project that uses cgo adds gcc and the development packages it
+# binds with go.package(buildroot_packages = ...).
+box.new(
+    name = "build.box",
+    packages = [
+        # TLS trust for the module fetch from proxy.golang.org.
+        "ca-certificates",
+    ]
+    + distribution.select({
+        "arch": ["go"],
+        "debian": ["golang-go"],
+        "fedora": ["golang"],
+    }),
+    release = distribution.release_target("release"),
+    visibility = ["PUBLIC"],
+)
+
+# The project's source artifacts in; the module root, its pins, the go.mod files the fetch reads and the
+# Go release to build with out.
+python.binary(
     name = "workspace",
     main = "workspace.py",
     visibility = ["PUBLIC"],
-    deps = ["//:specs", "//:util"],
+    deps = [":goversion", "//:specs", "//:util"],
 )
 
-# Runs inside the box with the network: go.mod and go.sum in, the verified module cache out.
-tine_python_binary(
+# refresh-catalog runs this driver on the host through a go.releases target's [snapshot] sub-target.
+python.binary(
+    name = "releases",
+    main = "releases.py",
+    visibility = ["PUBLIC"],
+    deps = [":goversion", "//:specs", "//:util"],
+)
+
+python.library(
+    name = "goversion",
+    srcs = ["goversion.py"],
+)
+
+python.library(
+    name = "toolchain",
+    srcs = ["toolchain.py"],
+)
+
+# Runs inside the box with the network: go.mod and go.sum files in, the verified module cache out.
+python.binary(
     name = "fetch",
     main = "fetch.py",
     visibility = ["PUBLIC"],
-    deps = ["//:specs", "//:util"],
+    deps = [
+        ":toolchain",
+        "//:specs",
+        "//:util",
+    ],
 )
 
 # Runs inside the box offline: the source tree and its module cache in, the declared binaries out.
-tine_python_binary(
+python.binary(
     name = "build",
     main = "build.py",
     visibility = ["PUBLIC"],
     deps = [
+        ":toolchain",
         "//:specs",
         "//:util",
         "//rootfs:rootfs",
     ],
 )
 
-box_python_test(
+# Runs inside the box offline. It runs each test binary that the build compiled in the binary's package directory.
+python.binary(
+    name = "runner",
+    main = "runner.py",
+    visibility = ["PUBLIC"],
+    deps = [
+        "//:specs",
+        "//rootfs:rootfs",
+    ],
+)
+
+# A catalog declares go.releases before refresh-catalog writes its first snapshot. go/ contains no
+# snapshot for this target, so the graph analysis that lint runs checks that go.releases analyzes
+# without one.
+go.releases(name = "unrefreshed.releases")
+
+python.test(
     name = "test",
     box = "//tools:dev.box",
     srcs = [
         "build.py",
         "build_test.py",
+        "fetch.py",
+        "fetch_test.py",
+        "goversion.py",
+        "releases.py",
+        "releases_test.py",
+        "runner.py",
+        "runner_test.py",
+        "toolchain.py",
+        "toolchain_test.py",
         "workspace.py",
         "workspace_test.py",
     ],

@@ -1,11 +1,15 @@
 # SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
 # SPDX-License-Identifier: MPL-2.0
 
-"""Native package repositories, universes, and dynamic transaction selection."""
+"""Native package repositories, universes, dynamic transaction selection, and repository configuration for a consumer's box."""
 
-load("//platforms:architecture.bzl", "architecture")
+load("//:specs.bzl", "specs")
+load("//box:runtime.bzl", "BoxInfo", "box_run")
+load("//distribution:defs.bzl", "distribution")
+load("//platform:architecture.bzl", "architecture")
+load("//platform:defs.bzl", "platform")
 load(":system.bzl", "PackageSystemInfo")
-load(":verify.bzl", "Verifier", "verify_packages")
+load(":verify.bzl", "Verifier", "repository_verifier", "verify_packages")
 
 PackageArtifactInfo = record(
     artifact = Artifact,
@@ -25,26 +29,26 @@ PackagePoolValueInfo = provider(
     fields = {"packages": provider_field(dict[str, PackageArtifactInfo])},
 )
 
-def _snapshot_subtarget(architecture: str) -> str:
+def _snapshot_subtarget(arch: str) -> str:
     """The subtarget that takes a repository's metadata for one architecture.
 
     Keep in sync with `_snapshot` in tools/catalog.py, which names it to refresh a lock.
     """
-    return "snapshot." + architecture
+    return "snapshot." + arch
 
-def _repository_lock_path(name: str, architecture: str) -> str:
+def _repository_lock_path(name: str, arch: str) -> str:
     """Where one architecture's committed metadata lock lives, relative to the catalog package.
 
     Keep in sync with `_repository_lock_path` in tools/catalog.py, which writes it.
     """
-    return "snapshot/repo/{}.{}.json".format(name, architecture)
+    return "snapshot/repo/{}.{}.json".format(name, arch)
 
-def box_lock_path(name: str, architecture: str) -> str:
+def box_lock_path(name: str, arch: str) -> str:
     """Where one architecture's committed box transaction lives, relative to the catalog package.
 
     Keep in sync with `_box_lock_path` in tools/catalog.py, which writes it.
     """
-    return "snapshot/box/{}.{}.json".format(name, architecture)
+    return "snapshot/box/{}.{}.json".format(name, arch)
 
 def snapshot_data(snapshot: ArtifactValue, id: str) -> dict:
     """Read one repository's committed snapshot."""
@@ -115,13 +119,19 @@ def _retained_metadata(id: str, box_locks: list[ArtifactValue], current: list, p
             generations[json.encode(files)] = entry
     return [generations[key] for key in sorted(generations)]
 
-def _download(actions: AnalysisActions, path: str, file: dict) -> Artifact:
-    out = actions.declare_output(path)
+def _download(actions: AnalysisActions, arch: str, path: str, file: dict) -> Artifact:
+    # The path of a content-based output contains no configuration. The configurations of one repository
+    # for two architectures download an identical file, such as a noarch package, to the same path. Two
+    # parallel downloads into one path corrupt the file, so the architecture is part of the path.
+    out = actions.declare_output(arch, path)
+
+    # A repository may serve a file larger than a Starlark i32, which arrives as a float.
     actions.download_file(out, file["url"], sha256 = file["sha256"], size_bytes = int(file["size"]))
     return out
 
 def _materialize_metadata_impl(
     actions: AnalysisActions,
+    arch: str,
     id: str,
     repo: OutputArtifact,
     snapshot: ArtifactValue,
@@ -136,7 +146,7 @@ def _materialize_metadata_impl(
 
     tree = {path: actions.write(path, content) for path, content in metadata["inline"].items()}
     for file in metadata["files"]:
-        tree[file["out"]] = _download(actions, file["out"], file)
+        tree[file["out"]] = _download(actions, arch, file["out"], file)
     if vouches:
         # A resolve records the manifest in the lock it writes, so what vouched for a package
         # is retained with its transport, and a lock's packages stay verifiable after the pin moves.
@@ -145,7 +155,7 @@ def _materialize_metadata_impl(
         for index, generation in enumerate(_retained_metadata(id, box_locks, metadata["files"], data.get("packages", {}))):
             directory = "{}/{}".format(RETAINED_DIRECTORY, index)
             for file in generation["files"]:
-                tree[directory + "/" + file["out"]] = _download(actions, directory + "/" + file["out"], file)
+                tree[directory + "/" + file["out"]] = _download(actions, arch, directory + "/" + file["out"], file)
             # A generation is judged as of its own pin, the way the current one is as of the repository's.
             if generation.get("pinned_at") != None:
                 tree[directory + "/" + PINNED_AT_FILE] = actions.write(directory + "/" + PINNED_AT_FILE, generation["pinned_at"])
@@ -155,6 +165,7 @@ def _materialize_metadata_impl(
 _materialize_metadata = dynamic_actions(
     impl = _materialize_metadata_impl,
     attrs = {
+        "arch": dynattrs.value(str),
         "box_locks": dynattrs.list(dynattrs.artifact_value()),
         "id": dynattrs.value(str),
         "pinned_at": dynattrs.value(str | None),
@@ -166,6 +177,7 @@ _materialize_metadata = dynamic_actions(
 
 def _materialize_package_pool_impl(
     actions: AnalysisActions,
+    arch: str,
     baseurl: str,
     box_locks: list[ArtifactValue],
     id: str,
@@ -175,16 +187,14 @@ def _materialize_package_pool_impl(
     pool = {}
     for checksum, package in pool_transports(id, baseurl, snapshot, box_locks).items():
         url = package["url"]
-        artifact = actions.declare_output("packages", checksum + suffix, has_content_based_path = True)
-
-        # A repository may serve a package larger than a Starlark i32, which arrives as a float.
-        actions.download_file(artifact, url, sha256 = checksum, size_bytes = int(package["size"]))
+        artifact = _download(actions, arch, "packages/" + checksum + suffix, {"sha256": checksum, "size": package["size"], "url": url})
         pool[checksum] = PackageArtifactInfo(artifact = artifact, name = url.rsplit("/", 1)[-1])
     return [PackagePoolValueInfo(packages = pool)]
 
 _materialize_package_pool = dynamic_actions(
     impl = _materialize_package_pool_impl,
     attrs = {
+        "arch": dynattrs.value(str),
         "baseurl": dynattrs.value(str),
         "box_locks": dynattrs.list(dynattrs.artifact_value()),
         "id": dynattrs.value(str),
@@ -213,6 +223,7 @@ def _remote_repository_impl(ctx: AnalysisContext) -> list[Provider]:
         snapshot = ctx.actions.write("empty-snapshot.json", "{}")
     ctx.actions.dynamic_output_new(
         _materialize_metadata(
+            arch = ctx.attrs._arch,
             box_locks = ctx.attrs.box_locks,
             id = ctx.label.name,
             pinned_at = ctx.attrs.pinned_at,
@@ -239,6 +250,7 @@ def _remote_repository_impl(ctx: AnalysisContext) -> list[Provider]:
         PackagePoolInfo(
             value = _declare_package_pool(
                 ctx,
+                arch = ctx.attrs._arch,
                 baseurl = baseurl,
                 box_locks = ctx.attrs.box_locks,
                 package_system = ctx.attrs.package_system,
@@ -250,6 +262,7 @@ def _remote_repository_impl(ctx: AnalysisContext) -> list[Provider]:
 def _declare_package_pool(
     ctx: AnalysisContext,
     *,
+    arch: str,
     baseurl: str,
     box_locks: list[Artifact],
     package_system: Dependency,
@@ -263,6 +276,7 @@ def _declare_package_pool(
     """
     return ctx.actions.dynamic_output_new(
         _materialize_package_pool(
+            arch = arch,
             baseurl = baseurl,
             box_locks = box_locks,
             id = ctx.label.name,
@@ -275,7 +289,7 @@ PackageRepositoryInfo = provider(
     doc = "A repository belonging to one native package system.",
     fields = {
         "baseurl": provider_field(str | None, default = None),
-        # Local declarations are materialized by a consuming package manager.
+        # None for a local repository, which the consumer of a package manager indexes in its own box.
         "dir": provider_field(Artifact | None, default = None),
         "package_system": provider_field(Dependency),
         # When the pinned snapshot was published, ISO 8601 in UTC; None for a rolling repository.
@@ -359,11 +373,13 @@ _REMOTE_REPOSITORY_ATTRS = {
         default = {},
         doc = "what else this repository's snapshot driver needs to name its metadata",
     ),
-    # Private: the configuration a repository is reached under says which architecture it serves.
     "_arch": attrs.string(default = architecture.configured(), doc = "the architecture to serve"),
 }
 
-remote_repository = rule(impl = _remote_repository_impl, attrs = _REMOTE_REPOSITORY_ATTRS)
+# A box lock, the box and an image reach a repository in configurations that also differ in other
+# constraints, such as the image's distribution. `architecture_transition` configures the repository for
+# its architecture alone, so all of them share one configured repository and download each file once.
+remote_repository = rule(impl = _remote_repository_impl, attrs = _REMOTE_REPOSITORY_ATTRS, cfg = platform.architecture_transition)
 
 LocalPackageInfo = provider(
     doc = "Built native packages and their native package system.",
@@ -386,12 +402,12 @@ def _local_repository_impl(ctx: AnalysisContext) -> list[Provider]:
     package_dirs = []
     for package in packages:
         info = package[LocalPackageInfo]
-        if info.package_system.label != context.package_system.label:
+        if info.package_system.label.raw_target() != context.package_system.label.raw_target():
             fail(
                 "local_repository: package {} uses package system {}, expected {}".format(
                     package.label,
-                    info.package_system.label,
-                    context.package_system.label,
+                    info.package_system.label.raw_target(),
+                    context.package_system.label.raw_target(),
                 ),
             )
         package_dirs.append(info.packages)
@@ -440,12 +456,14 @@ def _add_repository(
 ) -> None:
     repo = repository[PackageRepositoryInfo]
     rid = repository.label.name
-    if repo.package_system.label != package_system.label:
+    # A remote repository is configured for its architecture alone, so its package system is in a
+    # different configuration than the consumer's.
+    if repo.package_system.label.raw_target() != package_system.label.raw_target():
         fail(
             "repository '{}' uses package system {}, expected {}".format(
                 rid,
-                repo.package_system.label,
-                package_system.label,
+                repo.package_system.label.raw_target(),
+                package_system.label.raw_target(),
             ),
         )
     previous = by_id.get(rid)
@@ -582,26 +600,26 @@ def remote_repository_base(
         fail("remote_repository_base: {} are supplied by the neutral spec".format(reserved))
 
     # per-architecture specs/subtargets so that refresh-catalog can produce all locks from a single build
-    specs = {
-        architecture: ctx.actions.write_json(
-            "{}.snapshot.spec.json".format(architecture),
+    snapshot_specs = {
+        served_arch: ctx.actions.write_json(
+            "{}.snapshot.spec.json".format(served_arch),
             dict(
                 snapshot_spec,
-                arch = arch_spelling(architecture, system),
-                baseurl = expand_baseurl(baseurl, architecture, system),
+                arch = arch_spelling(served_arch, system),
+                baseurl = expand_baseurl(baseurl, served_arch, system),
                 id = rid,
             ),
             has_content_based_path = False,
         )
-        for architecture in architectures
+        for served_arch in architectures
     }
 
-    def snapshot(architecture: str) -> list[Provider]:
-        return [DefaultInfo(), RunInfo(args = cmd_args(system.snapshot[RunInfo], "--spec", specs[architecture]))]
+    def snapshot(served_arch: str) -> list[Provider]:
+        return [DefaultInfo(), RunInfo(args = cmd_args(system.snapshot[RunInfo], "--spec", snapshot_specs[served_arch]))]
 
-    sub_targets = {_snapshot_subtarget(architecture): snapshot(architecture) for architecture in specs}
-    sub_targets.update({_manifest_subtarget(architecture): [DefaultInfo(default_output = spec)] for architecture, spec in specs.items()})
-    sub_targets["manifest"] = [DefaultInfo(default_output = specs[arch])]
+    sub_targets = {_snapshot_subtarget(served_arch): snapshot(served_arch) for served_arch in snapshot_specs}
+    sub_targets.update({_manifest_subtarget(served_arch): [DefaultInfo(default_output = spec)] for served_arch, spec in snapshot_specs.items()})
+    sub_targets["manifest"] = [DefaultInfo(default_output = snapshot_specs[arch])]
     sub_targets["snapshot"] = snapshot(arch)
     return [
         DefaultInfo(default_output = repo_dir, sub_targets = sub_targets),
@@ -681,6 +699,7 @@ def declare_remote_repository(
         signing_key_files = glob([SIGNING_KEY_DIRECTORY + "/" + fingerprint + SIGNING_KEY_SUFFIX for fingerprint in signing_keys]),
         signing_keys = signing_keys,
         snapshot = architecture.select(locks),
+        target_compatible_with = distribution.serves(name, architectures),
         **kwargs,
     )
 
@@ -709,6 +728,7 @@ def _closure_name(canonical_name: str, checksum: str, suffix: str) -> str:
 def _select_package_artifacts_impl(
     actions: AnalysisActions,
     tx: ArtifactValue,
+    installed: ArtifactValue | None,
     output: OutputArtifact,
     local_packages: dict[str, list[Artifact]],
     name: str,
@@ -720,6 +740,11 @@ def _select_package_artifacts_impl(
     entries = tx.read_json()
     if type(entries) != type([]):
         fail("transaction is not a list (a frozen transaction still seeded `{}`?); resolve or remove it")
+
+    below = {}
+    for entry in installed.read_json() if installed != None else []:
+        if entry.get("source") in ("local", "repo"):
+            below[entry["pkg_checksum"]] = entry["package_id"]
 
     by_repo = {rid: pool.providers[PackagePoolValueInfo].packages for rid, pool in pools.items()}
     artifacts = {}
@@ -751,6 +776,9 @@ def _select_package_artifacts_impl(
             fail("transaction entry has invalid repo/package_id: {}".format(entry))
         if type(checksum) != type("") or len(checksum) != 64 or checksum != checksum.lower() or not _contains_only(checksum, "0123456789abcdef"):
             fail("transaction entry has invalid pkg_checksum: {}".format(entry))
+        # Skip if it's already in the layer below.
+        if below.pop(checksum, None) != None:
+            continue
         if source == "local":
             package_dirs = local_packages.get(rid)
             if package_dirs == None:
@@ -784,6 +812,15 @@ def _select_package_artifacts_impl(
         package = by_repo[rid][checksum]
         selected.setdefault(rid, {})[_closure_name(package.name, checksum, suffix)] = package.artifact
 
+    # Layering must be clean, otherwise the resolution is incompatible or the committed locks went out of sync.
+    if below:
+        fail(
+            "{}: the layer below has {} that the transaction does not. Either a lock is outdated (run refresh-catalog), or resolving both package lists together picked other packages (set layered=False)".format(
+                name,
+                ", ".join(sorted(below.values())),
+            ),
+        )
+
     for rid, packages in selected.items():
         if rid in verifiers:
             verified = verify_packages(actions, name, rid, verifiers[rid], packages)
@@ -795,6 +832,7 @@ def _select_package_artifacts_impl(
 _select_package_artifacts_action = dynamic_actions(
     impl = _select_package_artifacts_impl,
     attrs = {
+        "installed": dynattrs.option(dynattrs.artifact_value()),
         "local_packages": dynattrs.value(dict[str, list[Artifact]]),
         "name": dynattrs.value(str),
         "output": dynattrs.output(),
@@ -812,10 +850,14 @@ def select_package_artifacts(
     suffix: str,
     extra_packages: list[Artifact] = [],
     name: str = "install.closure",
+    installed: Artifact | None = None,
 ) -> Artifact:
     """Select each transaction package's artifact into a directory.
 
     For a repository configured with a verifier, the directory holds verified copies.
+
+    `installed` is the transaction the layers below this one were installed from. Its packages are
+    left out, and the transaction has to carry every one of them to avoid upgrades and removals.
     """
     output = ctx.actions.declare_output(name, dir = True)
     pools = {}
@@ -841,6 +883,7 @@ def select_package_artifacts(
     ctx.actions.dynamic_output_new(
         _select_package_artifacts_action(
             tx = tx,
+            installed = installed,
             output = output.as_output(),
             local_packages = local_packages,
             name = name,
@@ -850,3 +893,109 @@ def select_package_artifacts(
         )
     )
     return output
+
+def _materialize_local_repository_impl(ctx: AnalysisContext) -> list[Provider]:
+    system = ctx.attrs.package_system[PackageSystemInfo]
+    if system.index == None:
+        fail("package system {} indexes no local repositories".format(ctx.attrs.package_system.label))
+
+    # Every consumer of a promised artifact would have to assert a content-based path; keep the plain one.
+    repo = ctx.actions.declare_output("repo", dir = True, has_content_based_path = False)
+    index = cmd_args(
+        box_run(box = ctx.attrs.box[BoxInfo], exe = system.index),
+        specs.args(
+            ctx.actions,
+            "index.spec.json",
+            {
+                "out": repo.as_output(),
+                "packages": [],
+                "packages_dirs": ctx.attrs.package_dirs,
+            },
+        ),
+    )
+    ctx.actions.run(index, category = "repository_index")
+    return [DefaultInfo(default_output = repo)]
+
+_materialize_local_repository = anon_rule(
+    impl = _materialize_local_repository_impl,
+    attrs = {
+        "box": attrs.dep(providers = [BoxInfo]),
+        "package_dirs": attrs.list(attrs.source()),
+        "package_system": attrs.dep(providers = [PackageSystemInfo]),
+    },
+    artifact_promise_mappings = {
+        "repo": lambda p: p[DefaultInfo].default_outputs[0],
+    },
+)
+
+def materialize_local_repository(
+    ctx: AnalysisContext,
+    box: Dependency,
+    package_system: Dependency,
+    package_dirs: list[Artifact],
+) -> Artifact:
+    """Materialize local package directories in their consumer's execution context."""
+    return ctx.actions.anon_target(
+        _materialize_local_repository,
+        {
+            "box": box,
+            "name": "//local-repository:materialize",
+            "package_dirs": package_dirs,
+            "package_system": package_system,
+        },
+    ).artifact("repo")
+
+def check_repository(owner: str, repository: Dependency) -> None:
+    """Fail for a remote repository that no consumer could install from.
+
+    `owner` starts the failure message, such as `package_manager` or `box`.
+    """
+    if repository.get(LocalPackageRepositoryInfo) != None:
+        return
+    repo = repository[PackageRepositoryInfo]
+    rid = repository.label.name
+    if repo.dir == None:
+        fail("{}: repository '{}' has no directory".format(owner, rid))
+    if repo.baseurl == None:
+        fail("{}: repository '{}' has no base URL".format(owner, rid))
+    missing = [fingerprint for fingerprint, file in repo.signing_keys.items() if file == None]
+    if missing:
+        fail("{}: repository '{}': signing key(s) {} are not in the catalog yet; run refresh-catalog".format(owner, rid, missing))
+
+def configure_repository(
+    ctx: AnalysisContext,
+    repository: Dependency,
+    priority: int,
+    package_system: Dependency,
+    box: Dependency | BoxInfo | None,
+    keyrings: dict[str, Artifact],
+) -> ConfiguredPackageRepositoryInfo:
+    """Configure `repository` for a consumer that runs in `box`, which also verifies its packages.
+
+    With `box` None, nothing verifies the repository's packages. Only a box's resolve action and the
+    bootstrap of a root box pass None. A local repository is indexed in `box`, which has to be a dependency.
+    """
+    rid = repository.label.name
+    local = repository.get(LocalPackageRepositoryInfo)
+    if local != None:
+        if not isinstance(box, Dependency):
+            fail("repository '{}': a local repository is indexed in the box of its consumer".format(rid))
+        return ConfiguredPackageRepositoryInfo(
+            id = rid,
+            dependency = repository,
+            directory = materialize_local_repository(ctx, box, package_system, local.package_dirs),
+            priority = priority,
+        )
+    repo = repository[PackageRepositoryInfo]
+    verifier = None
+    if box != None:
+        verifier = repository_verifier(ctx, box, rid, repo.signing_keys, package_system, repo.dir, keyrings, repo.pinned_at)
+    return ConfiguredPackageRepositoryInfo(
+        id = rid,
+        dependency = repository,
+        directory = repo.dir,
+        priority = priority,
+        baseurl = repo.baseurl,
+        packages = repository[PackagePoolInfo].value,
+        verifier = verifier,
+    )

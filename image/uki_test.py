@@ -61,7 +61,52 @@ def _token(key: uki.Key, source: str = "provider:pkcs11", certificate: bool = Tr
 
 def _profiles(*ids: str, unsealed: str = "") -> list[uki.Profile]:
     """Profiles by id, `unsealed` naming the one that opts out of the expected-PCR policy."""
-    return [{"id": id, "title": id, "cmdline": [], "sign_expected_pcr": id != unsealed} for id in ids]
+    return [
+        {"id": id, "title": id, "cmdline": [], "sign_expected_pcr": id != unsealed, "fields": {}}
+        for id in ids
+    ]
+
+
+class TestProfileSection(unittest.TestCase):
+    def test_fields_follow_id_and_title(self) -> None:
+        # A profile with extra fields must write ID and TITLE first and then each field as
+        # its own KEY=VALUE line, in the order the profile declares them.
+        profile: uki.Profile = {
+            "id": "Profile2",
+            "title": "Profile Two",
+            "cmdline": [],
+            "sign_expected_pcr": True,
+            "fields": {"PCRLOCK": "yes", "TOFU": "test.tofu"},
+        }
+        self.assertEqual(
+            uki._profile_section(profile, {}),
+            "ID=Profile2\nTITLE=Profile Two\nPCRLOCK=yes\nTOFU=test.tofu\n",
+        )
+
+    def test_own_fields_override_shared_fields(self) -> None:
+        # A profile must be able to override a field that the UKI sets for every profile, for example
+        # to opt out of TOFU= with an empty token. Write a profile whose own TOFU= is empty, with a
+        # shared TOFU= and PCRLOCK=, and check that the section has a single, empty TOFU= line.
+        profile: uki.Profile = {
+            "id": "install",
+            "title": "Install",
+            "cmdline": [],
+            "sign_expected_pcr": True,
+            "fields": {"TOFU": ""},
+        }
+        self.assertEqual(
+            uki._profile_section(profile, {"TOFU": "com.example.os", "PCRLOCK": "yes"}),
+            "ID=install\nTITLE=Install\nTOFU=\nPCRLOCK=yes\n",
+        )
+
+    def test_base_profile_is_main(self) -> None:
+        # The base profile must have the id main, which ukify selects it by with --sign-profile, and no
+        # TITLE=. Build the section from the shared fields and check that ID=main comes first, followed
+        # by each field as its own KEY=VALUE line.
+        self.assertEqual(
+            uki._base_profile_section({"TOFU": "com.example.os", "PCRLOCK": "yes"}),
+            "ID=main\nTOFU=com.example.os\nPCRLOCK=yes\n",
+        )
 
 
 class TestSigningArguments(unittest.TestCase):
@@ -72,7 +117,7 @@ class TestSigningArguments(unittest.TestCase):
         self.assertEqual(uki._signing_arguments(SECURE_BOOT, None, [], OPTIONS), SECURE_BOOT_ARGUMENTS)
 
     def test_expected_pcr_alone(self) -> None:
-        """The driver keeps the roles separate; only uki.bzl insists on signing what it seals."""
+        """The driver accepts an expected-PCR key alone. declare_uki() requires a Secure Boot key with it."""
         self.assertEqual(uki._signing_arguments(None, PCR, [], OPTIONS), PCR_ARGUMENTS)
 
     def test_the_initrd_policy_rides_along_with_the_expected_pcr_key(self) -> None:

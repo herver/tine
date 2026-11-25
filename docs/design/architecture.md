@@ -50,21 +50,41 @@ tine//package/            package-system-neutral providers and installation flow
 tine//package_system/     one directory per package system: its repository, resolver, installer,
                           extractor, and optional indexer and builder
 tine//box/                box bootstrap and sandbox command construction
-tine//rootfs/             bind/overlay mounting and stored-delta translation
-tine//image/              layers, boot artifacts, composition macros, and VM runners
-tine//image_format/       archive, directory, and raw-disk output rules and drivers
+tine//rootfs/             bind and overlay mounts, snapshot capture and restore, and Buck-storable names
+tine//image/              layers, compositions, archive, directory, disk and boot artifact rules and
+                          drivers, and VM runners
+tine//uapi16/             UAPI.16 manifests and the snapshot stores built on them
+tine//archive/            tar writer, cpio reader and writer
 tine//git/                pinned Git repositories with local checkout overrides
 tine//cargo/              vendored crate trees and offline Rust source builds
 tine//go/                 go.sum-verified module fetches and offline Go source builds
-tine//catalog/            default repositories, locks, releases, package managers, and buildroots
+tine//http/               prebuilt tools that Buck downloads and verifies
+catalog//                 default repositories, locks, releases, package managers, and buildroots
+settings//                default settings for tine's own targets, such as the tools box's extra packages
 tine//tools/              pinned development and catalog-refresh commands, and the boxes they run in
 tine//bin/                the command a checkout builds through, which fetches and configures Buck2
 ```
 
-The default `tine//catalog` package owns its release selection, mirrors, box choice, repository additions,
-and policy overrides. Projects can instead declare their own catalog package with tine's reusable family
-macros or low-level rules. The project's `//buildroots` package maps importer-generated
-`//buildroots/<family>:<release>` names to catalog targets.
+The default catalog is the `catalog` cell, in the `catalog/` directory of the tine checkout. It declares
+the release selection, mirrors, box choice, repository additions, and policy overrides. A project replaces
+it by declaring its own `catalog` cell, built with tine's family macros or low-level rules. Every
+`catalog//` label then resolves to the project's catalog, including the labels in tine's own targets, and
+the build does not use tine's catalog. Buck reads cells only from the root cell's configuration. `bin/tine`
+therefore writes the fallback cell into the project's generated `.buckconfig`, unless `tine.toml` declares
+the cell. The project's `//buildroots` package maps importer-generated `//buildroots/<family>:<release>`
+names to catalog targets.
+
+tine loads `releases.bzl` from every catalog. It lists the releases that images build for.
+
+The `settings` cell configures tine's own targets. Its `settings.bzl` defines one `SETTINGS` struct. The
+`tools_box` field of `SETTINGS` lists the packages and local repositories that the tools box installs in
+addition to its own. tine's `settings` cell is the `settings/` directory of the tine checkout. A project
+replaces it like the catalog, by declaring its own `settings` cell, and `bin/tine` writes the fallback cell
+in the same way. A project can therefore change the tools box without replacing tine's catalog.
+
+Starlark has no optional `load()`, and Buck fails on a missing file, symbol or struct field. tine therefore
+loads only `SETTINGS` from the cell and reads every field with `getattr()` and a default. A project's
+`settings.bzl` therefore only sets the fields it changes. It keeps loading when tine reads a new field.
 
 Catalog targets use `<family>.<release>[.<component>].<role>` names. A rolling channel occupies the release
 segment like any other release. Singular `.repository` targets own remotes, plural `.repositories` targets
@@ -91,13 +111,33 @@ the alias and forwarding what it does not declare:
 toolchain_alias(name = "python_bootstrap", actual = "tine//:python_bootstrap", visibility = ["PUBLIC"])
 ```
 
+`python.test` runs unittest discovery over `srcs` and the Python libraries in `deps`. It uses the
+bootstrap interpreter by default. Pass `box` to run with a box's interpreter and packages. Each suite
+also declares a type check against the selected environment. `env` can contain artifact references such
+as `$(location //target)`, and applies to both `buck test` and `buck run`.
+
+### Binding the glibc loader
+
+The pinned Python names the glibc loader at the standard path of its platform, such as
+`/lib64/ld-linux-x86-64.so.2`. NixOS keeps its loader in the Nix store and has a stub at the standard path.
+When no loader runs from the standard path, tine reads the loader of its own `python3` from `/proc/self/maps`
+and binds it over the standard path, in a user and mount namespace of its own. tine enters that namespace
+before it starts the cache shim, so the shim and every Buck action inherit the bind. The actions keep their
+command lines and their cache keys. The shim runs for longer than the command, so this namespace contains
+no project mounts. tine creates the mounts of `tine mount` in a nested namespace afterwards. A re-executed
+or nested tine finds a working loader at the standard path and binds nothing.
+
+A loader that runs from the standard path stays in place, even when the `python3` of tine uses another one.
+A `python3` from Nix on another distribution uses the loader of Nix, and the programs of the distribution
+need the loader of the distribution.
+
 ### Building with out-of-tree checkouts
 
 A cell root must be project-relative, so Buck cannot point a cell directly at an external directory.
 `tine mount` records local overrides in `.buck/tine-mounts.toml`, mapping project-relative targets to
 absolute source directories. Targets are cell roots or local-checkout slots declared by `git_fetch()`.
 They cannot overlap or cover `.buck/` or `.buckconfig.d/`: nested mounts would depend on application
-order, and those directories hold the mount table and private configuration. Invalid declarations stop
+order, and those directories hold the mount table and configuration layers. Invalid declarations stop
 the command rather than silently falling back to the checked-in directory.
 
 For example, `tine mount` can make `/work/lib` appear at `vendor/lib` inside a project. tine sets up the
@@ -110,62 +150,27 @@ the command, rules, and Buck2 pin come from the same checkout. After creating mo
 re-executes: a mount may have replaced the wrapper at the same path. A configured cell without
 `bin/tine` is an error, not a reason to keep running another checkout's wrapper.
 
-#### Matching clients and daemons
+#### Carrying the mount table
 
-A build needs a daemon with the right mounts, but it should not be stuck with an old copy of every
-project setting. The Buck client sends build requests to a background process, the daemon. The daemon
-keeps the mounts it started with. Changing a mount declaration does not change that daemon's mounts.
+Every `tine buck` command runs Buck's daemon as a thread of its own process, with `--no-buckd`. The
+daemon starts inside the namespace the command just created and dies with it, so a command always builds
+with the mounts it declared, and no daemon survives to serve a later command an old copy of any setting.
 
-tine gives each set of mounts a label, called the mount digest, using the `[buck2] daemon_buster` setting.
-The Buck client reads that setting from its config files. If it starts a daemon, it passes the label to
-that daemon in its startup arguments. The daemon keeps that label and reports it to clients; it does not
-reread the config to update it. Each later client reads its own config and compares its label with the
-daemon's saved label before reusing the daemon.
+What remains to carry is the mount table itself. A nested Buck inside a run target inherits the
+namespace, and it must use the mounts as they are rather than reread declarations that another command
+may have changed since. tine records the mounted project paths and the saved Git metadata locations in
+the `TINE_MOUNTS` environment variable. The variable travels by process inheritance, exactly like
+membership in the namespace itself, so it reaches precisely the processes that are in the namespace it
+describes, and dies with them. A value that does not decode is an error, not a reason to quietly build
+the namespace again: the holder is already mounted, and remounting would reread declarations that the
+holding command deliberately froze.
 
-Previously, tine put that label in a private copy of `.buckconfig`. This also hid later edits to ordinary
-settings. For example, if the copy said `build.threads = 4` and the project changed it to `8`, processes
-using that copy would still read `4`. Only the mount information needs to be private, not the whole
-project config.
-
-Putting the label in a shared file would introduce a different problem. Suppose two commands overlap,
-with no daemon running yet:
-
-1. Command A mounts `/work/lib-old` at `vendor/lib`, then pauses before starting its Buck client. Call
-   the label for these mounts "old".
-2. The mount declaration changes to `/work/lib-new`. Command B prepares those mounts and writes their
-   "new" label to the shared config, but has not started its Buck client yet.
-3. A's Buck client starts first. It reads "new" from the shared config and passes that label to a new
-   daemon. The daemon saves "new", but inherits A's mounts, which still point at `/work/lib-old`.
-4. B's Buck client reads "new" from the shared config and compares it with the label reported by the
-   daemon. Both say "new", so B's client reuses that daemon and builds against `/work/lib-old` by mistake.
-
-There is no mismatch for either client to detect. Killing mismatched daemons cannot help when the daemon
-has already been given the wrong label. The build can succeed while using the wrong checkout.
-
-Keep the label and the list of mounted project paths in a small private file,
-`.buckconfig.d/tine-mounts/config`. Each command sees its own version of this file: A sees "old" and B
-sees "new", even though the filename is the same. A private in-memory mount (`tmpfs`) provides that
-separation. The Buck client reads this file before deciding whether to reuse a daemon, and passes the
-label along if it starts a new one. The ordinary `.buckconfig` and `.buckconfig.local` files stay shared
-rather than being frozen with the mounts. They still follow the refresh rules described under
-[Shared configuration and nested commands](#shared-configuration-and-nested-commands).
-
-The root-cell config layers are read in order: `.buckconfig.d/`, `.buckconfig`, then `.buckconfig.local`.
-tine rejects project-owned `[buck2] daemon_buster` and `[tine] dev` while mounts are declared so that a
-higher-precedence setting cannot replace the private label or mounted-path list.
-
-#### Identifying the mounted directory
-
-The label must describe the directory that was actually mounted. For example, after mounting `/work/lib`
-at `vendor/lib`, someone could move `/work/lib` to `/work/lib-retired` and put a new checkout at
-`/work/lib`. The existing mount still points to the original directory. Looking at `/work/lib` now would
-describe the replacement instead. Calculate the label after mounting, using the directory reached
-through `vendor/lib`. The digest includes the target path, source path, and mounted directory's inode.
-It omits the device number because btrfs can assign a new one each time a subvolume is mounted.
-
-Re-executing inside an existing mount namespace preserves both the namespace and its saved list of
+Re-executing inside an existing mount namespace preserves both the namespace and its recorded list of
 mounted paths. tine does not reread declarations that another command may already have changed. Git
-ignores are read through the mounted paths too, so they describe the checkout the build will use.
+ignores are read through the mounted paths too, so they describe the checkout the build will use. The
+ordinary `.buckconfig` and `.buckconfig.local` files stay shared rather than being frozen with the
+mounts. They still follow the refresh rules described under
+[Shared configuration and nested commands](#shared-configuration-and-nested-commands).
 
 #### Git metadata in mounted checkouts
 
@@ -174,11 +179,10 @@ example, `/work/main/lib/.git` might contain `gitdir: ../.git/modules/lib`, refe
 `/work/main/.git/modules/lib`. After mounting that checkout at `vendor/lib`, the same pointer would look
 under `vendor/.git/modules/lib` instead.
 
-Before mounting, tine resolves each gitfile with `git rev-parse --absolute-git-dir` and saves the result
-under `[tine] gitdirs` in `.buckconfig.d/tine-mounts/config`, as a JSON map from mount targets to absolute
-metadata paths. Both relative and absolute gitfile pointers are recorded. Ordinary `.git` directories
-remain accessible through the bind mount and need no saved path. Neither directories nor gitfiles are
-rewritten.
+Before mounting, tine resolves each gitfile with `git rev-parse --absolute-git-dir` and records the
+result in the `TINE_MOUNTS` variable, as a map from mount targets to absolute metadata paths. Both
+relative and absolute gitfile pointers are recorded. Ordinary `.git` directories remain accessible
+through the bind mount and need no saved path. Neither directories nor gitfiles are rewritten.
 
 Ignore queries run from the mounted checkout with `--git-dir=<saved path>` and `--work-tree=.`. The
 explicit worktree matters because a submodule's `core.worktree` can still name its original source path.
@@ -186,10 +190,9 @@ If that path now holds a replacement checkout, following it would read the wrong
 Git both paths keeps the query on the mounted tree while retaining the saved metadata's `info/exclude`
 rules and tracked-file index, so tracked files are not mistaken for ignored build output.
 
-During configuration refresh, tine reads the map once from the project's private config and passes it
-to both the project and tine-cell ignore queries, keyed by mounted checkout paths. With no mounts, it
-skips this read. A mounted tine checkout's own private config is unrelated to this invocation and must
-not supply this map; malformed Git-directory data there must not break the build.
+During configuration refresh, tine reads the map once from the variable and passes it to both the
+project and tine-cell ignore queries, keyed by mounted checkout paths. With no mounts, it skips this
+read.
 
 #### Lock scope
 
@@ -201,10 +204,6 @@ for the query.
 A build can read either the old or new table, but cannot see a partly written one. Replacing a source
 directory does not have to go through `tine mount`, so locking mount-table edits cannot prevent the
 source-replacement case above.
-
-The Buck client can still replace a daemon when the labels really do differ, interrupting its connected
-clients as usual. Replacement does not remove `buck-out`; the decision to retain one output directory
-is explained under [Use bind mounts for out-of-tree content](#use-bind-mounts-for-out-of-tree-content).
 
 #### Shared configuration and nested commands
 
@@ -223,16 +222,23 @@ in native Buck configuration.
 When the tine cell is the project root itself, it is a standalone checkout. Its `.buckconfig` is source
 configuration and is not regenerated; put Buck overrides directly in that file rather than in TOML.
 
-The `.buckconfig.local` update only replaces tine's generated block, which contains project ignores and
-Git-derived image version components. Text outside that block is preserved.
+The `.buckconfig.local` update only replaces tine's generated block, which contains project ignores,
+Git-derived image version components and, while mounts are declared, the dev targets. Text outside that
+block is preserved.
 Configured ignores are merged with VCS metadata exclusions and Git ignores; a project-owned
 `[project] ignore` in `.buckconfig.local` is rejected because it would replace the generated list.
+`[tine] dev` lists the project paths that `project.is_dev()` builds in dev mode. The block writes the
+project's own entries followed by every mounted target, so a mount selects dev mode without configuration.
+Without mounts the block leaves the key out. While mounts are declared, a `[tine] dev` in `.buckconfig.local`
+is rejected. The block comes first in that file, and a later entry would replace the merged value. A tool
+that runs Buck directly under a build reads the same file and sees the same dev targets. A `-c` flag on the
+outer command would not reach such a tool.
 The version components live under `[tine]` as `version-base`, `version-count`, `version-height`,
 `version-commit`, and, for uncommitted work, `version-dirty`. Each image renders those components against
 its own label budget; see "Image versioning" in [images.md](../user/images.md).
 
-Generated settings go into a file rather than command-line flags because the daemon's file watcher
-reads its ignores from configuration files at startup, without command-line overrides. A file also
+Generated settings go into a file rather than command-line flags because Buck reads project ignores
+from configuration files at startup, without command-line overrides. A file also
 avoids the 128 KiB limit on a single argument, and `buck2 complete` accepts no configuration flags.
 Target completion and `tine completion` select the configured wrapper without refreshing shared
 configuration. Target completion uses the selected checkout's cached Buck2 without downloading. tine
@@ -242,9 +248,37 @@ The selected tine checkout pins Buck2 in `tine.lock.json`. Projects can override
 `[buck2]` table of `tine.toml` or `tine.local.toml`, with per-platform fields under
 `[buck2.platforms.<platform>]`.
 
-tine exports the pinned binary's path as `BUCK2_BINARY`. A nested Buck command still selects the
-configured wrapper, but inherits the current mounts and skips refreshing shared configuration
-underneath the build that started it.
+tine exports the pinned binary's path as `BUCK2_BINARY`. A tool running under a build never invokes the
+`tine` wrapper, but directly calls the exported binary (`util.buck2_argv()`), inherits the current
+mounts, and runs against the shared configuration the invoking command already wrote.
+
+### Project source trees
+
+A directory source cannot include a subdirectory that has a `BUCK` file of its own:
+
+    Directory `` of package `tine//project/fixture` may not cover any subpackages, but includes subpackage `sub`.
+
+`project.source_tree()` collects the files of a project the way `prelude/utils/source_listing_impl.bzl`
+does. `project.source_listing()` declares a `source_tree_listing` target in every `BUCK` file. The target
+lists the files of its package and depends on the `source_tree_listing` target of each direct subpackage.
+A build of the tree gets the project path of its package, with the listed files as hidden inputs, and
+reads the directory in place. A copy would get new timestamps whenever an edit makes Buck copy the tree
+again, and a dev build would then recompile everything after every edit.
+
+The list leaves out a few files that the build still sees:
+
+- `glob()` matches a name that starts with a dot only with a pattern component such as `.*`. The listing
+  has patterns for up to four such names in a path relative to the `BUCK` file, and leaves out a file with
+  more.
+- A cell that tine adds below the project root has its own packages, and the listing does not include
+  them.
+- The listing of the root package leaves out `.buckconfig.local`. tine writes the mounts and the address of
+  the cache into it, and as an input it would give a build different cache keys on different machines.
+
+A build of a tree at the project root sees an empty `buck-out`. The sandbox puts the upper and work
+directories of the overlay of the tree in the scratch directory of the action, which is in `buck-out`.
+overlayfs fails a lookup of them through the overlay with `ELOOP`. `source_overlay()` in `rootfs.py`
+therefore mounts a tmpfs over `buck-out` in the overlay.
 
 ### Component model
 
@@ -257,13 +291,12 @@ PackageSystemInfo (one package system's drivers)
         │                           ├── RepositoryUniverseInfo
         │                           │          │
         └───────────────────────────┴── OsReleaseInfo
-                                               ├── box transaction ── BoxInfo ──┬── package build
-                                               │                                ├── image tooling
+                                               ├── box transaction ── BoxInfo ──┬── image tooling
                                                │                                │
-                                               └────────────────────────────────┴── PackageManagerInfo
-                                                                              ├── image installation
-                                                                              └── BuildrootInfo
-                                                                                     └── package build
+                                               │                                ├── image installation
+                                               └── PackageManagerInfo ──────────┤
+                                                                                └── BuildrootInfo
+                                                                                       └── package build
 ```
 
 The providers have deliberately narrow roles:
@@ -273,52 +306,56 @@ The providers have deliberately narrow roles:
   paths that database occupies in an installed root, the file suffix a selected package is named with,
   and whether its planner reuses prebuilt repository metadata. The builder and the indexer are
   optional, and a system whose repository metadata is already what its resolver reads declines the
-  cache instead of leaving it on. A package build declared against a manager whose system has no
-  builder is refused by name, and so is a local repository of a system with no indexer.
+  cache instead of leaving it on. A package build declared against a buildroot of another package
+  system is refused by name, and so is a local repository of a system with no indexer.
 - `PackageRepositoryInfo` represents one repository and binds it to a package system. Its target name is
   the repository ID; remote declarations also expose their pinned directory and base URL. Priority is
   configuration policy, not an intrinsic repository property. A repository is not inherently owned by an
   OS release.
 - `LocalPackageRepositoryInfo` identifies a repository assembled from package artifacts in the build graph.
-  It carries package directories, not the box that produced them; a consuming package manager generates
-  its repository metadata with its own box.
+  It lists package directories, not the box that produced them; a consumer generates its repository
+  metadata with its own box.
 - `RepositoryUniverseInfo` defines one homogeneous solve universe: required repositories, named optional
   groups, and groups enabled by default. Selection preserves declaration order, de-duplicates identical
   targets, and rejects conflicting repository IDs.
 - `OsReleaseInfo` associates named native package sets with one repository universe and supplies the base
   of a box. Its target label carries the release identity.
-- `PackageManagerInfo` is an immutable solve environment. Each ordered `ConfiguredPackageRepositoryInfo`
-  record carries the repository ID, materialized directory, effective priority, base URL, and optional
-  declaration dependency. The dependency is analysis-only and is absent for an inline repository made from
-  package-build inputs. The manager also carries reusable solver caches, chooses a box, and carries its
-  release's package sets. A derived manager inherits this state and can add repositories without repeating
-  or rematerializing inherited release policy.
+- `PackageManagerInfo` is an immutable solve environment without a box. It lists its repositories in
+  order with their effective priorities, and names its package system and its release's package sets. A
+  consumer, such as an image or a buildroot, configures the repositories for the box it runs in. Each
+  `ConfiguredPackageRepositoryInfo` record then contains the repository ID, materialized directory,
+  effective priority, base URL, verifier and optional declaration dependency. A derived manager
+  inherits the repositories and can add repositories without repeating inherited release policy.
 - `LocalPackageUniverseInfo` describes a universe of locally built packages together with the imported
   runtime Requires/Provides metadata needed to select an install request's closure among them.
-- `BuildrootInfo` materializes the shared base root from explicit packages or a release package set.
-- `BoxInfo` contains a runnable root filesystem and the sandbox used to enter it. Its target label
-  establishes provenance; the box may serve compatible package managers for other releases.
+- `BuildrootInfo` materializes the shared base root from explicit packages or a release package set,
+  and names the box that installed it. A package build on the root runs in that box.
+- `BoxInfo` contains a runnable root filesystem as a stack of layers, and the sandbox used to enter it.
+  Its target label establishes provenance.
 
-Solver caches are anonymous targets keyed by resolver box, package system, configured repository,
-architecture, and execution platform. Matching boxes and package managers therefore consume one shared
-cache artifact, while distinct solver contexts remain isolated.
+Solver caches, local repository indexes and the keyrings that images and buildroots verify with are anonymous
+targets. Each is keyed by its box and package system, and by its inputs: a solver cache by its repository and
+architecture, an index by its package directories, and a keyring by its keys and the time they are checked
+at. Consumers that run in the same box therefore share one artifact, while distinct solver contexts remain
+isolated.
 
 This split is visible in the default catalog. Several releases of one family are separate OS releases whose
-package managers solve against their own repositories while sharing one box, and a release may model
+package managers solve against their own repositories, and a release may model
 some of its repositories as required, some as a default group, and some as an optional group a package
 manager enables. A family macro declares that whole standard target bundle and its package sets while
 accepting overrides for mirrors, repositories, priorities, and package policy. Buildroots resolve the
 release's `buildroot` package set rather than duplicating native package names in the buildroot
 declaration.
 
-An initial image normally fixes one package manager for the lifetime of the logical image and derives its
-box from that manager. Every derived image and terminal output inherits both. Box-only images are also
-supported, but cannot install native packages. A package target names a buildroot because its shared base
-root, not OS identity alone, is its relevant input.
+An initial image normally fixes one package manager for the lifetime of the logical image, and every derived
+image and terminal output inherits it. An initial image runs in the tools box, as "Box bootstrap" describes,
+and a derived image runs in the box of its parent. An image without a package manager cannot install native
+packages. A package target names a buildroot because its shared base root, not OS identity alone, is its
+relevant input.
 
 ### Catalog pinning and refresh
 
-Normal builds do not resolve against live network repositories. The catalog contains one required and two
+Normal builds do not resolve against live network repositories. The catalog contains one required and three
 optional generated forms:
 
 - `snapshot/repo/<name>.<architecture>.json` pins one repository's build metadata for one of the
@@ -339,16 +376,21 @@ optional generated forms:
   catalog's BUCK names the key by fingerprint, which is what a reviewer checks against the distribution's
   published one, together with the URL to fetch it from. `refresh-catalog` fetches a missing key file
   once and never updates it: a key is immutable by fingerprint, and whether the file is the declared key
-  is checked by the build with the package system's own tools, not by the refresh.
+  is checked by the build with the package system's own tools, not by the refresh;
+- `snapshot/go/<name>.json` pins one Go release for every minor version from Go 1.21 on. It contains the
+  URL, sha256 and size of each release's archive per architecture, as go.dev's release list publishes them.
+  `go.releases` reads the file, so its declaration names no release. Go keeps publishing patch releases of
+  an older minor version after a newer minor version is out, so `--advance` moves each minor version to its
+  newest patch release.
 
 A box with a resolver box and no committed transaction resolves through that predecessor as a normal
 cacheable build action. The generated transaction is an input to the existing dynamic package selectors,
 so the box builds in one invocation without mutating the source tree. Its package selection changes only
 when its authored policy, resolver box, or pinned repository inputs change.
 
-`tine buck run tine//tools:refresh-catalog` refreshes the default `tine//catalog` package in several
-phases. Pass another catalog package after `--`, for example
-`tine buck run tine//tools:refresh-catalog -- my_project//catalog`:
+`tine buck run tine//tools:refresh-catalog` refreshes the `catalog//` cell in several
+phases. Pass another package of repositories and boxes after `--`, for example
+`tine buck run tine//tools:refresh-catalog -- my_project//boxes`:
 
 0. With `--advance`, advance every repository pinned to a mirror that publishes snapshots, by rewriting
    the pin in the declaration. A remote repository rule owns its own pin arguments and carries them as metadata under a
@@ -367,7 +409,11 @@ phases. Pass another catalog package after `--`, for example
 2. Run every remote repository's `[snapshot.<architecture>]` sub-target on the host, once per
    architecture its mirror serves. The snapshot driver downloads and verifies repository metadata, drops
    unused streams, validates package locations, and writes deterministic, pure snapshot JSON. It does not
-   carry packages forward from an earlier snapshot. It only reads metadata, so any host runs it.
+   carry packages forward from an earlier snapshot. It only reads metadata, so any host runs it. Every
+   `go.releases` target's `[snapshot]` sub-target runs in the same phase, unless `--box` selects boxes
+   without `--go`. It snapshots the releases in the committed snapshot, and with `--advance` the newest
+   patch release of every minor version from Go 1.21 on instead. `--go` alone refreshes only the
+   `go.releases` targets, so their advance needs no repository advance.
 3. Run the selected boxes' `<box>.lock.<architecture>` targets against the freshly pinned repository trees
    and atomically replace their optional frozen transactions. The target box's release, repository
    selection, package list, and architecture define the solve. A lock target carries its architecture as
@@ -424,7 +470,7 @@ the generated transaction. Refreshing the
 catalog is optional for that box and freezes the generated result at the conventional lock path.
 
 The refresh convention keeps repository and box declarations plus their generated data in the active
-catalog's root Buck package, with generated data grouped under `snapshot/{repo,box,key}/`. This makes
+catalog's root Buck package, with generated data grouped under `snapshot/{repo,box,key,go}/`. This makes
 target-name-derived paths and the package-local optional `snapshot/box/*.<architecture>.json` retention
 inputs agree, the latter narrowed to the architecture being built for.
 
@@ -452,15 +498,14 @@ input package directory. They are projected directly from the producing target r
 second pool.
 
 A repository that declares signing keys verifies package signatures after fetching them. The repository
-cannot verify them itself, because that takes a box and the box a release names is built from the
-release's own repositories; so the package manager or the box rule declares the verification with the box
-it has: one keyring per set of declared key files (validated against the committed fingerprints), shared by
-the repositories declaring that set, or the key files themselves for a system whose verify program reads
-them as they are, and the selector then verifies what a transaction selects from that
+cannot verify them itself, because that takes a box and the box a release names is built from the release's
+own repositories; so the image, buildroot or box rule that installs the packages declares the verification
+with the box it runs in: one keyring per set of declared key files (validated against the committed
+fingerprints), shared by the repositories declaring that set, or the key files themselves for a system whose
+verify program reads them as they are, and the selector then verifies what a transaction selects from that
 repository in one action, publishing the closure's copies of those packages. One action per closure and
-repository, as the overhead of launching the sandbox and `rpmverify` per package is unbearably high. A
-derived manager inherits the verifier. The unverified pool is only being used by the repository
-configuration code.
+repository, as the overhead of launching the sandbox and `rpmverify` per package is unbearably high. The
+unverified pool is only being used by the repository configuration code.
 
 Why repository ownership matters:
 
@@ -470,19 +515,49 @@ Why repository ownership matters:
 
 ### Box bootstrap
 
-A box is a reproducible execution environment built from one base OS release. It supplies its package
-system's own resolver, installer and indexer, Python, core utilities, sandbox dependencies, and currently
-the image-building tools; a VM runner takes its box explicitly, so only a box asked for one carries
-that stack. The base release identifies where this userspace came from, not the only release it may
-operate on.
+A box is a reproducible execution environment built from one base OS release. A family macro declares the
+root box of each release. `<family>.<release>.box` contains the package system's own resolver, installer and
+indexer, Python, core utilities and sandbox dependencies, and it resolves every other box of the release.
+`tine//distribution:tools.box` adds the image-building tools, the VM stack and the PKCS#11 client, from one
+list that selects per family where names differ. One declaration serves every release. The tools box takes
+the distribution of the target that depends on it, and selects the release of that distribution from
+`catalog//:releases.bzl`. It adds its packages to the root box of that release. A dependency without a
+distribution, such as an `exec_dep`, gets the tools box of the catalog's default release. An image runs in
+the tools box, so it builds with the tools of its own release. A package manager names no box, and an image
+runs the plan and install of its package manager in the tools box as well. The tools box resolves during the
+build, so a new tool leaves the root box and its lock alone. `SETTINGS.tools_box` adds packages and local
+repositories to the tools box. The base release identifies where this userspace came from, not the only
+release it may operate on.
 
-A box runs on the build host, so it is an execution dependency: a rule takes it with `attrs.exec_dep`, a
-command line with `$(location_exec)`. Buck configures those for the execution
-platform (tine has just one) rather than for the consumer's target. A target named on the command line is
-configured for the target platform instead, which would be a second build of the same box. To avoid that,
-`box.new` declares the box under a hidden name that is compatible with the execution configuration only,
-and the public name as an alias reaching it through an execution dependency, so `buck build`, `buck run`
-and ordinary dependencies all arrive at the same box.
+A buildroot runs in the root box of its release. rpmbuild and the package manager run chrooted in the
+buildroot, so a buildroot action only needs Python and the package system outside of it. A buildroot doesn't
+depend on the tools box, so the tools box can contain packages that the project builds.
+
+A box runs on the build host. An image, a buildroot, a VM runner, a test and the AMI of a disk take their box
+as an ordinary dependency, so that the box takes their distribution. A box whose release follows the
+distribution, such as the tools box or `tine//tools:dev.box`, then builds from the release of the image.
+`box.sh_test` builds a test once per distribution of its package, or for the distribution that its `distro`
+names. A signing key takes the tools box as an execution dependency with `attrs.exec_dep`, because a key
+doesn't depend on a release. A command line takes a box with `$(location_exec)`. A target named on the
+command line or reached as an ordinary dependency is configured for the target platform instead. To build
+each box once, the box has an incoming transition to the host's platform plus the constraints of its
+release's distribution. Each distribution declares that platform beside it, as
+`<family>.<release>.distribution.host`. tine's execution platform registers no exec marker constraint, so the
+execution configuration is the same as the host platform's. `buck build`, `buck run`, execution dependencies
+and ordinary dependencies therefore all reach the same box. This assumes one execution platform, for the
+host's architecture. An execution platform for another architecture, such as a remote arm64 one, still gets
+the box built for the host. Its actions then run binaries for the wrong architecture.
+
+A box's packages can `select()` on the architecture, and `distribution.select()` on the release or its
+family. A box lock is configured for its own architecture and its release's
+distribution, so it resolves the packages for that architecture and distribution. A child box's lock reads
+its parent's packages from the parent's lock for the same architecture, because the parent box itself is
+configured for the host. A child box can therefore only keep a lock for an architecture that its parent keeps
+one for.
+
+A remote repository serves one architecture, and its content depends on nothing else. Its rule has an
+incoming transition to that architecture's target platform. A box lock, the box and an image of the same
+architecture therefore reach the same repository, and each file of the repository is downloaded once.
 
 A lockless box uses its resolver box, by default the one its release names, to produce its build
 transaction and perform the authoritative installation. Its target root therefore contains only the
@@ -500,16 +575,18 @@ two stages:
 
 1. The minimal extractor unpacks the same package closure into `stage1` without running scriptlets
    or creating a package database. An extractor reads the packages its repository serves, whatever
-   framing they carry, so the pool never has to derive a second form for the bootstrap.
+   framing they carry, so the pool never has to derive a second form for the bootstrap. Like a box layer,
+   `stage1` is written from a snapshot of the unpacked tree.
 2. The package-system installer runs from `stage1` and properly installs the closure into `stage2`,
-   including scriptlets and the package database. `stage2` becomes the reusable `BoxInfo` root.
+   including scriptlets and the package database. `stage2` becomes the reusable `BoxInfo` root, a single
+   layer.
 
 Before that second stage, `stage1` verifies the same closure against the release's declared signing keys,
 the way a predecessor box verifies a successor's packages. That catches an unsigned or tampered package
 and a wrong key, but the verifier itself was extracted unchecked, so a root box is not a root of trust
 independent of the packages it bootstraps from.
 
-Both catalog boxes are root boxes.
+The `<family>.<release>.box` of every release is a root box.
 
 A first lock is the one thing a root box cannot produce for itself, since resolving needs a box to
 resolve in. Pointing the new box's `resolver_box` at an existing box that can run the new package
@@ -527,26 +604,66 @@ unprivileged sandbox, and scriptlets.
 The host contract is intentionally small; its short list of requirements is documented in
 [images.md](../user/images.md).
 
+### Box layers
+
+If a box and its `parent` come from the same repositories, the box is a layer over its parent's
+layers, like with images. It enforces addition only, and fails if its lock would update or remove parent
+packages. One likely cause is an outdated committed lock, which needs a catalog refresh. The other is that
+resolving both package lists together picks other packages than the parent got, for example
+`libcurl` for a box that needs it where the parent has `libcurl-minimal`; `layered = False` then installs
+the box on its own.
+
+Each box layer except a `box.layer()` is a snapshot over the snapshots of its parent's layers, like an image
+layer. A child box installs over its restored parent snapshot, so it sees the modes, hardlinks and extended
+attributes that the package manager wrote. The installer also writes the objects that differ from the parent
+as a plain directory with only what Buck stores: directories, symlinks and regular files with mode 0755 or
+0644. The sandbox merges these directories per top-level directory with a read-only overlay. A plain
+directory cannot express a deletion, so the installer refuses a box layer that deletes from the layers below.
+Buck cannot store fifos, sockets or device nodes, so a box layer that contains one fails to build. No box
+installs over a `box.layer()`, such as the build box of a Cargo or Go build, so it keeps only the plain
+directory.
+
+If the parent has different repositories, the box only shares the parent's package list and is installed
+on its own. A child box also installs from the local repositories of its parent, so it
+still layers over that parent. Without them, the child box would resolve the parent's package names from
+the release's repositories.
+
+A local repository of a box is indexed in the resolver box at the priority that a package manager gives
+local repositories, so the solver picks its packages over the release's. A locally built package changes
+whenever its sources do, so a committed lock would go stale on every rebuild. A box with a local repository
+therefore resolves during the build and keeps no lock. A root box has no resolver box to index the
+repository in, so a root box can't have local repositories.
+
+`cargo.package()` and `go.package()` add their `buildroot_packages` to their box in a layer that an anonymous
+target builds. Buck keys an anonymous target on its attributes, the box and the sorted package list, so
+every target that adds the same packages to the same box shares one layer. The layer resolves during the
+build, because it has no target that a committed lock could belong to.
+
 ### Execution isolation and target roots
 
-All build actions run through `box.run()` and `box/sandbox.py`. The sandbox binds the box's
+All build actions run through `box.run()` and `box/sandbox.py`. The sandbox mounts the box's
 userspace read-only over an otherwise isolated namespace, supplies API and temporary filesystems, clears the
-host environment, disables network by default, and offers unprivileged fakeroot behavior
-(`--suppress-chown`, `--suppress-sync`, and `--become-root`).
+host environment, disables network by default, and gives build actions unprivileged fakeroot behavior. A
+build action runs as root, and its sync calls succeed without doing anything. When the sandbox maps only
+one user ID, for example when tine runs as an unprivileged user, the action's chown calls also succeed
+without doing anything.
 
 The project is mounted at `/tine/project` and the action runs there, rather than at the path it is checked
 out under. A checkout is then free to live anywhere, including under a directory the box populates
 itself such as `/var/lib`, and an absolute path that leaks into a build output is the same for every
-checkout. A chrooted operation is a second frame and mounts the project again, under the target root's
-`/run`, which apivfs covers with a tmpfs so the mount point is not captured into the image.
+checkout. The sandbox clones the project's mount tree before it creates its user namespace, so the kernel
+doesn't lock a mount below the project, such as a `tine mount`, and overlayfs accepts the project as a lower
+directory. Each chrooted `run` or `copy` mounts the project read-only under the target root's `/run` for
+the duration of that operation. Package scripts and remove globs cannot reach the project through that
+mount. apivfs covers `/run` with a tmpfs so the mount point is not captured into the image.
 
-The sandbox only creates the execution environment. Drivers own their target-root layout through
-`rootfs.rootfs()`:
+The sandbox only creates the execution environment. Drivers restore their target root from snapshots and
+bind it with `rootfs.rootfs()`:
 
-- a fresh install or image layer binds an output directory at `/buildroot`;
-- an incremental install or image layer mounts an ordered lower stack plus a persisted upper;
-- a package build mounts its buildroot stack with an ephemeral upper and binds action scratch at `/build`;
-- pack/disk operations merge a stack with an ephemeral upper so cleanup does not modify stored layers.
+- an install or image layer restores its lower snapshots into a temporary root, binds it at `/buildroot`
+  and captures the result as a new snapshot;
+- a package build restores its buildroot snapshots the same way and binds action scratch at `/build`;
+- terminal readers and disk operations restore their snapshots into a read-only temporary root.
 
 This division keeps one namespace boundary while letting each driver express the root it needs. Nesting a
 second sandbox inside a box would duplicate isolation, complicate mounts, and make remote execution
@@ -564,22 +681,25 @@ actions never use relaxed mode.
 Native package installation has three phases shared by buildroots and images:
 
 1. **Plan.** Run `PackageSystemInfo.plan` against each configured repository's materialized directory,
-   effective priority, and solver cache. Weak dependencies are disabled. Existing lower layers are mounted
-   read-only so installed packages can satisfy an incremental request.
+   effective priority, and solver cache. Weak dependencies are disabled. Existing lower snapshots are
+   restored into a temporary root so installed packages can satisfy an incremental request. A request lists
+   its packages in the analysis, or in JSON files that an earlier action writes, such as the BuildRequires
+   query of an rpm package. A request with no packages installs nothing, and its snapshot repeats the
+   manifest of the snapshot below it.
 2. **Select.** Use the resulting transaction to select package files from repository pools, verified after
    download if the repository declares signing keys, named with the package system's declared suffix so its
    installer finds them. A local repository is materialized by
-   an anonymous indexing target using the consuming package manager's box. The same path handles
+   an anonymous indexing target using the consumer's box. The same path handles
    package-build inputs and lets the solve choose between local and upstream packages.
    Extra packages arrive on two mutually exclusive paths: a package build passes its explicit
-   `buildroot_deps` outputs, while a package manager with attached `local_packages` computes the request's
-   runtime closure at analysis time from imported metadata and offers exactly the locally built packages
-   in it. Buildroots reject managers with local packages, because buildroot contents must come from the
-   explicit, cycle-checked self-hosting locks.
+   `buildroot_packages` outputs, while a package manager with attached `local_packages` computes the
+   request's runtime closure at analysis time from imported metadata and offers exactly the locally built
+   packages in it. Buildroots reject managers with local packages, because buildroot contents must come from
+   the explicit, cycle-checked self-hosting locks.
 3. **Install.** Run `PackageSystemInfo.install` over the exact package directory, whose file names carry
-   the package system's suffix. `install_packages()` owns a fresh root or incremental buildroot delta. An
-   image layer instead invokes the same installer against its already-mounted root so package and
-   filesystem operations have one output owner.
+   the package system's suffix. `install_packages()` writes a fresh root snapshot or an incremental
+   buildroot snapshot. An image layer instead invokes the same installer against its already-mounted root
+   so package and filesystem operations have one output owner.
 
 What a request looks like, rather than how one package system answers it, belongs to the neutral layer:
 `package/transaction.py` owns the transaction schema both planners write and Starlark reads back, and
@@ -588,15 +708,15 @@ left with its own transaction and nothing else. `package/repository.bzl` owns th
 rule (the repository's current route wins while it carries the content, a lock's transport is the
 fallback once it does not, and a size that disagrees is skew) is stated once for both.
 
-The package manager assigns default priorities when it configures repositories: local repositories use 50
-and remote repositories use 99, with target-specific overrides applied by `package.manager()`. A planner
+The package manager assigns its repositories their default priorities: local repositories use 50 and remote
+repositories use 99, with target-specific overrides applied by `package.manager()`. A planner
 action carries its repositories as `{id, directory, priority, baseurl}` objects in its spec.
 `encode_repositories()` projects them from `ConfiguredPackageRepositoryInfo`; the record's `dependency` is
 deliberately stripped because Buck dependencies are analysis-only and not JSON-serializable. `plan.py`
 reads each object into its `Repository` named tuple. The directory selects the pinned local repository
 metadata, while the base URL records the transport for remote packages selected into a transaction.
 
-Package-specific `buildroot_deps` use the same representation. Their ordered package directories are
+Package-specific `buildroot_packages` use the same representation. Their ordered package directories are
 materialized as an anonymous repository with ID `extra`, local priority, no base URL, and no declaration
 dependency. Transaction selection maps its local locations directly back to the producing package outputs.
 
@@ -607,14 +727,14 @@ base.
 
 After installation, the installer parks the package database and scrubs the package-manager and ldconfig
 bookkeeping that would otherwise make identical roots differ; what parking takes is each package system's
-own business. The action that owns the root then captures names and overlay metadata into Buck-storable
-form. A fresh root receives the `uninitialized` machine-id marker systemd initializes on first boot;
-incremental installs preserve any existing machine ID.
+own business. The action that owns the root then captures it as a snapshot. A fresh root receives the
+`uninitialized` machine-id marker systemd initializes on first boot; incremental installs preserve any
+existing machine ID.
 
 `LocalPackageInfo` intentionally does not carry the producer's box. `local_repository` checks that its
-packages use one native package system and remains a box-independent declaration. The consuming package
-manager materializes deterministic repository metadata with its own box; anonymous materializations with
-the same box, package system, and ordered package directories share one action.
+packages use one native package system and remains a box-independent declaration. An image or a buildroot
+that installs from it materializes deterministic repository metadata with the box it runs in; anonymous
+materializations with the same box, package system, and ordered package directories share one action.
 
 ### The RPM package system
 
@@ -645,10 +765,10 @@ scrubs libdnf5 and ldconfig bookkeeping. Documentation and language filtering ar
 `_install_langs`. A locally built package keeps the `<directory>/<file>` location convention that maps it
 back to the input directory it came from.
 
-The default catalog declares Fedora 44 and Rawhide as separate OS releases whose package managers solve
-against their own repositories while sharing `fedora.rawhide.box`, both from the one `fedora_release()`
-bundle. It offers no CentOS Stream release: nothing publishes immutable CentOS Stream composes, so its
-pinned metadata stops resolving the moment the mirror advances, which is not a repository this can pin.
+The default catalog declares Fedora Rawhide from the `fedora.release()` bundle, which also declares the
+release's root box. Another Fedora release gets a root box of its own. It offers no CentOS Stream release:
+nothing publishes immutable CentOS Stream composes, so its pinned metadata stops resolving the moment the
+mirror advances, which is not a repository this can pin.
 
 #### Import and build flow
 
@@ -656,7 +776,7 @@ The OS.git repository's `packages/` tree contains imported source-package metada
 files. The importer emits data; the Starlark in `package_system/rpm/generated.bzl` validates that data and
 creates targets.
 
-For each branch, `rpm_branch()` currently:
+For each branch, `rpm.branch()`:
 
 - combines common and the configured architecture's BuildRequires;
 - indexes each imported binary package's name, `Provides`, and file paths;
@@ -674,31 +794,53 @@ and runtime package closures are still delegated to libdnf5 at buildroot-plan ti
 An `rpm_package` action:
 
 1. obtains the shared base root from its `BuildrootInfo`;
-2. resolves and installs its BuildRequires delta, preferring RPMs from `buildroot_deps` over upstream;
-3. overlays the base and delta, stages its spec/sources in Buck action scratch, and runs `rpmbuild -ba`,
-   or `rpmbuild -bb --build-in-place` on a volatile overlay of a populated source tree. The project is
-   read-only until the driver exits;
+2. resolves its BuildRequires and installs them as a snapshot over the base root, preferring RPMs from
+   `buildroot_packages` over upstream. A hand-written `rpm.package()` also installs the BuildRequires of the
+   spec that it builds. Analysis cannot read the contents of a spec, so an action stages the spec as the
+   build does and runs `rpmbuild -bd` with the build's options in the base root and that snapshot. It writes
+   the BuildRequires that are missing, and a second snapshot installs them. That snapshot repeats the
+   manifest below it when the spec needs nothing more;
+3. restores the snapshots into a temporary root, stages its spec/sources in Buck action scratch, and runs
+   `rpmbuild -ba`, or `rpmbuild -bb --build-in-place` on a volatile overlay of a populated source tree.
+   overlayfs shows the directory under a mount rather than the mounted tree, so each directory mount below
+   the source tree, such as a `tine mount`, gets a volatile overlay of its own. The driver discovers
+   directory mounts with `listmount()` and `statmount()` using unique mount IDs. With `in_place_packaging`, a
+   separate action first fetches the dist-git commit that the tree pins, and the build takes its spec and
+   Source/Patch files from that commit. The project is read-only until the driver exits;
 4. freezes `%autorelease`, `_buildhost`, the dist tag, and the per-package source date epoch;
 5. collects binary RPMs and the source RPM into one output directory, carrying its package-system identity
    in `LocalPackageInfo`;
-6. exposes each declared binary subpackage as a Buck sub-target and checks that declared outputs exist.
+6. exposes each declared binary subpackage as a Buck sub-target and checks that declared outputs exist. With
+   pinned packaging, it prints the subpackages that differ from the declared ones instead of failing,
+   because the pinned spec can declare other subpackages than the imported metadata.
 
 The build currently uses `--nocheck`. Automatically generated debuginfo/debugsource RPMs are retained in the
 directory output but are tolerated rather than exposed as declared sub-targets. Successful build scratch is
 discarded; failed scratch remains available for diagnosis.
 
+A hand-written `rpm.package()` can name the distribution of its buildroot's release with `distro`. The
+target is then incompatible with an architecture that the release does not serve. An imported package
+names none, and gets no per-release aliases either.
+
 #### Limitations
 
 - The imported self-host dependency graph is inferred from stored BuildRequires/Provides/file metadata; it
-  does not run RPM's dynamic BuildRequires protocol.
+  does not run RPM's dynamic BuildRequires protocol. The BuildRequires query runs `%generate_buildrequires`
+  only when the base root and the declared BuildRequires snapshot contain every static BuildRequires, and
+  runs it once.
+- An imported package installs only its recorded BuildRequires, also for a spec from a checkout or a pin.
+  `rpm.branch()` derives `buildroot_packages` from them, and Buck cannot add a target dependency that an
+  action output discovers. A queried BuildRequires on a package of the branch would install it from
+  upstream.
 - Build cycles fall back to upstream RPMs for ordinary intra-SCC edges, so the package set is not a fully
   self-hosted fixed point.
 - Builds use `--nocheck`; package test policy is not implemented.
 - Debuginfo/debugsource outputs are not first-class declared sub-targets.
 - The bootstrap extractor supports the pinned v4/newc payload form, not RPM v6 metadata.
 
-Entry points: `package_system/rpm/{rules,catalog,generated}.bzl` and
-`package_system/rpm/{snapshot,plan,install,pkgdb,createrepo,build,extract,rpmfile}.py`.
+Entry points: `package_system/rpm/{rules,catalog,generated}.bzl`,
+`package_system/rpm/{snapshot,plan,install,pkgdb,createrepo,build,extract,rpmfile}.py` and
+`package_system/rpm/{rpmbuild,buildrequires}.py`.
 
 ### The alpm package system
 
@@ -766,8 +908,6 @@ explicitly, because alpm rebases its system hook directory onto the target root 
 administrator's, and the box's must not run against the image. Afterwards the driver replaces the
 wall-clock `%INSTALLDATE%` alpm records with the assembly epoch, and drops ldconfig's auxiliary
 cache, the sync databases and the transaction log.
-It rewrites only the entries that actually change: alpm keeps one file per package, so rewriting an
-entry a lower layer already parked would copy that whole database up into this layer's delta.
 
 The database stays at Arch's own `/var/lib/pacman`, since Arch has no usr-merged location for it. The
 package-database artifact is read from the assembled layer stack rather than from a terminal output,
@@ -777,7 +917,7 @@ file list.
 
 alpm needs no prebuilt solver cache. A repository database is the metadata pacman reads directly,
 not a format to convert in advance, so this package system declares `solver_cache = False` and no
-cache target is created for it. There is no package builder either: `arch_release()` defines a
+cache target is created for it. There is no package builder either: `arch.release()` defines a
 `buildroot` package set, but no `makepkg` rule consumes it, so `PackageSystemInfo.build` is unset.
 
 `arch.rolling.box` is the one that made this second package system prove itself. It is a root box:
@@ -854,7 +994,8 @@ Both pinned files keep the path the mirror serves them under, such as `dists/tes
 `dists/testing/main/binary-amd64/Packages.xz`. That layout is what the signed `InRelease` is held to:
 
 - It has to say it is the suite its directory names, by `Suite` or `Codename`. An archive signs every
-  suite with the same keys, so the signature alone would accept the `InRelease` of another suite.
+  suite with the same keys, so the signature alone would accept the `InRelease` of another suite. The
+  only exception is a flat repository, where there is only one `InRelease` to verify anyway.
 - It has to state the index at the path the index sits at. Every index of a suite is signed, so
   matching the bytes alone would accept the index of another component.
 
@@ -922,14 +1063,12 @@ Entry points: `package_system/deb/rules.bzl`, `package_system/deb/{aptget,deb822
 ### Rust source builds
 
 A consuming repository can build a Rust project it has checked out instead of packaging it first.
-`cargo.package()` takes the project's files as ordinary sources, so a clone needs nothing added to it, and
-the single `Cargo.lock` among them identifies the workspace root. An action discovers that lock after the
-sources have been built, so the checkout may itself be a fetched directory artifact; a dynamic action
-then reads the resolved lock and declares what the build fetches. A project that resolves nothing carries
-no lock, because cargo will not create one under `--locked` and there would be nothing in it to pin; its
-sole manifest identifies the root, `--locked` is dropped, and the empty vendored source plus the unshared
-network are what keep the build from resolving anything. The declaration contract is in
-[cargo.md](../user/cargo.md).
+`cargo.package()` takes the project directory as input, so a clone of a project that commits its lock needs
+nothing added to it, and the single `Cargo.lock` in it identifies the workspace root. An action discovers
+that lock after the sources have been built, so the checkout may itself be a fetched directory artifact; a
+dynamic action then reads the resolved lock and declares what the build fetches. A project without
+dependencies commits a lock too: the build passes `--locked`, and cargo cannot write a missing lock into the
+read-only sources. The declaration contract is in [cargo.md](../user/cargo.md).
 
 A lock entry's `checksum` is the SHA-256 of its crates.io tarball and `static.crates.io` serves that
 tarball under a URL derived from name and version, so each registry crate becomes one hash-verified
@@ -944,7 +1083,7 @@ A build is then two actions:
 
 1. `cargo_vendor` unpacks the registry crates into `vendor/<name>-<version>/` with the
    `.cargo-checksum.json` cargo expects. Git dependencies never enter this tree.
-2. `cargo_build` runs cargo in the consumer's box with the network unshared, against the vendored tree
+2. `cargo_build` runs cargo in the package's box with the network unshared, against the vendored tree
    and the fetched repositories: each git source is replaced by its repository, served over git's local
    `file://` transport, so cargo takes its own checkout and resolves each crate inside its workspace,
    inheritance and sibling path dependencies included, and it insists on finding the locked commit in the
@@ -964,40 +1103,57 @@ The unit of caching is the project: any change to its sources reruns one action 
 Splitting that into one action per crate would require the crate dependency graph rather than just the
 lock, and is deliberately not attempted.
 
-The rerun is made cheap instead for a `tine mount`ed checkout, for a developer working on that part:
-Cargo's build directory then is a declared output that buck is told not to clear before rerunning the
-action, so cargo finds the previous one and recompiles only what changed, exactly as it does in a working
-copy. Nothing else survives: the source tree is copied afresh from the action's inputs on every run, with
-the modification times cargo compares them by. A build that finds no previous directory remains the
-reference, which is what CI and any `buck2 clean` produce.
+The rerun is made cheap instead for a `tine mount`ed checkout, for a developer working on that part: Cargo's
+build directory then is a declared output that buck is told not to clear before rerunning the action, so
+cargo finds the previous one and recompiles only what changed, exactly as it does in a working copy. Buck
+keeps the binaries directory of a mounted build as well as its build directory, so the driver replaces the
+binaries of the last run instead of adding to them. A build that finds no previous directory remains the
+reference, which is what CI and any `buck clean` produce.
 
-Fetched or committed sources declare no build directory and build in scratch space: there is no edit
-cycle to speed up, and the large intermediate build artifacts are not uploaded to a shared cache.
+Every cargo build, mounted or not, runs in the action's scratch space, which the sandbox mounts at
+`/var/tmp`, outside the project. The driver bind-mounts the source tree at a fixed path there. Cargo searches
+every parent directory of the workspace for configuration and for a workspace manifest, and none of those
+parents is in the consuming repository. The project is read-only while the driver runs, and so is the bind of
+the source tree. Cargo's documentation says that a build script should write only into `OUT_DIR`, because two
+builds that share a dependency can run its build script at the same time. A write into the sources therefore
+fails the build instead of being discarded on an overlay, as `rpm.package()` must. The project's sources and
+its vendored crates.io dependencies are read-only. Cargo checks a git dependency out into its home directory
+in the scratch space, which is writable. The declared output directories are mounted writable in the scratch
+space.
+
+Fetched or committed sources declare no build directory, and cargo keeps its build directory in scratch
+space: there is no edit cycle to speed up, and the large intermediate build artifacts are not uploaded to a
+shared cache.
 
 ### Go source builds
 
-`go.package()` gives a checked-out Go project the same treatment, sources in and declared binaries out.
-The project carries no build file pointing at its own root, so a `go_workspace` action finds the `go.mod`
-among the built sources and a dynamic action declares the two steps below from what it reports; as with
-`cargo.package()`, that is what lets the sources be a fetched directory artifact rather than a checkout.
-Only the two files those steps read are taken back out of the sources, so the fetch still reruns for a
-dependency bump alone. But the pinning is delegated rather than translated: A `go.sum` records `h1:`
-dirhashes over each module's contents, not the hash of any bytes a proxy serves, so there is nothing a
-hash-verified `download_file` could check a download against. Deriving byte hashes would mean a second,
-generated lock to keep refreshed. Instead go itself is the verifier, and the build is two actions so the
-network stays confined to the first:
+`go.package()` gives a checked-out Go project the same treatment, sources in and declared binaries out. The
+project carries no build file pointing at its own root, so a `go_workspace` action finds the `go.mod` among
+the built sources, or reads the `go.mod` in the directory that `module_root` names, and a dynamic action
+declares the two steps below from what it reports; as with `cargo.package()`, that is what lets the sources
+be a fetched directory artifact rather than a checkout. The fetch's inputs are the `go.mod`, the `go.sum`
+beside it, and the `go.mod` of each module that a `replace` directive points at a directory in the sources. A
+dependency bump reruns the fetch, and an edit to a Go source file does not. But the pinning is delegated
+rather than translated: A `go.sum` records `h1:` dirhashes over each module's contents, not the hash of any
+bytes a proxy serves, so there is nothing a hash-verified `download_file` could check a download against.
+Deriving byte hashes would mean a second, generated lock to keep refreshed. Instead go itself is the
+verifier, and the build is two actions so the network stays confined to the first:
 
-1. `go_fetch` is the online action: `go mod download` in the consumer's box with the network shared,
-   reading nothing but `go.mod` and `go.sum`, so editing sources never refetches. go checks a download
+1. `go_fetch` is the online action: `go mod download` in the package's box with the network shared, reading
+   only the fetch's inputs named above, so an edit to a Go source file never refetches. go checks a download
    against the committed `go.sum` where that pins it, and against the checksum database otherwise.
-   Downloading deliberately does not extend `go.sum`, so an unpinned module is fetched here and rejected
-   in the step below. The driver does reject a `go.sum` missing the module graph's `go.mod` hashes, which
-   is the one incompleteness that downloading repairs silently. The output is go's module cache.
+   Downloading deliberately does not extend `go.sum`, so an unpinned module is fetched here and rejected in
+   the step below. The driver does reject a `go.sum` missing the module graph's `go.mod` hashes, which is the
+   one incompleteness that downloading repairs silently. The output is go's module cache. The `go_workspace`
+   action finds the `replace` directives in the `go.mod` itself instead of running `go mod edit -json`,
+   because it runs on the host rather than in the box that provides go.
 2. `go_build` compiles offline. The `cache/download` half of a module cache is exactly the layout a
    module proxy serves, so the driver points `GOPROXY` at it as a `file://` URL and go re-extracts every
    module from it, verifying against `go.sum` a second time (the fetched artifact is never trusted
    implicitly). `-mod=readonly` makes a lock that no longer agrees with `go.mod` a failure rather than a
-   silent re-resolution, and `GOTOOLCHAIN=local` keeps the box's go the only toolchain.
+   silent re-resolution, and `GOTOOLCHAIN=local` keeps go from downloading another toolchain. The build
+   runs the box's go, the toolchain that `toolchain` names, or, for a `go.releases` toolchain, the release
+   that `go_workspace` picks from the project's nearest `.go-version`.
 
 The `packages` mapping selects the main packages to build and names their outputs. A checked-out project
 often carries commands an image does not install; building those would cost time and may require
@@ -1009,57 +1165,110 @@ links. syft catalogs these as `pkg:golang` components in the image SBOM. The dec
 [go.md](../user/go.md).
 
 A local `go build` inside the checkout leaves no build tree behind: go's cache lives outside it, so there
-is no `target/` equivalent for the glob and the daemon's watcher to exclude. It does drop the binary it
-built into the current directory, which the glob then picks up as a source, so a project is better built
-with `-o`.
+is no `target/` equivalent for Buck's ignores to exclude. It does drop the
+binary it built into the current directory, which then is a source like any other file there, so a
+project is better built with `-o`.
 
 The unit of caching is the project, not the package: one action per package would mean modelling the
 package graph and the toolchain here, which is what rules_go exists for, and go's own content-keyed build
 cache gets most of that back for none of it. That cache follows the same rule as cargo's build directory
 above, and keys on file contents, so a mounted project's rerun recompiles only what actually changed. The
-build runs on a volatile overlay of the sources, in a read-only project, with the declared outputs
-mounted beside it.
+build runs in the source tree itself, in a read-only project, with the declared outputs mounted beside it.
 
 The module cache is the one difference: `go_build` consumes it, so it is a declared output whatever the
 sources are. For a mount buck keeps it too, so a dependency bump downloads only what is missing; old
 module versions accumulate but are inert, since go takes only what `go.sum` names out of the proxy view.
-Otherwise buck clears it before the fetch, and what reaches the cache follows `go.mod` and `go.sum` alone.
+Otherwise buck clears it before the fetch, and the cache content depends only on the fetch's inputs.
+
+A `go.package()` that sets `test_packages` also compiles the tests of those packages in `go_build`, with
+`go test -c`, one test binary per package. The test binaries use go's build cache of the same action, so the
+project's packages compile once for the binaries and the tests. A test that does not compile fails the
+build. The test compile runs without vet, because a vet finding would fail the build too. `go.test()` runs
+each test binary under `buck test` in the package's box, in the package's directory, with the sources
+read-only. A pattern in `test_packages` that matches a package outside `src` fails the build, because that
+package's directory does not exist when the tests run.
 
 ### Filesystem layer representation
 
-Buck directory artifacts cannot faithfully store overlay whiteout devices, opaque-directory xattrs, or a
-backslash in a path component. tine stores filesystem deltas in a regular-file representation:
+An image-producing action writes a complete UAPI.16 snapshot before Buck publishes its outputs. Logical
+paths, inode types, modes, nanosecond modification times, user extended attributes, symlink targets and
+explicit hardlink groups are in the manifest. Regular-file contents are immutable SHA-256 blobs. Each store
+contains only blobs absent from its parents; the ordered store list remains an explicit input to every
+consumer. Content references use `blobs/<sha256>` in the combined store namespace, resolved in store order. A
+store with parents therefore needs its declared parent stores to resolve its references. The `[snapshot]`
+store of an image contains every blob that its manifest references. Every root object lists the `features` of
+the manifest, because the default features of UAPI.16 leave out modification times and extended attributes. A
+reader refuses a manifest whose root object does not list all of these features. The root object of a
+snapshot also contains the metadata of the root directory. The listing of a partition has a root object with
+only the media type and the features.
 
-- `.wh.<name>` represents a whiteout;
-- `.wh..wh..opq` represents an opaque directory;
-- `.esc.<percent-escaped-name>` represents a path component Buck cannot store.
+Equal bytes share storage without sharing an inode. Reproducible `inodeToken` counters identify explicit
+hardlink groups independently of content digests. A metadata-only change changes the manifest and therefore
+Buck's input digest. Capture reads the visible merged filesystem after scriptlets and authored operations;
+deletions disappear from the next snapshot, including native OverlayFS whiteouts, opaque directories and
+file/directory replacements. Logical names never become the file names of a snapshot store. Capture clamps
+modification times to the action's `SOURCE_DATE_EPOCH`, so the same install at another time writes the same
+manifest.
 
-`rootfs.capture()` translates a native overlay upper into this form after unmounting. Before a later mount,
-`rootfs.rootfs()` constructs sparse sidecar layers that translate the stored markers back to native
-overlayfs whiteouts/xattrs and thaw escaped names. Stored layers remain ordinary Buck artifacts and can
-therefore move through its CAS.
+Reconstruction first reflinks one blob into the temporary directory. If that works, it clones every file into
+a private root. Each independent file gets its own inode with shared data extents, and only declared hardlink
+groups share an inode. Metadata restoration and later writes leave cached blobs unchanged. A read-only root
+is a read-only bind mount of the private root. Reconstruction tests a clone instead of checking the
+filesystem type. Separate btrfs filesystems cannot reflink between each other, and other filesystems support
+reflinks too.
 
-Directory modes are made traversable so Buck can materialize/delete them, and Buck's artifact model does
-not preserve general ownership, capabilities, xattrs, or every mode bit. Authored tmpfiles snippets can
-recreate paths, modes, and xattrs during terminal assembly. Ownership is deliberately normalized to uid/gid
-zero rather than reconstructed. SELinux labels are not currently produced.
+Reconstruction creates one inode per file of the snapshot. Capture reads a regular file only when its device,
+inode number, ctime, modification time or size changed since reconstruction. Every write sets the ctime and
+the modification time. An action therefore costs time in proportion to the number of files in its root plus
+the size of the files it changes.
+
+If the blob cannot be reflinked, reconstruction uses OverlayFS. Each independent file has a sparse metadata
+inode in the normal lower layer and reads contents from the blob stores as data-only lower layers. Explicit
+hardlink groups start as private clones or copies in the upper, with aliases linked to that private inode.
+`index=off` would break a lower hardlink group on copy-up. Metadata restoration finishes before mounting.
+Directory times are restored after their contents, and symlink metadata is applied without following the
+link.
+
+On the overlay path, metadata changes and data writes copy independent files into the upper. `metacopy=off`
+copies file data even for chmod; the kernel attempts a reflink and falls back to a byte copy. An unprivileged
+mount cannot enable `redirect_dir`, so renaming an inherited directory fails with `EXDEV`
+on this path. It works in a private root, so a command that renames an inherited directory only builds on
+a filesystem with reflinks. A command that creates a hardlink to an inherited independent file can
+see different inode numbers for the source and alias even though writes affect both. Snapshot capture scans
+the visible tree and uses the upper inode to identify the actual hardlink group. The complete snapshot
+retains the group when the root is reconstructed or exported.
+
+Read-only overlays use only metadata inodes in the normal lower, with aliases linked for declared groups.
+Boot selection, UKI assembly, artifact extraction and SBOM scanning select between private reflinks and
+read-only overlays, and so does repart. Temporary roots are removed when the operation exits, including on
+failure. There is no persistent materialized-root cache.
+
+Box layers other than a `box.layer()` are snapshots too, but the sandbox mounts the plain directory that the
+installer writes from each snapshot. In that directory, `.esc.<percent-escaped-name>` encodes a name that
+Buck cannot store. Nothing decodes it, so a box shows the escaped name. A box layer can't delete files of the
+layers below it, because the directory has no whiteouts. Ordinary box startup does not parse image manifests
+or reconstruct image roots.
+
+Ownership remains uid/gid zero. Capture clears the setuid and setgid bits, because a set-id file owned by
+root would run as root even when its package installed it for another user or group. Capture clears the
+setgid bit of a directory too. The group of every directory is root, so on the booted image the bit would
+give every new file in the directory the root group. Every other mode stays as the package or operation set
+it. Security labels, capabilities and named ACL entries are unsupported.
 
 ### Selecting a distribution
 
 Which distribution an image is built from is a configuration, and the target carries it.
-`tine//distribution` owns one constraint setting; a catalog release declares one value of it beside its
-other role targets, as `<family>.<release>.distribution`. That single target answers both questions asked
-of a distribution: it is the key a `select()` branches on, and it is the incoming transition that puts the
-value in place. Nothing in this cell knows which distributions exist, because a consumer maps values to
-package managers itself:
+`tine//distribution` declares two constraint settings, `distribution` and `family`. A catalog release
+declares one value of the distribution setting beside its other role targets, as
+`<family>.<release>.distribution`, and that target also sets the value of its family. The target is the key a
+`select()` branches on, and it is the incoming transition that sets the two values. An image that names no
+package manager and no parent takes the package manager of its release from `distribution.package_manager()`,
+which selects among the package managers of the package's releases:
 
 ```Starlark
-package.manager(
-    name = "image.package-manager",
-    base = select({
-        "//catalog:<family>.<release>.distribution": "//catalog:<family>.<release>.package-manager",
-    }),
-)
+distribution.select({
+    "<family>.<release>": "catalog//:<family>.<release>.package-manager",
+})
 ```
 
 Every rule that declares a logical image accepts a `distro`. A target that names none is
@@ -1070,54 +1279,76 @@ target being built decides and everything under it follows: an image's `parent` 
 distribution of its own, it is whatever the leaf pulling it in is. One declaration therefore serves every
 distribution, and only the alias names are per-distribution.
 
-What varies between distributions stays where it belongs. A release names the packages a bootable system
-of its own family needs, so an image asks for the `bootable` package set rather than for concrete package
-names. Where a genuine difference remains, it is an ordinary select on the same constraint.
+A release serves a list of architectures, and Arch serves only x86_64. Its repositories and release resolve
+`target_compatible_with` to `select_incompatible()` for any other architecture. The release's boxes are built
+for the host, so its boxes are incompatible on a host of another architecture. On such a host, the release
+serves no architecture at all. Where a release serves no architecture, the transition leaves the distribution
+unset, and `compatibility()` makes every distributed target and alias incompatible. A build of `//...` then
+skips the Arch targets for arm64 and on an arm64 host. On such a host, no compatible target depends on an
+Arch box, so a whole-cell run is `//...` on every host.
 
-Nothing supplies a default. A target declared for no distribution in particular names none of them in
+What varies between distributions stays where it belongs. A release names the packages a bootable system of
+its own family needs, so an image asks for the `bootable` package set rather than for concrete package names.
+Where a genuine difference remains, `distribution.select()` keys it by family or by release. Every
+distribution also sets its value of the `tine//distribution:family` constraint, so a `fedora` key matches
+every Fedora release. Buck picks a release key such as `fedora.43` over the `fedora` key, because the
+configuration of the release's distribution contains the family constraint as well. `distribution.select()`
+turns the release key into `catalog//:fedora.43.distribution`. `distribution.new()` fails for a distribution
+outside the root package of the catalog cell, so every release's distribution has that label. A select
+never reads the names in a package's table. A key such as `fedora` therefore always means the family,
+whatever a package calls its distributions.
+
+The repository supplies no default. A target declared for no distribution in particular names none of them in
 its `select()`, and is `target_compatible_with` a value no platform carries wherever none was chosen,
 so a build that has chosen one resolves, `//...` skips the rest, and naming one directly fails as
 incompatible rather than quietly picking, reporting the missing choice by name. A default
-would decide which distribution actually gets built and leave the others to rot. A package declares
-that list once in its `PACKAGE` file and every image rule defaults to it, because the failure mode of
-repeating it per target is a target that forgets: being compatible while depending on something
-incompatible is an error rather than a skip.
+would decide which distribution actually gets built and leave the others to rot. If the catalog lists
+one release, no other release can go unbuilt. A package that takes its list from the catalog then builds
+every target for that release by its own name and declares no aliases. The list comes from
+`catalog//:releases.bzl`, or from a package's `PACKAGE` file where the package declares its own, and
+every image rule defaults to it. The failure mode of repeating it per target is a target that forgets:
+being compatible while depending on something incompatible is an error rather than a skip. Buck can't
+look up another package's targets while it loads a `BUCK` file, so the catalog lists its releases in a
+`.bzl` file that tine loads.
 
-This is deliberately not a buckconfig. A distribution is a property of the image, so it belongs in the
-declaration, where it is visible to `buck2 uquery`, can differ between two targets in one build, and does
-not reconfigure the world when it changes.
+The list of distributions is deliberately not a buckconfig. A distribution is a property of the image,
+so it belongs in the declaration, where it is visible to `buck2 uquery`, can differ between two targets in
+one build, and does not reconfigure the world when it changes. The `distribution` key of the `tine`
+buckconfig section only sets which entry of a package's table a target's own name builds. A developer
+who builds one distribution all day sets it in `.buckconfig.local`. The aliases build every distribution
+whether the key is set or not, so CI does not depend on it.
 
 ### Image construction
 
-The `image.layer` rule creates either an initial image from a package manager or box, or a derived image from
-`parent`. `image.ImageInfo` carries the package manager, its box, an ordered stack of filesystem deltas,
-deferred tmpfiles snippets, and the canonical lazy package-database and SBOM artifacts. A derived image
-inherits the construction configuration but declares fresh metadata for its completed stack, so one
-composition cannot silently switch package sources or tooling environments between stages. A box may
-be supplied directly for an initial image that never installs native packages.
+The `image.layer` rule creates either an initial image from a package manager, or a derived image from
+`parent`. `image.ImageInfo` carries the package manager, the box the image runs in, an ordered list of
+snapshot stores, and the canonical lazy package-database and SBOM artifacts. A derived image inherits the
+construction configuration but declares fresh metadata for its completed stack, so one composition cannot
+silently switch package sources or tooling environments between stages.
 
-Each `image.layer` call applies one ordered operation sequence in one action and persists exactly one overlay
-upper. A layer's `packages` and `package_sets` are rule attributes rather than operations: it installs them
-as one request before any operation runs, while `run`, `copy`, `mkdir`, `symlink`, and `remove` mutate the
-same root afterwards. A package set resolves its symbolic name through the image's package manager during
-analysis and joins the concrete names in the same request, deduplicated. Installation is a property of the
-layer rather than a position in it because a layer resolves one closure at analysis time over the stack below
-it: a second install could only ever be solved blind to what the first one added, so there is nothing an
-ordering could mean. Making it an attribute is also what lets operation sequences compose, since two lists
-that both need packages no longer collide, and what lets a sequence name a package set and extra packages
-together, which a set alone cannot express because its members are known only during analysis. Installing
-against the result of an earlier install is a second layer, which is where a closure resolved over that
-result becomes available. `copy` introduces a declared Buck artifact at an absolute image path, preserving
-its position relative to the other operations. `run` executes the image's own tools in a chroot by default;
-`chroot = False` instead executes box tooling with the image available at `/buildroot`. Its `env` argument
-overlays variables on the box or image environment for that command. Package installation and copying
-always run outside the chroot. The `image.layer()` declaration macro recursively flattens operation lists,
-allowing reusable helpers to return ordered groups of operations. Every rule that accepts operations is
-wrapped in a declaration macro that flattens them the same way, so a helper returning an ordered group
-works identically in `image.layer()` and in a composition; the underlying attribute stays a flat, typed
-list so Buck can track every embedded source dependency. An `image.install()` target carries `packages`
-beside its operations, so a reusable target declares what it needs and `image.install_from()` folds that
-into the installing layer's own request.
+Each `image.layer` call applies one ordered operation sequence in one action and persists one complete
+snapshot with its new blobs. A layer's `packages` and `package_sets` are rule attributes rather than
+operations: it installs them as one request before any operation runs, while `run`, `copy`, `mkdir`,
+`symlink`, and `remove` mutate the same root afterwards. A package set resolves its symbolic name through the
+image's package manager during analysis and joins the concrete names in the same request, deduplicated.
+Installation is a property of the layer rather than a position in it because a layer resolves one closure at
+analysis time over the stack below it: a second install could only ever be solved blind to what the first one
+added, so there is nothing an ordering could mean. Making it an attribute is also what lets operation
+sequences compose, since two lists that both need packages no longer collide, and what lets a sequence name a
+package set and extra packages together, which a set alone cannot express because its members are known only
+during analysis. Installing against the result of an earlier install is a second layer, which is where a
+closure resolved over that result becomes available. `copy` introduces a declared Buck artifact at an
+absolute image path, preserving its position relative to the other operations. `run` executes the image's own
+tools in a chroot by default; `chroot = False` instead executes box tooling with the image available at
+`/buildroot`. Its `env` argument overlays variables on the box or image environment for that command. Package
+installation runs outside the chroot. `copy`, `merge_os_release`, `mkdir`, `symlink`, `write_file` and
+`remove` run inside it, so ordinary absolute symlinks resolve relative to the image. The `image.layer()`
+declaration macro recursively flattens operation lists, allowing reusable helpers to return ordered groups of
+operations. Every rule that accepts operations is wrapped in a declaration macro that flattens them the same
+way, so a helper returning an ordered group works identically in `image.layer()` and in a composition; the
+underlying attribute stays a flat, typed list so Buck can track every embedded source dependency. An
+`image.install()` target carries `packages` beside its operations, so a reusable target declares what it
+needs and `image.ops.install_from()` folds that into the installing layer's own request.
 
 `install_langs` narrows the install to the translated files of the named languages, and `install_docs`
 drops documentation while keeping licenses. Neither ever enters the tree, so the package database records
@@ -1126,7 +1357,7 @@ sequence, not the logical image's lifetime: an initrd needs neither, while the r
 want both. Each package system implements them in its own driver. A sequence that installs nothing ignores
 both, so a composition can forward them to a layer whose operations happen to skip installation.
 
-An `image.layer` exposes its newly persisted delta, the full stack and canonical metadata through
+An `image.layer` exposes its snapshot, parent stores and canonical metadata through
 `image.ImageInfo`, and the same metadata through lazy `[manifest]`, `[pkgdb]` and `[sbom]` subtargets.
 `image.ImageSbomInfo` gives typed consumers only the two SBOM formats. Declaring a logical image declares
 its metadata with it, because they are intrinsic metadata facets of every logical image: an
@@ -1141,9 +1372,11 @@ an archive or disk format.
 Package installation and image tooling remain separate concerns:
 
 - the bootstrap `package_manager` determines what native packages can be resolved;
-- that manager's `box` supplies every layer driver and terminal image tool;
+- the image's box supplies every layer driver and terminal image tool, and runs the manager's resolver and
+  installer;
 - `local_repository` declares compatible package outputs and infers their package system from
-  `LocalPackageInfo`; a consuming package manager materializes its repository metadata with its own box;
+  `LocalPackageInfo`; an image or a buildroot that installs from it materializes its repository metadata
+  with the box it runs in;
 - a derived package manager adds such repositories to a base manager's configured selection;
 - a manager's `local_packages` instead selects locally built packages per install by runtime closure.
 
@@ -1160,15 +1393,18 @@ locally backed in later solves. Unlike a static `local_repository`, only the pac
 pulls in are built; the universe target itself never forces a package build.
 
 Logical images and terminal outputs are separate rule families. Terminal rules merge the stack only when
-needed. The catalog of terminal rules (`image.archive`, `image.directory`, `image.uki`, `image.repart`,
-`image.bootable`, `image.sysext`, and `image.vm`) and the `image.rootfs_archive`, `image.sysext_image`, and
-`image.bootable_disk` composition rules are documented in [images.md](../user/images.md). All of them,
-with the operation helpers and conventional partition layouts, are members of the `image` struct exported
-from `tine//image:defs.bzl`; that facade is the public API, and the modules behind it are implementation
-structure. Every public facade a consuming project loads from exports one namespace struct the same way:
-`box`, `cargo`, `go`, `git`, `package`, `package_system/rpm`, `package_system/deb`,
-`package_system/pacman`, `distribution`, and `tests`. Every rule resolves its drivers through one
-`ImageToolsInfo` bundle at `tine//image:tools` instead of a private attribute per driver.
+needed. The catalog of terminal rules (`image.snapshot`, `image.uki`, `image.bootable`,
+and `image.vm`) and the `image.archive`, `image.sysext`, `image.confext`, `image.extension`,
+`image.portable`, and `image.disk` composition rules are documented in
+[images.md](../user/images.md). All of them, with the operation helpers and conventional partition layouts,
+are members of the `image` struct exported from `tine//image:defs.bzl`; that facade is the public API, and
+the modules behind it are implementation structure. Every public facade a consuming project loads from
+exports one namespace struct the same way: `box`, `cargo`, `go`, `git`, `package`, `package_system/rpm`,
+`package_system/deb`, `package_system/pacman`, `distribution`, `http`, `platform`, `python`, and `tests`.
+Internal callers can use a public facade when the import does not create a load cycle. A facade's
+dependencies import the implementation helpers directly.
+Every rule resolves its drivers through one `ImageToolsInfo` bundle at `tine//image:tools` instead of a private
+attribute per driver.
 
 The package database and SBOMs are supply-chain outputs read from the assembled image, never shipped in it.
 Declaring any logical image declares both lazy facets, so compositions inherit them rather than repeating a
@@ -1176,58 +1412,58 @@ metadata step. Each package system captures its database in its native shape. SB
 tree additionally catches
 packages no package manager knows about, such as Go modules bundled into ELF binaries.
 
-Terminal rules leave the package database and other package state intact — except `image.sysext`, which
-drops the database from the paths the image's package system declares: a merged extension must not shadow
-the host's. Image cleanup is an explicit, configurable layer so output formats do not silently alter image
-contents. Every terminal driver receives the same ordered layer stack and deferred tmpfiles snippets. It
-applies those snippets with
-`systemd-tmpfiles --root` before reading or emitting image content; a missing tool is an error whenever
-finalization is needed. The directives
-run against a disposable overlay upper and can create paths or restore modes and xattrs. Image-shipped
-tmpfiles configuration is not applied implicitly; enabling it will be an explicit output option once its
-single-UID/GID behavior is defined. Ownership and named ACL entries are deliberately unsupported: all
-archive entries use uid/gid zero.
+Terminal rules leave the package database and other package state intact. An extension drops the database
+from the paths the image's package system declares, because a merged extension must not replace the host's. A
+terminal output that strips the database or other paths, and an extension, read a layer of their own on top
+of the image. That layer removes the paths, writes the extension-release files and removes the os-release of
+an extension. Every terminal driver receives the ordered layer stack of its image and changes nothing in it.
+The system partitions of a bootable disk leave out the contents of the directories that its ESP copies. The
+disk driver removes them from the snapshot that repart copies and that the partition listings describe.
+Image-shipped tmpfiles configuration is not applied at build time; enabling it will be an explicit output
+option once its single-UID/GID behavior is defined. Ownership and named ACL entries are deliberately
+unsupported: all archive entries use uid/gid zero.
 
-Tar uses deterministic PAX archives and stores Linux xattrs using `SCHILY.xattr.*` headers. The newc cpio
-format has no general xattr representation. Tar/cpio entries are ordered and mtimes are clamped to the fixed
-assembly epoch. The cpio reader/writer aligns regular-file payloads and uses `copy_file_range` when possible
-so large archives can share extents on reflink-capable filesystems. `compression = "zstd"` compresses the
-finished archive in the same action, so the uncompressed form never becomes a Buck artifact; zstd's
-multi-threaded output is byte-identical to its single-threaded output, so this stays reproducible. The initrd
-uses it, while the kernel-modules cpio that `uki.py` appends stays raw because the distribution already
-ships each module compressed; the kernel unpacks the concatenation as independently compressed segments.
+Tar uses deterministic PAX archives and stores user xattrs using `SCHILY.xattr.user.*` headers. The newc cpio
+format has no general xattr representation. Tar/cpio entries are ordered and encode explicit hardlinks
+independently of content identity. Linux's initramfs unpacker [recreates hardlinked symlinks as separate
+symlinks][initramfs-symlinks]. Mtimes are clamped to the fixed assembly epoch. Tar retains nanoseconds; newc
+cpio uses whole seconds. The cpio reader/writer aligns regular-file payloads and uses `copy_file_range` when
+possible so large archives can share extents on reflink-capable filesystems. `compression = "zstd"`
+compresses the finished archive in the same action, so the uncompressed form never becomes a Buck artifact;
+zstd's multi-threaded output is byte-identical to its single-threaded output, so this stays reproducible. The
+initrd uses it, while the kernel-modules cpio that `uki.py` appends stays raw because the distribution
+already ships each module compressed; the kernel unpacks the concatenation as independently compressed
+segments.
 
-`image.repart` deliberately distinguishes `definitions` from `partitions`. Definitions describe new
-partitions to populate directly from `image.ImageInfo`: repart mounts the delta stack with a
-disposable overlay upper instead of first copying a directory artifact. Partition inputs are
-`image.RepartInfo` outputs from an earlier split call; their blocks are copied into the new disk with
-their resolved type and UUID preserved.
-Calls emit a disk by default. `split = True` additionally exposes each newly defined partition with
-normalized metadata alongside its block artifact; `disk = False` makes such a call partition-only. No
-partial disk is passed between
-actions. The partition artifacts are portable, so `image.RepartInfo` carries no box: repart uses the
-destination `image.ImageInfo.box`, while standalone conversion and VM rules select a box explicitly.
-`image.directory` is an independent terminal view and is never an input to repart.
+`declare_ddi()` in `ddi.bzl` deliberately distinguishes `definitions` from `partitions`. Definitions describe
+new partitions to populate directly from `image.ImageInfo`: repart reads a temporary root reconstructed
+from the snapshot and blobs. Partition inputs are `image.DdiInfo` outputs
+from an earlier split call; their blocks are copied into the new disk with their resolved type and UUID
+preserved. Calls emit a disk by default. `split = True` additionally exposes each newly defined partition
+with normalized metadata alongside its block artifact; `disk = False` makes such a call partition-only. No
+partial disk is passed between actions. The partition artifacts are portable, so `image.DdiInfo` carries no
+box: repart and the format conversions use the destination `image.ImageInfo.box`, and `image.vm` uses the
+tools box of the image's release. `image.snapshot` is an independent terminal view and is never an input to
+repart.
 
-Partition layouts are always explicit inputs; neither `image.repart` nor `image.bootable_disk` chooses one
+Partition layouts are always explicit inputs; `image.disk` doesn't choose one
 implicitly. The reusable conventional layouts are listed in [images.md](../user/images.md).
 
-Partition labels may contain `{image_id}` and `{version}` placeholders. `image.format_partition_labels()`
-renders them — `image.bootable_disk()` calls it with its own image identity, raw `image.repart()` users
-call it themselves, and unrendered placeholders fail the build. The usr-verity layouts carry such labels
+Partition labels may contain `{image_id}` and `{version}` placeholders. `image.disk()` renders them from its
+own image identity, and unrendered placeholders fail the build. The usr-verity layouts carry such labels
 to produce the `<id>_<version>[_verity[_sig]]` names that systemd-sysupdate A/B slot matching expects.
 Rendered labels pass through `image.partition()` again, so GPT's 36-character label limit is enforced on the
 final value.
 
 Verity data, hash, and optional signature partitions are produced together in the split action. The root or
-usr hash is an artifact because its value is known only after execution. `image.RepartInfo.root_hash` carries
+usr hash is an artifact because its value is known only after execution. `image.DdiInfo.root_hash` carries
 an optional `image.RootHashInfo`, allowing `image.uki` to consume the hash without another top-level
 provider. One split call may produce at most one such hash. This artifact boundary also ensures the final
 disk contains exactly the partition bytes whose hash was embedded in the UKI. The hash is also available
-as the split target's `roothash` subtarget. Signature partitions require an explicitly declared key and
+as the disk's `roothash` subtarget. Signature partitions require an explicitly declared key and
 certificate.
 
-`image.bootable_disk()` composes:
+A bootable `image.disk()` composes:
 
 ```text
 base initrd package image (zstd cpio)
@@ -1264,18 +1500,16 @@ never means restating what it already does, and `install_docs` and `install_lang
 image wants, since documentation and translations only cost an initrd boot memory. It generates before it
 prunes, so the hardware database it ships is compiled from the sources it then drops. The rule archives the
 image into the cpio itself, at the `compression` it declares, and returns both as `image.InitrdInfo`
-alongside the image's own providers. That cpio omits the package database from the paths the image's
-package system declares: nothing in an initrd resolves a dependency or verifies a package, and the kernel
-unpacks the whole cpio into tmpfs, so shipping it would only cost boot memory. The `[manifest]`, `[pkgdb]`
-and `[sbom]` views
-read the tree rather than the archive, so they still describe the complete installed set.
-`image.bootable_disk` consumes `image.InitrdInfo` rather than a bare `image.ImageInfo`, so the archive is
-the initrd target's own output and its compression is declared where the initrd is. A composition given
-no `initrd` declares `<name>.initrd` for itself through the same macro, inheriting its package manager,
-version, and distribution; the default is therefore an ordinary target that can be built and inspected on
-its own rather than an anonymous step inside the disk image. The composition publishes the provider it was
-given from `[initrd]` and returns the same
-instance directly, so both interfaces describe exactly the same initrd.
+alongside the image's own providers. That cpio omits the package database from the paths the image's package
+system declares: nothing in an initrd resolves a dependency or verifies a package, and the kernel unpacks the
+whole cpio into tmpfs, so shipping it would only cost boot memory. The `[manifest]` view describes the cpio
+after package-database removal. The `[pkgdb]` and `[sbom]` views describe the complete installed set. A
+bootable `image.disk` consumes `image.InitrdInfo` rather than a bare `image.ImageInfo`, so the archive is the
+initrd target's own output and its compression is declared where the initrd is. A composition given no
+`initrd` declares `<name>.initrd` for itself through the same macro, inheriting its package manager, version,
+and distribution; the default is therefore an ordinary target that can be built and inspected on its own
+rather than an anonymous step inside the disk image. The composition publishes the provider it was given from
+`[initrd]` and returns the same instance directly, so both interfaces describe exactly the same initrd.
 
 `uki.py` appends the kernel-modules cpio and runs `ukify`. On x86 it also packs the microcode the image
 ships under `/usr/lib/firmware/{amd,intel}-ucode` into a `.ucode` section: one concatenated file per vendor
@@ -1295,14 +1529,15 @@ UKI is named
 `<image_id>_<version>_<arch>.efi` from the image identity. For now an image holds exactly one kernel — the
 name (and sysupdate's matching of it) could not distinguish more. If several kernels per image ever become
 a requirement, add naming configuration to `image.uki()` to disambiguate them. The ESP layer copies the UKI
-directory into `EFI/Linux` and includes the operations returned by `image.install_systemd_boot()`. Those
+directory into `EFI/Linux` and includes the operations returned by `image.ops.install_systemd_boot()`. Those
 create the ESP path, run the box's `bootctl` with its paths in the command environment, and remove the
 random seed. The final repart action creates the ESP while copying the previously split system partitions
 into the same disk. It splits nothing itself: the system partitions arrive already split, and nothing updates
 the ESP as a partition. The default system partition is a compressed EROFS `/usr` protected by
-dm-verity; the generated `usrhash=` is embedded in every UKI. The same copy operation can place device
-trees, bootloader entries, and future standalone artifacts; `esp_files` exposes it, copying caller-declared
-artifacts to chosen ESP paths.
+dm-verity; the generated `usrhash=` is embedded in every UKI. A caller places other files on the ESP, such
+as device trees or bootloader entries, with `image.ops.copy()` operations to `/boot` or `/efi` in `ops`. The
+system partitions leave out what `/boot` and `/efi` contain, so the files are only on the ESP, also with a
+root partition that copies `/`.
 
 Kernel command lines remain lists of arguments through the Starlark API and driver invocation. The UKI
 driver appends any generated verity hash and joins the arguments only when writing ukify's command-line file.
@@ -1310,24 +1545,22 @@ Boot profiles become small PE binaries of `.profile` and `.cmdline` sections, bu
 addon stub and joined into every UKI; a profile's arguments extend the shared base command line (including
 the verity hash), and kernel arguments are last-wins, so profiles can also override it.
 
-A composed raw disk can be re-encoded into distributable formats without rebuilding it: `image.disk_convert`
-uses its explicit box to drive `qemu-img` for a compact qcow2 and `zstd` for a compressed raw. These are
-alternative encodings of the same disk and remain separate, reusable terminal implementations rather than
-default outputs. A converted target provides `image.DiskConversionInfo`, naming the format alongside its
-artifact, so one provider covers every encoding instead of one provider type per format.
+A composed raw disk can be re-encoded into distributable formats without rebuilding it: the `[qcow2]`,
+`[raw.zst]` and `[vmdk]` subtargets of a disk run `qemu-img` or `zstd` in the image's box. These are
+alternative encodings of the same disk and remain subtargets rather than default outputs.
 
 #### Bootable-image result
 
 Bootability and output format remain independent terminal capabilities, but the artifacts declared by one
-`image.bootable_disk()` invocation form one concrete product. The composition publishes one target at
-the requested name. Its default output and `image.RepartInfo.disk` are the raw disk; its other terminal
+`image.disk()` invocation form one concrete product. The composition publishes one target at
+the requested name. Its default output and `image.DdiInfo.disk` are the raw disk; its other terminal
 views,
 supply-chain metadata, and constituents are lazy subtargets:
 
 ```text
 //examples/image:boot-demo
 ├── [uki]
-├── [directory]
+├── [snapshot]
 ├── [qcow2]
 ├── [raw.zst]
 ├── [manifest]
@@ -1348,8 +1581,8 @@ supply-chain metadata, and constituents are lazy subtargets:
 ```
 
 Typed providers are the composition API; subtargets are the command-line interface. There is no aggregate
-bootable-image provider. The rule returns its completed `image.ImageInfo`, `image.RepartInfo`,
-`image.InitrdInfo`, `image.ImageDirectoryInfo`, and `image.UkiInfo` independently. `image.RepartInfo`
+bootable-image provider. The rule returns its completed `image.ImageInfo`, `image.DdiInfo`,
+`image.InitrdInfo`, `image.ImageSnapshotInfo`, and `image.UkiInfo` independently. `image.DdiInfo`
 holds the composed raw disk, its independent partitions, and optional `image.RootHashInfo`, rather than
 exposing separate top-level providers for these facets.
 Its qcow2 and compressed-raw encodings are reachable only through their subtargets, each publishing one
@@ -1363,18 +1596,20 @@ corresponding artifact or a user selects its subtarget. They must not appear in 
 so requesting either format runs the same SBOM action. A metadata view publishes itself the same way a
 conversion does: `[sbom]` and `[pkgdb]` carry an `image.PublishedInfo` naming them after the image they
 describe, so a release gathers what a scanner reads while an image's own published set stays what an
-update transfers.
+update transfers. Every `image.PublishedInfo` must name its image and give each file a kind, and may give
+the version of its image. `image.artifacts` writes the image, the kinds and the version into the release's
+description.
 
-`image.bootable_disk` is one rule that owns the complete composition action graph. Provider-oriented action
-helpers are shared with the standalone `image.layer`, `image.repart`, `image.uki`, and terminal-format
+`image.disk` is one rule that owns the complete composition action graph. Provider-oriented action
+helpers are shared with the standalone `image.layer`, `image.uki`, and terminal-format
 rules, so the composition reuses their implementations without declaring private sibling targets or
 forwarding through a result rule. This aggregation remains scoped to the concrete bootable-image product;
 it does not restore a generic `image_result` around every logical `image.ImageInfo`.
 
-`image.rootfs_archive` and `image.sysext_image` follow the same ownership model on a smaller graph: one
-rule declares the logical image with its lazy package-database/SBOM views, and its terminal archive or DDI.
-Each target returns `image.ImageInfo` alongside its terminal provider, so consumers never depend on
-generated `.layer`, `.pkgdb`, or `.sbom` labels. The standalone terminal rules share the same
+`image.archive`, `image.portable` and the extension rules follow the same ownership model on a smaller
+graph: one rule declares the logical image with its lazy package-database/SBOM views, and its terminal
+archive or DDI. Each target returns `image.ImageInfo` alongside its terminal provider, so consumers never
+depend on generated `.layer`, `.pkgdb`, or `.sbom` labels. The standalone terminal rules share the same
 provider-oriented declaration functions.
 
 The disk, directory, package database, and SBOM derive from the same ESP layer. The initrd is a second
@@ -1393,8 +1628,8 @@ chooses the newest valid UKI by its embedded kernel release and writes a generic
 image artifact driver only extracts a named path or PE section from that manifest. Without a UKI, the
 selector chooses the newest standalone kernel. In either case, bootability requires an initrd matching that
 exact release. A UKI remains an optional extraction: requesting it fails if the selected image has only
-standalone artifacts. Selecting the `[directory]` subtarget does not assemble the disk, and repart never
-materializes the directory.
+standalone artifacts. Selecting the `[snapshot]` subtarget does not assemble the disk, and repart never
+reads its store.
 
 Repart derives stable UUID seeds from target identity and logical configuration; callers can override them
 explicitly. VM runners are declared separately from disk composition. Their execution box and runtime
@@ -1410,30 +1645,36 @@ A package installs configuration that describes state rather than carrying it: m
 index, `hwdb.d` with no compiled database, a locale list with no archive. On a running system scriptlets and
 boot-time units produce it; an image being assembled is neither, so tine builds it explicitly. Each generator
 is an operation of its own rather than a step of one pass, so it is positioned where the image wants it,
-configured on its own terms, and adopted one at a time; what it writes persists into the delta that captures
-it, so it is built once and cached with the layer rather than repeated by every terminal output. An `image`
-gets the content its operations ask for and nothing else, which is the same reason terminal rules leave
-package state alone.
+configured on its own terms, and adopted one at a time; what it writes persists into the snapshot that
+captures it, so it is built once and cached with the layer rather than repeated by every terminal output. An
+`image` gets the content its operations ask for and nothing else, which is the same reason terminal rules
+leave package state alone.
 
 Each generator is a no-op for an image that carries none of what it acts on, so none of them needs
-per-distribution knowledge: `image.depmod()` is silent without kernels, `image.hwdb()` without `hwdb.d`,
-`image.locale_gen()`
-without an `/etc/locale.gen` asking for something. That is what lets the compositions, which declare a whole
-product rather than one layer, end every image they build with all three at their defaults without knowing
-what went into it. A generator named in `ops` replaces the composition's copy instead of adding a second, so
-placing or configuring one stays possible. `sysext_image` is the exception that generates nothing: an
-extension merges onto a system it does not own, where a database built from the extension's own tree would
-shadow that system's while describing only what the extension carries, exactly as its package database
-would.
+per-distribution knowledge: `image.ops.depmod()` is silent without kernels, `image.ops.hwdb()` without
+`hwdb.d`, `image.ops.locale_gen()` without an `/etc/locale.gen` asking for something. That is what lets the
+compositions, which declare a whole product rather than one layer, end every image they build with all three
+at their defaults without knowing what went into it. A generator named in `ops` replaces the composition's
+copy instead of adding a second, so placing or configuring one stays possible. The extension rules are the
+exception that generates nothing: an extension merges onto a system it does not own. A database generated in
+the extension would replace the database of that system in the merged tree, and would go stale when that
+system changes, exactly as its package database would.
 
 Their tools are the box's, applied to the mounted image through the `--root` interface systemd gives them,
 which is the same relationship every other layer driver has to the image and is what lets an image that
-installs no systemd still be finalized. Two cannot work that way and use the image's own binaries in a
-chroot: `locale-gen` is a distribution's own script over its own sources, and `depmod` resolves its
-search-order configuration from absolute paths that `--basedir` does not relocate, so a box-side run
-would silently apply the wrong module ordering. Its index format is its own kmod's to define as well, and a
-box older than the image would leave out index files the image's modprobe expects. Both report the
-missing binary by name rather than skipping.
+installs no systemd still be finalized. `depmod` runs from the box as well. `--basedir` does not relocate
+the directories it reads its search order from, so the driver reads the image's `depmod.d` files inside the
+image's root and passes a copy with `--config`. `depmod` would look in the box for an `external` directory
+and for the target of an absolute module symlink. The driver therefore fails the build when the image's
+configuration lists an `external` directory or a module is an absolute symlink. `locale-gen` is a
+distribution's script around `localedef`, so the driver runs the same loop itself. It runs the box's
+`localedef` with `--prefix` and `I18NPATH` set to directories in the image, and it finds each locale's
+source and charmap inside the image's root. The layer runs in the tools box of the image's own release,
+which resolves its packages from the release's repositories, its additional repositories included. An image
+whose kmod and glibc come from those repositories gets an index and a locale archive in the formats it reads.
+The `additional_repositories` and `local_packages` of a package manager do not reach the tools box, so an
+image that installs kmod or glibc from them is finalized with the release's versions, unless
+`SETTINGS.tools_box` adds the same local repositories to the tools box.
 
 ### Reproducibility and caching
 
@@ -1482,8 +1723,10 @@ future remote workers. Bazel's broader language-rule ecosystem mattered less tha
 for a package-heavy repository.
 
 Buck cannot add ordinary target dependencies discovered from an action output. Dynamic actions may select
-among declared inputs but cannot turn newly discovered BuildRequires into a new static graph. Therefore
-dependency discovery/import must produce committed or analysis-time lock data before normal builds.
+among declared inputs but cannot turn newly discovered BuildRequires into a new static graph. An action can
+still install BuildRequires that an earlier action discovers, as the BuildRequires query of a hand-written
+`rpm.package()` does. A BuildRequires on a package that the project builds needs committed or analysis-time
+lock data before normal builds.
 
 ### Commit repository snapshots and selectively freeze boxes
 
@@ -1512,8 +1755,8 @@ The current vocabulary follows the actual responsibilities:
 - the package system defines operations;
 - the repository universe defines membership and normal enablement policy;
 - the OS release defines identity, selects a repository universe, and may provide a box's base;
-- the package manager defines one exact solve universe and box; derived managers compose additional
-  repositories and priority overrides without changing their inherited release or box;
+- the package manager defines one exact solve universe; derived managers compose additional repositories and
+  priority overrides without changing their inherited release;
 - the buildroot materializes the shared base packages.
 
 This is also why a release is not called a distribution target: two releases of one family are separate
@@ -1532,10 +1775,9 @@ package ecosystems, not every possible image content type.
 ### Separate a box's base release from its target releases
 
 A box is a tools root with a concrete OS userspace, so its base release records where its packages and
-identity came from. That does not make it part of a package manager's target OS identity: one box can
-still operate on every compatible release. An image normally obtains this explicit box dependency
-through its package manager, making reuse visible and content-keyed while avoiding duplicated compatible
-tooling roots. Box-only images remain available when no native package resolution is needed.
+identity came from. That does not make it part of a package manager's target OS identity. A package manager
+names no box, so every image of a release shares the tools box of that release rather than one tooling root
+per package manager.
 
 ### Use one sandbox boundary and let drivers mount target roots
 
@@ -1559,11 +1801,16 @@ spec schema. Both it and the snapshot driver keep `--out` there too: the box loc
 targets let a caller name the file to write, or `-` for stdout when it has nowhere to write one, and one
 calling convention per driver beats splitting the destination by verb.
 
-### Store image layers as deltas
+### Store image snapshots with shared blobs
 
-Copying a complete root for every image step scales with total image size rather than change size. Ordered
-overlay deltas let child layers and terminal outputs reuse their ancestors. Encoding whiteouts and opaque
-directories as regular files keeps those deltas compatible with Buck's artifact/CAS model.
+Complete manifests describe visible filesystem state independently of Buck's metadata and filename limits.
+Each action stores only newly introduced content blobs and retains its parent stores as Buck inputs. Buck
+cannot store the modes, mtimes and hardlinks of a directory artifact, so a layer stored as a Buck directory
+loses them. Reconstruction costs one inode per file for every action that needs a root, where an overlay of
+stored layers cost one mount per layer. Reflinks keep that cost low, and capture only reads changed files.
+Temporary reconstruction restores inode identity and metadata before commands run. Archive writers read
+manifests and blobs directly. Directory exports restore their authoritative snapshot after final Buck
+materialization.
 
 ### Prefer exact transactions over package-manager network access
 
@@ -1596,13 +1843,40 @@ The previous implementation declared the checkout as an external git cell, which
 other pinned repository. As a result, Buck could only see committed changes. Bind mounting the checkout
 at the cell root exposes the working copy, preserves file watching, and keeps Buck's declared paths
 unchanged. This only works on Linux with unprivileged user namespaces and only when the build runs through
-`bin/tine`; a direct `buck2 build` uses the checked-in path. Those constraints are acceptable for a local
+`bin/tine`; a build that bypasses it uses the checked-in path. Those constraints are acceptable for a local
 development feature.
 
-Using the namespace digest as the Buck2 isolation directory would avoid daemon replacement entirely, but
-each mount set would also get a separate `buck-out`. Keeping one isolation directory preserves build
-outputs when switching between checkouts, while `daemon_buster` lets Buck compare the digest and replace
-the daemon under its native lifecycle lock.
+Deriving the Buck2 isolation directory from the mount set would keep those sets fully apart, but each
+set would also get a separate `buck-out`. Keeping one isolation directory preserves build outputs when
+switching between checkouts; with every command running its own daemon, nothing else tells the mount
+sets apart, and the `TINE_MOUNTS` variable only names the one a nested invocation inherited.
+
+### Require Linux 6.16 for sandbox, project and snapshot mounts
+
+The sandbox builds every filesystem as a detached mount, assembles its root as a detached tmpfs, and
+attaches the result once. It uses `open_tree_attr()`, mounting onto a detached mount, and cloning a mount
+out of a detached mount from the [Linux 6.15 mount API][mount-api-6.15]. The box's directory binds are
+clones out of the detached tools tree, and `File` clones its file out of a private tmpfs. Overlay layer
+file descriptors require [Linux 6.13 or newer][overlay-layer-fds].
+
+A snapshot root on a filesystem without reflinks is an overlay with data-only lower layers. An unprivileged
+overlay must use `userxattr`, which turns metacopy off. Linux 6.15 refuses data-only layers without
+metacopy, and [Linux 6.16][overlay-data-only] accepts them.
+
+An older kernel floor would require attaching the root first and keeping staging mount points for the
+tools tree and `File`. Kernels without overlay layer file descriptors would also need escaped path
+strings. The 6.15 mount API keeps one mount mechanism without staging directories. Hosts with older kernels
+need a newer kernel. `tine mount` uses the same mount operations and requires the same version.
+
+The host root must also support `pivot_root()`. Kernels that [cannot pivot their initramfs
+root][initramfs-pivot] require booting from another root filesystem.
+
+[mount-api-6.15]: https://github.com/torvalds/linux/blob/v6.15/fs/namespace.c
+[overlay-layer-fds]:
+  https://docs.kernel.org/filesystems/overlayfs.html#specifying-layers-via-file-descriptors
+[overlay-data-only]: https://docs.kernel.org/6.16/filesystems/overlayfs.html
+[initramfs-pivot]: https://docs.kernel.org/6.15/filesystems/ramfs-rootfs-initramfs.html#what-is-initramfs
+[initramfs-symlinks]: https://github.com/torvalds/linux/blob/v6.16/init/initramfs.c
 
 ## Operating the current system
 
@@ -1614,9 +1888,11 @@ Host requirements, the wrapper commands, and representative smoke builds are doc
 These are properties of the implementation today, not merely ideas for future optimization. Limitations that
 belong to one package system are listed in its own section instead:
 
-- Buck preserves `buck-out` across daemon replacement. This is safe for hermetic actions because source
+- Buck preserves `buck-out` across mount changes. This is safe for hermetic actions because source
   changes produce new input digests. An action that reads an undeclared input can still reuse stale output
   after a mount change.
+- Source builds and checkouts read their source directory as it is on disk, including the files that Buck
+  ignores. An ignored file can change what a build produces without changing the action key.
 - Two native package systems are implemented, and only one of them can build packages.
 - A transaction describes packages to add. An install that would have to remove or replace something a
   lower layer carries is refused rather than expressed.
@@ -1629,9 +1905,10 @@ belong to one package system are listed in its own section instead:
   than the SHA-256 pinning everything else here uses.
 - `cargo-auditable` is a pinned upstream release binary rather than a source-built one, so the Rust build
   path is not itself part of the source-trust chain.
-- Three build steps reach the network instead of downloading content with a recorded byte hash: Rust Git
+- Four build steps reach the network instead of downloading content with a recorded byte hash: Rust Git
   dependencies use commit hashes from the lock file, project fetches use the commit passed to
-  `git.fetch()`, and Go verifies module downloads against the committed `go.sum`.
+  `git.fetch()`, the RPM packaging fetch uses the commit in the pin file of `in_place_packaging`, and Go
+  verifies module downloads against the committed `go.sum`.
 - Crate downloads carry no recorded size, so Buck learns it from an HTTP HEAD whenever a download action
   executes. A cold daemon therefore needs the network even when every crate is already cached.
 - Repository metadata is trusted on first use: neither Fedora's GA trees nor the pinned mirrors serve a
@@ -1640,19 +1917,19 @@ belong to one package system are listed in its own section instead:
 - A root box verifies its packages with the `rpmkeys` of its own unverified stage1, so a tampered rpm
   package in the seed could defeat the check for that box; every other box and every image verifies with a
   predecessor. Arch packages are not verified at all.
-- Archive ownership is intentionally normalized to uid/gid zero. Capabilities, xattrs, and SELinux labels do
-  not survive as Buck directory metadata; deferred tmpfiles can restore xattrs at terminal assembly, and tar
-  preserves them in PAX headers, but newc cpio cannot represent general xattrs.
-- Directory image output cannot represent backslashes in names; archive outputs should be used instead.
+- Archive ownership is intentionally normalized to uid/gid zero. Snapshots keep user xattrs but no
+  capabilities, other xattr namespaces or SELinux labels. Tar preserves user xattrs in PAX headers, and newc
+  cpio cannot represent xattrs.
 - The default `/usr`-only disk has a volatile root, so the `/etc` a build writes is not what such an image
   boots with; first-boot defaults come from credentials instead. Package and authored state outside `/usr`
   is not yet translated into factory defaults or another persistent partition. How much `/etc` such an
   image boots with therefore depends on the distribution: Fedora's and Arch's systemd ship upstream's
   `etc.conf`, whose `L` lines recreate `/etc/os-release` and its neighbours, while Debian drops it and
   populates `/etc` from packages instead.
-- The generators cover the databases under `/usr`. System users, volatile files and directories, and unit
-  presets are left to the boot-time units systemd ships for them, so an image whose `/etc` is created at
-  first boot gets them then and one that ships a populated `/etc` does not get them at all.
+- The generators cover the databases under `/usr`. System users and volatile files and directories are left
+  to the boot-time units systemd ships for them, so an image whose `/etc` is created at first boot gets them
+  then and one that ships a populated `/etc` does not get them at all. Unit presets are also left to first
+  boot, unless the image runs `image.ops.preset()`.
 - Bootable images currently disable SELinux.
 - Remote execution, Barrage integration, release publishing, and systematic reproducibility audits are not
   wired into CI.
@@ -1707,15 +1984,17 @@ outside the build, addressed by URI over a PKCS#11 socket, see
 Near-term image gaps are:
 
 - offline SELinux labeling instead of `selinux=0`, as one more generator;
-- build-time `systemd-sysusers`, `systemd-tmpfiles` and `systemctl preset-all`, once their single-UID/GID
-  and volatile-`/etc` behavior is settled;
+- build-time `systemd-sysusers` and `systemd-tmpfiles`, once their single-UID/GID and volatile-`/etc`
+  behavior is settled;
+- `image.ops.preset(vendor = True)` as a default generator of the compositions, once every release's tools
+  box contains systemd 263;
 - deterministic ext4/FAT byte-level validation and any required normalization;
-- OCI, confext, ESP, and other terminal formats as real consumers require them;
+- OCI, ESP, and other terminal formats as real consumers require them;
 - richer ordered operations for setting file metadata directly;
 - deciding whether package installation and image tooling eventually need distinct compatible boxes.
 
-The layer model should remain ordered operations captured as deltas. A provides/requires feature solver is
-unnecessary unless real composition requirements appear.
+The layer model should remain ordered operations captured as complete snapshots. A provides/requires feature
+solver is unnecessary unless real composition requirements appear.
 
 ### Scale, configuration, and testing
 
@@ -1739,8 +2018,8 @@ Useful implementation entry points:
   `package/{href,installer,transaction}.py`
 - each package system's `rules.bzl` and drivers under `package_system/`, listed in its own section above
 - `box/{build,runtime}.bzl`, `box/sandbox.py`, and `rootfs/rootfs.py`
-- `image/{image,compose,defs,sign,vm}.bzl` and `image_format/{archive,boot,disk,sysext,uki}.bzl`
-- `cargo/{rules,lock,vendor}.bzl` and `cargo/{vendor,build}.py`
+- `image/{image,compose,defs,sign,vm,archive,boot,ddi,extension}.bzl`
+- `cargo/{defs,rules,vendor}.bzl` and `cargo/{lock,vendor,build}.py`
 - `go/rules.bzl` and `go/{fetch,build}.py`
 - `tools/catalog.py` and `catalog/BUCK`
 - the generated `packages/*/*/BUCK` and the importer-facing Starlark that validates it

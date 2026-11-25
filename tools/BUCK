@@ -5,48 +5,44 @@
 
 load("//:tine.lock.json", _pins = "value")
 load("//box:defs.bzl", "box")
-load("//python:defs.bzl", "tine_python_binary")
-load(":defs.bzl", "http_tool")
+load("//distribution:defs.bzl", "distribution")
+load("//http:defs.bzl", "http")
+load("//python:defs.bzl", "python")
 
-_RELEASE = "tine//catalog:fedora.rawhide.release"
+_RELEASE = "catalog//:default.release"
 
-# Every pinned tool is declared in //:tine.lock.json and refreshed by `bump` (see docs/user/images.md). Buck
+# Every pinned tool is declared in //:tine.lock.json and refreshed by `tine bump` (see docs/user/images.md). Buck
 # fetches and verifies every tool except Buck2, which `bin/tine` fetches.
 
 # Relocatable bootstrap Python; 3.14 provides stdlib zstd for RPM payloads.
 # PUBLIC: the toolchain reaching it is `tine//:python_bootstrap`, and a project that declares a
 # `toolchains` cell of its own rather than aliasing this one forwards to that target from outside.
-http_tool(
+http.tool(
     name = "python3",
     args = ["-B"],
+    bootstrap = True,
     path = "bin/python3",
     spec = _pins["python3"],
     visibility = ["PUBLIC"],
 )
 
 # The Starlark formatter is published as a bare zstd-compressed binary in the releases of Buck2.
-# tine.lock.json pins the formatter and Buck2, so one `bump` run keeps them on the same release.
-http_tool(
+# tine.lock.json pins the formatter and Buck2, so one `tine bump` run keeps them on the same release.
+http.tool(
     name = "starlark-fmt",
     compressed = True,
     spec = _pins["starlark-fmt"],
 )
 
-# Decompressor for the above; the pinned CPython is new enough to have zstd in its standard library.
-tine_python_binary(
-    name = "unzstd",
-    main = "unzstd.py",
-)
-
 # Python formatter + linter (static musl builds).
-http_tool(
+http.tool(
     name = "ruff",
     path = "ruff",
     spec = _pins["ruff"],
 )
 
 # Python type checker (static musl builds).
-http_tool(
+http.tool(
     name = "ty",
     path = "ty",
     spec = _pins["ty"],
@@ -55,7 +51,7 @@ http_tool(
 
 # SBOM generator (static release binary; not packaged in Fedora). Scans an assembled image tree for the
 # package database, ELF-bundled modules, and other package metadata.
-http_tool(
+http.tool(
     name = "syft",
     path = "syft",
     spec = _pins["syft"],
@@ -65,7 +61,7 @@ http_tool(
 # Cargo wrapper that embeds the crate graph in every binary it builds, so SBOM scanners can report
 # what a from-source Rust binary contains. Fedora does not package it, and we
 # can't build it from source yet. https://crates.io/crates/cargo-auditable
-http_tool(
+http.tool(
     name = "cargo-auditable",
     path = "cargo-auditable",
     spec = _pins["cargo-auditable"],
@@ -73,7 +69,7 @@ http_tool(
 )
 
 # S3 server with a plain-HTTP read side, for the remote cache's integration tests. Not packaged in Fedora.
-http_tool(
+http.tool(
     name = "seaweedfs",
     path = "weed",
     spec = _pins["seaweedfs"],
@@ -83,44 +79,72 @@ http_tool(
     ],
 )
 
-# tine's dev environment for importer and its unit tests. Used by every `box_python_test` suite
-# (hermetic), `tine//tools:importer` (relaxed), and anyone entering it as a box.
-# Derived from the main box (lockless transaction, resolved during the build), so dev tooling
-# changes never invalidate the build graph that depends on the main box.
+# The dev box supplies the importer and boxed Python suites with package tools.
+# The dev box layers over the tools box, so it installs only its own packages. A test of an image runs in
+# the dev box of the image's release. No image depends on the dev box, so a change to its packages rebuilds
+# no image.
+# The dev box contains the package tooling of its own family only. The tests of the importer and of
+# package_system/rpm skip themselves in a dev box without rpmbuild. The plan test of package_system/pacman
+# skips itself in a dev box without libalpm.
 box.new(
     name = "dev.box",
     packages = [
         "coreutils",
-        # for "importer srpm"
-        "dist-git-client",
         "gawk",
-        "git-core",
+        # for the assertions over a release's description
+        "jq",
         # for the assertions over generated certificates
         "openssl",
-        "rpm-build",
-        # package_system/rpm's tests sign what they build
-        "gnupg2",
-        "rpm-sign",
-        "python3-createrepo_c",
-        "python3-libdnf5",
         # the license headers lint, see the `reuse` alias below
         "reuse",
         "sed",
-        # The tests of package_system/deb verify a Release with sqv, as verify.py does.
-        "sequoia-sqv",
-    ],
-    release = _RELEASE,
+    ]
+    + distribution.select({
+        "arch": [
+            "diffutils",
+            "git",
+            "gnupg",
+            "sequoia-sqv",
+            "tar",
+            "util-linux",
+        ],
+        "debian": [
+            "fdisk",
+            "git",
+            "gnupg",
+            # The tools box resolves awk to mawk, and the dev box installs gawk too. Without mawk in
+            # this list, the dev box resolves awk to gawk alone and can't layer over the tools box.
+            "mawk",
+            "sqv",
+        ],
+        "fedora": [
+            # `importer srpm` runs dist-git-client.
+            "dist-git-client",
+            "git-core",
+            "gnupg2",
+            "python3-createrepo_c",
+            "python3-libdnf5",
+            "python3-rpm",
+            "rpm-build",
+            # The tests of package_system/rpm sign the packages that they build.
+            "rpm-sign",
+            "sequoia-sqv",
+            "util-linux",
+        ],
+    }),
+    parent = "tine//distribution:tools.box",
+    release = distribution.release_target("release"),
     visibility = ["PUBLIC"],
 )
 
 # Runtime driver for the source-tree commands below.
-tine_python_binary(
+python.binary(
     name = "dev",
     main = "dev.py",
     deps = ["//:util"],
 )
 
-box.python_test(
+python.test(
     name = "dev-test",
     box = ":dev.box",
     srcs = [
@@ -129,58 +153,94 @@ box.python_test(
     ],
     env = {
         "TY_TEST_BINARY": "$(location_exec :ty)",
-        "TY_TEST_BOX": "$(location_exec tine//catalog:fedora.rawhide.box)",
         "TY_TEST_PYTHON": "$(location_exec :python3)",
     },
     deps = ["//:util"],
 )
 
-tine_python_binary(
+python.binary(
     name = "catalog",
     main = "catalog.py",
     deps = ["//:util"],
 )
 
 # The dev box carries gpg, which the armoring test reads its output back with.
-box.python_test(
+python.test(
     name = "catalog-test",
     box = ":dev.box",
     srcs = ["catalog.py", "catalog_test.py"],
     deps = ["//:util"],
 )
 
-# PUBLIC: a consuming project runs this driver with `--data` to bump its own tine.lock.json.
-tine_python_binary(
-    name = "bump-driver",
-    main = "bump.py",
-    deps = ["//:util"],
-    visibility = ["PUBLIC"],
-)
-
-# bump gets the ty configuration as a label. If `ty.toml` moves or is renamed, the analysis of this
-# target fails, and not the next bump run.
-command_alias(
-    name = "bump",
-    args = ["--data", "$(location //:tine.lock.json)", "--ty-config", "$(location_exec //:ty-config)"],
-    exe = ":bump-driver",
-)
-
-box.python_test(
-    name = "bump-test",
-    box = ":dev.box",
-    srcs = [
-        "bump.py",
-        "bump_test.py",
-    ],
-    deps = ["//:util"],
-)
-
 # PUBLIC: CI's automatic changes (.github/workflows/bump.yml, used by consuming project as well). A
 # runner invokes it as a plain script with the host python, before Buck has fetched anything;
 # this target is what type checks it.
-tine_python_binary(
+python.binary(
     name = "bot-pr",
     main = "bot_pr.py",
+    visibility = ["PUBLIC"],
+)
+
+# Debian testing has no gh package, so setup-deploy-key runs GitHub's own build of gh in every box.
+http.tool(
+    name = "gh",
+    path = "bin/gh",
+    spec = _pins["gh"],
+)
+
+# setup-deploy-key gets its own box, as it runs rarely.
+box.new(
+    name = "deploy-key.box",
+    # gh runs git to find the repository of the checkout, and it verifies GitHub's certificate against the
+    # box's CA certificates. The openssh packages contain ssh-keygen.
+    packages = ["ca-certificates"]
+    + distribution.select({
+        "arch": ["git", "openssh"],
+        "debian": ["git", "openssh-client"],
+        "fedora": ["git-core", "openssh-clients"],
+    }),
+    release = _RELEASE,
+)
+
+python.binary(
+    name = "setup-deploy-key-driver",
+    box = ":deploy-key.box",
+    main = "setup_deploy_key.py",
+)
+
+# PUBLIC: run by repository admin once. Relaxed, it uses the host's gh login and checkout.
+command_alias(
+    name = "setup-deploy-key",
+    args = ["--gh", "$(location_exec :gh)"],
+    exe = ":setup-deploy-key-driver",
+    visibility = ["PUBLIC"],
+)
+
+# The AWS tools are big and rarely needed, so they get a box of their own. A disk's AMI subtarget writes and
+# imports the AMI in the aws box of the disk's release.
+box.new(
+    name = "aws.box",
+    # uefi-data-test in examples/image-secureboot runs mktemp from coreutils. Fedora installs coreutils as a
+    # dependency of the other packages, and Arch does not.
+    packages = ["coreutils"]
+    # The virt-firmware packages contain virt-fw-vars, which writes an AMI's UEFI variable store.
+    + distribution.select({
+        "arch": ["aws-cli-v2", "virt-firmware"],
+        "debian": ["awscli", "python3-virt-firmware"],
+        "fedora": ["awscli2", "python3-virt-firmware"],
+    }),
+    release = distribution.release_target("release"),
+    visibility = ["PUBLIC"],
+)
+
+# PUBLIC: the AWS CLI, relaxed so that it logs in to and reads the host's ~/.aws, e.g.
+# `buck run tine//tools:aws -- login`.
+command_alias(
+    name = "aws",
+    args = ["aws"],
+    # The box has no pager, neither aws' `less` default nor the host's $PAGER; aws breaks without it.
+    env = {"AWS_PAGER": ""},
+    exe = ":aws.box",
     visibility = ["PUBLIC"],
 )
 
@@ -228,23 +288,43 @@ command_alias(
 # sandboxes over a socket. See tools/signing-server.
 box.new(
     name = "swtpm-signing.box",
+    # swtpm has no resource manager, so tools/signing-server runs tpm2-abrmd on a private D-Bus. The
+    # ci.sh step runs ukify to read a UKI section back out. tpm2_ptool runs tpm2-tools binaries, but its
+    # package does not depend on tpm2-tools.
     packages = [
         "bash",
         "coreutils",
-        # the resource manager swtpm lacks, and the private bus it needs; see tools/signing-server
-        "dbus-daemon",
         "openssl",
-        "p11-kit-server",
         "pkcs11-provider",
         "swtpm",
-        # ukify, to read a UKI section back out in the ci.sh step
         "systemd-ukify",
         "tpm2-abrmd",
-        "tpm2-pkcs11",
-        "tpm2-pkcs11-tools",
-        # tpm2_ptool drives these binaries without a package dependency on them
         "tpm2-tools",
-    ],
+    ]
+    + distribution.select({
+        "arch": [
+            "dbus",
+            "p11-kit",
+            "tpm2-pkcs11",
+            "tpm2-pkcs11-tools",
+        ],
+        # Debian packages each TCTI of tpm2-tss on its own. tpm2-abrmd reaches swtpm through the swtpm TCTI,
+        # and tpm2-tools and tpm2-pkcs11 reach tpm2-abrmd through the tabrmd TCTI.
+        "debian": [
+            "dbus-daemon",
+            "libtpm2-pkcs11-1",
+            "libtpm2-pkcs11-tools",
+            "libtss2-tcti-swtpm0t64",
+            "libtss2-tcti-tabrmd0",
+            "p11-kit",
+        ],
+        "fedora": [
+            "dbus-daemon",
+            "p11-kit-server",
+            "tpm2-pkcs11",
+            "tpm2-pkcs11-tools",
+        ],
+    }),
     release = _RELEASE,
     visibility = ["PUBLIC"],
 )
@@ -255,7 +335,7 @@ command_alias(
     exe = ":swtpm-signing.box",
 )
 
-box.python_test(
+python.test(
     name = "importer-test",
     box = ":dev.box",
     srcs = [
@@ -288,6 +368,13 @@ command_alias(
 command_alias(
     name = "ty-config",
     args = ["ty-config"],
+    exe = ":dev",
+    visibility = ["PUBLIC"],
+)
+
+command_alias(
+    name = "ty-check",
+    args = ["ty-check"],
     exe = ":dev",
     visibility = ["PUBLIC"],
 )

@@ -3,6 +3,7 @@
 
 """The conventional Arch Linux distribution declaration."""
 
+load("//box:defs.bzl", "box")
 load("//distribution:defs.bzl", "distribution")
 load("//package:manager.bzl", "package_manager")
 load("//package:release.bzl", "os_release")
@@ -22,14 +23,14 @@ _ARCH_SIGNING_KEYS = {
     "gromit": ("99B6618472A3B3B814185BAED7D3D823B88BDB9B", "ed1qppfih3jee3fqsa8kydgw8wfdjtqd"),
 }
 
-def arch_signing_keys(*users) -> dict[str, str]:
+def _signing_keys(*users) -> dict[str, str]:
     """The `signing_keys` for repositories whose packagers the named main keys vouch for, all of them by default.
 
     A packager's key counts once three declared main keys certify it, so declare at least three.
     """
     users = users or tuple(_ARCH_SIGNING_KEYS)
     if len({user: True for user in users}) < 3:
-        fail("arch_signing_keys: three main keys must vouch for a packager, so declare at least three distinct ones: {}".format(users))
+        fail("arch.signing_keys: three main keys must vouch for a packager, so declare at least three distinct ones: {}".format(users))
     for user in users:
         if user not in _ARCH_SIGNING_KEYS:
             fail("no Arch main key is known for {}; add its fingerprint to distribution/arch.bzl".format(user))
@@ -48,20 +49,34 @@ _ARCH_PACKAGE_SETS = {
     ],
     # `base-devel` is a metapackage, so makepkg's assumed build environment is one name.
     "buildroot": ["base-devel"],
-    # Arch ships udev inside systemd and veritysetup inside cryptsetup.
+    # Arch ships udev, networkd and IMDS support inside systemd, and veritysetup inside cryptsetup.
     "initrd": ["bash", "cryptsetup", "kmod", "systemd"],
 }
 
 # Arch has no numbered releases; a catalog pins a date in the archive instead.
 _COMPONENTS = ("core", "extra", "multilib")
 
+# The root box of an Arch release contains the packages that resolve, verify and install a box.
+# tine//distribution:tools.box contains everything else. Extracting alpm packages needs no package
+# tooling, so the root box bootstraps its own pacman.
+_ARCH_ROOT_PACKAGES = [
+    # The keyring driver takes the packagers' keys and the main keys' certifications from here.
+    "archlinux-keyring",
+    "bash",
+    "coreutils",
+    "pacman",
+    # A relaxed box binds the host's /run, and nss-systemd reads the caller's identity from the host's
+    # UserDB services there. Without libnss_systemd, getpwuid() cannot find a systemd-homed caller, and
+    # ssh-keygen aborts.
+    "systemd-libs",
+]
+
 def _check_name(name: str) -> None:
     if not name.startswith("arch.") or name.count(".") != 1:
         fail("arch release name must be 'arch.<release>': {}".format(name))
 
-def arch_release(
+def _release(
     name: str,
-    box: str,
     architectures: list[str],
     signing_keys: dict[str, str],
     archive_snapshot: str | None = None,
@@ -77,7 +92,7 @@ def arch_release(
     """Declare the conventional Arch Linux release target bundle.
 
     `signing_keys` are the main keys whose certifications make a packager's key count, normally
-    `arch_signing_keys()`; they are stated so that a reviewer sees which keys a release trusts.
+    `arch.signing_keys()`; they are stated so that a reviewer sees which keys a release trusts.
 
     Every repository shares one archive pin, so the release stays internally consistent: core and
     extra are only guaranteed to solve together when they come from the same day. Overriding the
@@ -87,12 +102,12 @@ def arch_release(
     _check_name(name)
     unknown = [component for component in repository_urls if component not in _COMPONENTS]
     if unknown:
-        fail("arch_release: unknown repository components {}".format(sorted(unknown)))
+        fail("arch.release: unknown repository components {}".format(sorted(unknown)))
     if (archive_snapshot == None) == (not repository_urls):
-        fail("arch_release: takes archive_snapshot or repository_urls, not both or neither: {}".format(name))
+        fail("arch.release: takes archive_snapshot or repository_urls, not both or neither: {}".format(name))
     if repository_urls and sorted(repository_urls) != sorted(_COMPONENTS):
         fail(
-            "arch_release: repository_urls must cover every component {}: {}".format(
+            "arch.release: repository_urls must cover every component {}: {}".format(
                 sorted(_COMPONENTS),
                 name,
             ),
@@ -111,30 +126,50 @@ def arch_release(
 
     repository_universe(
         name = name + ".repositories",
+        target_compatible_with = distribution.serves(name, architectures),
         package_system = PACKAGE_SYSTEM,
-        required_repositories = [":" + name + ".core.repository"],
+        # A box resolves against the universe and nothing else. An image runs the tools of the release's
+        # tools box against what it installs from these repositories, so the tools box resolves from
+        # them as well.
+        required_repositories = [":" + name + ".core.repository"] + additional_repositories,
         optional_repository_groups = {
             "extra": [":" + name + ".extra.repository"],
             "multilib": [":" + name + ".multilib.repository"],
         },
         default_repository_groups = ["extra"],
     )
-    distribution.new(name = name + ".distribution", visibility = visibility)
+    distribution.new(name = name + ".distribution", architectures = architectures, visibility = visibility)
     package_sets = dict(_ARCH_PACKAGE_SETS)
     package_sets.update(package_set_overrides)
     os_release(
         name = name + ".release",
+        target_compatible_with = distribution.serves(name, architectures, in_box = True),
+        box = ":" + name + ".box",
         repository_universe = ":" + name + ".repositories",
         package_sets = package_sets,
         visibility = visibility,
     )
+    box.new(
+        name = name + ".box",
+        architectures = architectures,
+        packages = _ARCH_ROOT_PACKAGES,
+        release = ":" + name + ".release",
+        repository_universe = ":" + name + ".repositories",
+        root = True,
+        visibility = visibility,
+    )
     package_manager(
         name = name + ".package-manager",
+        target_compatible_with = distribution.serves(name, architectures, in_box = True),
         release = ":" + name + ".release",
-        box = box,
         enable_repository_groups = enable_repository_groups,
         disable_repository_groups = disable_repository_groups,
         additional_repositories = additional_repositories,
         repository_priorities = repository_priorities,
         visibility = visibility,
     )
+
+arch = struct(
+    release = _release,
+    signing_keys = _signing_keys,
+)

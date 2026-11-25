@@ -11,16 +11,32 @@ pinned userspace but exposes host devices, services, environment, cwd, and netwo
 Target-root setup belongs to rootfs.py rather than this launcher.
 """
 
+import errno
 import os
+import stat
 import sys
 import warnings  # noqa: F401 (os.execvpe imports it after the host Python is no longer reachable)
 
-from isolation import Bind, Devices, Filesystem, Sandbox, SandboxOSError, Symlink, Tmpfs, enter
+from isolation import (
+    Bind,
+    Close,
+    Devices,
+    ExitStack,
+    File,
+    Filesystem,
+    SandboxOSError,
+    Symlink,
+    Tmpfs,
+    check_kernel,
+    enter_sandbox,
+    open_layers,
+    unshare_sandbox,
+)
 
 TYPE_CHECKING = False
 
 # Older host interpreters evaluate annotations when defining the functions.
-if TYPE_CHECKING or sys.version_info < (3, 14):  # noqa: UP036
+if TYPE_CHECKING or sys.version_info < (3, 14):
     from typing import NoReturn
 
 # Hermetic sandbox mount point of the project (host cwd). A path of tine's own rather than just keeping
@@ -54,7 +70,8 @@ _HELP = """\
 usage: sandbox --tools TOOLS [OPTIONS...] [--] COMMAND [ARGUMENTS...]
 
   -h, --help                 Show this help
-  --tools TOOLS              Read-only pinned tools tree (required)
+  --tools TOOLS              Read-only pinned tools tree (required); repeat to
+                             stack layers, lowest first
   --ro-bind SRC:DST          Add a read-only bind mount (repeatable)
   --setenv K=V               Set an environment variable (repeatable)
   --source-date-epoch EPOCH   Set SOURCE_DATE_EPOCH
@@ -78,17 +95,24 @@ def _prompt_prefix(name: str, previous: str, prefix: str) -> str:
 
 
 class Launch:
-    """Pair one sandbox description with the process it launches."""
+    """Pair the sandbox's filesystems with the process it launches."""
 
-    def __init__(self, sandbox: Sandbox, command: tuple[str, ...], environment: dict[str, str]) -> None:
-        self.sandbox = sandbox
+    def __init__(
+        self,
+        filesystems: tuple[Filesystem, ...],
+        chdir: str | None,
+        command: tuple[str, ...],
+        environment: dict[str, str],
+    ) -> None:
+        self.filesystems = filesystems
+        self.chdir = chdir
         self.command = command
         self.environment = environment
 
 
 class Options:
     def __init__(self) -> None:
-        self.tools: str | None = None
+        self.tools: list[str] = []
         self.ro_bind: list[tuple[str, str]] = []
         self.setenv: dict[str, str] = {}
         self.source_date_epoch: int | None = None
@@ -99,11 +123,6 @@ class Options:
         self.cmd: list[str] = []
 
 
-def _abs(p: str) -> str:
-    # Bind sources are mounted after the sandbox has changed root, so they cannot stay relative.
-    return p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
-
-
 def _relocate(value: str, cwd: str) -> str:
     """Point an absolute path into the project at where the sandbox mounts the project."""
     if value == cwd:
@@ -111,19 +130,32 @@ def _relocate(value: str, cwd: str) -> str:
     return value.replace(cwd + "/", _PROJECT + "/")
 
 
-def _relaxed(tools: str) -> list[Filesystem]:
+def _relaxed_path(path: str) -> str:
+    directories = path.split(os.pathsep) if path else []
+    missing = [d for d in _BASE_ENV["PATH"].split(os.pathsep) if d not in directories]
+    return os.pathsep.join(directories + missing)
+
+
+def _mode(tools: int, path: str, *, follow_symlinks: bool = True) -> int:
+    """Return the mode of `path` in the tools tree, or 0 if it doesn't exist."""
+    try:
+        return os.stat(path, dir_fd=tools, follow_symlinks=follow_symlinks).st_mode
+    except FileNotFoundError:
+        return 0
+
+
+def _relaxed(tools: int) -> list[Filesystem]:
     """Mount pinned userspace over a host-integrated root."""
     out: list[Filesystem] = []
     for name in _TOOLS_DIRS:
-        entry = os.path.join(tools, name)
-        if os.path.isdir(entry):
-            out.append(Bind(entry, "/" + name, readonly=True))
+        if stat.S_ISDIR(_mode(tools, name)):
+            out.append(Bind(name, "/" + name, readonly=True, root=tools))
     for name in _TOOLS_LINKS:
-        entry = os.path.join(tools, name)
-        if os.path.islink(entry):
-            out.append(Symlink(os.readlink(entry), "/" + name))
-        elif os.path.isdir(entry):
-            out.append(Bind(entry, "/" + name, readonly=True))
+        mode = _mode(tools, name, follow_symlinks=False)
+        if stat.S_ISLNK(mode):
+            out.append(Symlink(os.readlink(name, dir_fd=tools), "/" + name))
+        elif stat.S_ISDIR(mode):
+            out.append(Bind(name, "/" + name, readonly=True, root=tools))
     for name in sorted(os.listdir("/")):
         if name in _HOST_SKIP:
             continue
@@ -132,16 +164,16 @@ def _relaxed(tools: str) -> list[Filesystem]:
             out.append(Symlink(os.readlink(entry), entry))
         else:
             out.append(Bind(entry, entry))
-    if os.path.isdir(etc := os.path.join(tools, "etc")):
-        out.append(Bind(etc, "/etc", readonly=True))
+    if stat.S_ISDIR(_mode(tools, "etc")):
+        out.append(Bind("etc", "/etc", readonly=True, root=tools))
     for f in _HOST_ETC:
         host = os.path.join("/etc", f)
-        if os.path.exists(host) and os.path.exists(os.path.join(etc, f)):
+        if os.path.exists(host) and _mode(tools, f"etc/{f}"):
             out.append(Bind(host, host, readonly=True))
     return out + _identity(tools)
 
 
-def _identity(tools: str) -> list[Filesystem]:
+def _identity(tools: int) -> list[Filesystem]:
     """Make the invoking uid/gid resolvable inside the sandbox.
 
     Relaxed /etc comes from the tools tree, which lists only system users. On a host the caller's uid
@@ -163,18 +195,13 @@ def _identity(tools: str) -> list[Filesystem]:
     }
     out: list[Filesystem] = []
     for base, entry in tables.items():
-        source = os.path.join(tools, "etc", base)
         content = ""
-        if os.path.exists(source):
-            with open(source, encoding="utf-8") as handle:
+        if _mode(tools, f"etc/{base}"):
+            with open(
+                os.open(f"etc/{base}", os.O_RDONLY | os.O_CLOEXEC, dir_fd=tools), encoding="utf-8"
+            ) as handle:
                 content = handle.read()
-        # Deterministic per-uid path: overwritten each run rather than accumulated, and O_NOFOLLOW so
-        # a pre-planted symlink can't redirect the write.
-        path = f"/var/tmp/.tine-sandbox-{base}-{uid}"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content + entry)
-        out.append(Bind(path, "/etc/" + base, readonly=True))
+        out.append(File(content + entry, "/etc/" + base))
     return out
 
 
@@ -224,7 +251,7 @@ def _parse(argv: list[str] | None) -> Options:
 
         option = argument.partition("=")[0]
         if option == "--tools":
-            args.tools = _value(argument, argv)
+            args.tools.append(_value(argument, argv))
         elif option == "--ro-bind":
             source, separator, target = _value(argument, argv).partition(":")
             if not source or not separator or not os.path.isabs(target):
@@ -253,7 +280,7 @@ def _parse(argv: list[str] | None) -> Options:
             _fail(f"unrecognized option: {argument}")
 
     args.cmd = list(reversed(argv))
-    if args.tools is None:
+    if not args.tools:
         _fail("--tools is required")
     if not args.cmd and not args.box:
         _fail("no command given (expected `-- cmd ...`)")
@@ -316,34 +343,42 @@ def _interactive_shell(environment: dict[str, str]) -> str:
     _fail("no shell installed in box ($SHELL and bash were not found)")
 
 
-def _launch(args: Options) -> Launch:
-    """Translate the command-line request into the Python sandbox interface."""
+def _launch(args: Options, tools: int, project: Bind | None) -> Launch:
+    """Translate the command-line request into the Python sandbox interface.
+
+    `tools` is a file descriptor of the tools tree, which the binds of the tools tree take their sources
+    from. `project` is the bind of the project for `--bind-cwd`. With `None`, the plan constructs the bind
+    after unsharing if `--bind-cwd` is set.
+    """
     filesystems: list[Filesystem] = []
-    cwd = os.getcwd() if args.bind_cwd else None
 
     # Recreate usr-merge symlinks instead of binding through them.
-    assert args.tools is not None
-    tools = os.path.realpath(args.tools)
     if args.relaxed:
         filesystems += _relaxed(tools)
     else:
-        for name in sorted(os.listdir(tools)):
+        # os.listdir() needs a file descriptor that is open for reading, and `tools` is an O_PATH file
+        # descriptor.
+        with Close(os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=tools)) as directory:
+            names = sorted(os.listdir(directory))
+        for name in names:
             if name in _PROVIDED:
                 continue
-            entry = os.path.join(tools, name)
-            dest = "/" + name
-            if os.path.islink(entry):
-                filesystems.append(Symlink(os.readlink(entry), dest))
-            elif os.path.isdir(entry):
-                filesystems.append(Bind(entry, dest, readonly=True))
+            mode = _mode(tools, name, follow_symlinks=False)
+            if stat.S_ISLNK(mode):
+                filesystems.append(Symlink(os.readlink(name, dir_fd=tools), "/" + name))
+            elif stat.S_ISDIR(mode):
+                filesystems.append(Bind(name, "/" + name, readonly=True, root=tools))
 
     for src, dest in args.ro_bind:
-        filesystems.append(Bind(_abs(src), dest, readonly=True))
+        filesystems.append(Bind(src, dest, readonly=True))
 
     chdir: str | None = None
     command = tuple(args.cmd)
-    if cwd:
-        filesystems.append(Bind(cwd, _PROJECT))
+    cwd: str | None = None
+    if args.bind_cwd:
+        project = project or Bind(os.getcwd(), _PROJECT)
+        cwd = project.source
+        filesystems.append(project)
         chdir = _PROJECT
 
         # A build action names its artifacts project-relative, but `buck run` calls the same command with
@@ -356,7 +391,7 @@ def _launch(args: Options) -> Launch:
     if not args.relaxed:
         filesystems.append(Devices("/dev", _tty()))
         filesystems.append(Tmpfs("/run"))
-        filesystems.append(Tmpfs("/tmp"))
+        filesystems.append(Tmpfs("/tmp", mode="1777"))
 
         # Everything large stages under /var/tmp, which TMPDIR points at: back it with Buck's
         # on-disk per-action scratch directory rather than a tmpfs, since staging trees run into
@@ -370,13 +405,19 @@ def _launch(args: Options) -> Launch:
         if cwd and "BUCK_SCRATCH_PATH" in os.environ:
             staging = os.path.join(cwd, os.environ["BUCK_SCRATCH_PATH"])
         if staging is None:
-            filesystems.append(Tmpfs("/var/tmp"))
+            filesystems.append(Tmpfs("/var/tmp", mode="1777"))
         else:
             backing = os.path.join(staging, "var-tmp")
             os.makedirs(backing, exist_ok=True)
             filesystems.append(Bind(backing, "/var/tmp"))
 
     environment = dict(os.environ) if args.relaxed else dict(_BASE_ENV)
+    if args.relaxed:
+        # The host's PATH can lack a directory that the box installs programs into. A Debian box
+        # installs tpm2-abrmd into /usr/sbin, and an Arch host has no /usr/sbin on PATH. Without the
+        # base directories, running tpm2-abrmd in a Debian box on an Arch host fails with "command
+        # not found".
+        environment["PATH"] = _relaxed_path(environment.get("PATH", ""))
     if not args.relaxed and args.bind_cwd and "BUCK_SCRATCH_PATH" in os.environ:
         environment["BUCK_SCRATCH_PATH"] = os.environ["BUCK_SCRATCH_PATH"]
     if args.source_date_epoch is not None:
@@ -394,25 +435,51 @@ def _launch(args: Options) -> Launch:
         filesystems.append(_resolv_conf())
         filesystems.append(Bind("/run", "/run", readonly=True))
 
-    return Launch(
-        sandbox=Sandbox(
-            filesystems=tuple(filesystems),
-            chdir=chdir,
-            become_root=not args.relaxed,
-            isolate_network=not args.relaxed and not args.network,
-            suppress_chown=not args.relaxed,
-            suppress_sync=not args.relaxed,
-        ),
-        command=command,
-        environment=environment,
-    )
+    return Launch(filesystems=tuple(filesystems), chdir=chdir, command=command, environment=environment)
+
+
+def _clone_project(stack: ExitStack) -> Bind | None:
+    # overlayfs rejects locked submounts, so clone the mount tree before entering the user namespace.
+    project = Bind(os.getcwd(), _PROJECT)
+    try:
+        stack.enter_context(project)
+    except OSError as error:
+        # An unprivileged caller can clone mounts only after unshare_sandbox() creates its mount namespace.
+        if error.errno != errno.EPERM:
+            raise
+        return None
+    return project
 
 
 def main(argv: list[str] | None = None) -> NoReturn:
     args = _parse(argv)
-    launch = _launch(args)
+    # `layers` lists the layers of the tools tree top first, which is the order of overlayfs lower
+    # directories.
+    layers = tuple(reversed(args.tools))
     try:
-        enter(launch.sandbox)
+        check_kernel()
+        with ExitStack() as stack:
+            project = _clone_project(stack) if args.bind_cwd else None
+            unshare_sandbox(
+                become_root=not args.relaxed,
+                isolate_network=not args.relaxed and not args.network,
+            )
+            # The tools tree is opened after unshare_sandbox(), so that an overlay of its layers belongs to
+            # the sandbox's user namespace.
+            tools = open_layers(layers)
+            stack.enter_context(Close(tools))
+            launch = _launch(args, tools, project)
+            # The mounts take their sources from paths in the host's root, so they are entered before
+            # enter_sandbox() changes the root. _clone_project() already entered `project`.
+            for filesystem in launch.filesystems:
+                if not isinstance(filesystem, Symlink) and filesystem is not project:
+                    stack.enter_context(filesystem)
+            enter_sandbox(
+                launch.filesystems,
+                launch.chdir,
+                suppress_chown=not args.relaxed,
+                suppress_sync=not args.relaxed,
+            )
     except SandboxOSError as error:
         print(error.message, file=sys.stderr)
         raise

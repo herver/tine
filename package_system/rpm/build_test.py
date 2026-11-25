@@ -5,16 +5,33 @@
 
 import contextlib
 import errno
+import hashlib
+import io
 import shutil
 import subprocess
 import tempfile
 import unittest
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
 import build
+
+SHOWRC = b"%_topdir /build\n"
+
+
+def answering_showrc[T](run: Callable[..., T]) -> Callable[..., T | subprocess.CompletedProcess[bytes]]:
+    """Wrap the fake `run` so that it answers `rpmbuild --showrc` with SHOWRC."""
+
+    def dispatch(
+        command: list[str], *args: object, **kwargs: object
+    ) -> T | subprocess.CompletedProcess[bytes]:
+        if "--showrc" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=SHOWRC)
+        return run(command, *args, **kwargs)
+
+    return dispatch
 
 
 class BuildRpm(unittest.TestCase):
@@ -32,6 +49,15 @@ class BuildRpm(unittest.TestCase):
         self.project.mkdir()
         self.auxiliary = self.scratch / "auxiliary"
         self.auxiliary.write_text("packaging input\n")
+        # The tests replace the buildroot mount, so the buildroot doesn't need a snapshot to restore.
+        self.enterContext(mock.patch.object(build.builder.rootfs.uapi16, "Snapshot"))
+        self.enterContext(
+            mock.patch.object(
+                build.builder.rootfs.storage,
+                "root",
+                return_value=contextlib.nullcontext(build.builder.rootfs.storage.Root(Path("buildroot"))),
+            )
+        )
 
     def specification(
         self,
@@ -39,23 +65,31 @@ class BuildRpm(unittest.TestCase):
         *,
         build_dir: Path | None = None,
         spec_file: Path | None = None,
+        in_place_spec: str | None = None,
         subpackages: list[str] | None = None,
+        sources: list[Path] | None = None,
+        strict_subpackages: bool = True,
     ) -> build.Spec:
         """Return a complete driver spec for one test build."""
         return build.Spec(
             build_dir=str(build_dir) if build_dir is not None else None,
             lower=["buildroot"],
             spec_file=str(spec_file or self.spec_file),
-            sources=[str(self.auxiliary)],
+            in_place_spec=in_place_spec,
+            sources=[str(source) for source in sources] if sources is not None else [str(self.auxiliary)],
             dist=".test",
+            # rpm_package keeps the build directory of every dev build, and only of a dev build.
+            incremental=build_dir is not None,
             source_date_epoch=1234567890,
             release="7",
             out=str(self.project / "out"),
             subpackages=subpackages or [],
             subpackages_out=str(self.project / "subpackages-out"),
-            in_place_rpmbuild_options=["--define", "local_option yes"],
+            # The rule passes the in-place options only to a build with a source tree.
+            in_place_rpmbuild_options=["--define", "local_option yes"] if source_tree is not None else [],
             rpmbuild_options=["--define", "common_option yes"],
             source_tree=str(source_tree) if source_tree is not None else None,
+            strict_subpackages=strict_subpackages,
         )
 
     def invoke(
@@ -77,11 +111,13 @@ class BuildRpm(unittest.TestCase):
 
         with (
             contextlib.chdir(self.project),
-            mock.patch.object(build.rootfs, "rootfs", return_value=contextlib.nullcontext()) as mounted,
-            mock.patch.object(build.subprocess, "run", side_effect=run) as process,
+            mock.patch.object(
+                build.builder.rootfs, "rootfs", return_value=contextlib.nullcontext()
+            ) as mounted,
+            mock.patch.object(build.subprocess, "run", side_effect=answering_showrc(run)) as process,
             # Patch the module wrapper first so TemporaryDirectory still uses the real rmtree.
-            mock.patch.object(build, "shutil", mock.Mock(wraps=shutil)),
-            mock.patch.object(build.shutil, "rmtree") as remove,
+            mock.patch.object(build.builder, "shutil", mock.Mock(wraps=shutil)),
+            mock.patch.object(build.builder.shutil, "rmtree") as remove,
             mock.patch.object(tempfile, "tempdir", str(self.scratch)),
         ):
             self.assertEqual(build.build_rpm(spec), 0)
@@ -104,7 +140,7 @@ class BuildRpm(unittest.TestCase):
         self.assertIsNone(cwd)
         self.assertEqual(environment["SOURCE_DATE_EPOCH"], "1234567890")
         self.assertNotIn("_annotated_build", command)
-        self.assertEqual(binds, [(topdir, "/build")])
+        self.assertEqual(binds, [(topdir, Path("/build"))])
         self.assertEqual((topdir / "SOURCES" / "auxiliary").read_text(), "packaging input\n")
         frozen = (topdir / "SPECS" / "example.spec").read_text()
         self.assertTrue(frozen.startswith("%global autorelease 7%{?dist}\n%global autochangelog %{nil}\n"))
@@ -124,6 +160,9 @@ class BuildRpm(unittest.TestCase):
         self.assertIn("-bb", command)
         self.assertIn("--noprep", command)
         self.assertIn("--build-in-place", command)
+        prefix_map = "-fdebug-prefix-map=/build/CHECKOUT=%{builddir}/%{NAME}-%{VERSION}"
+        for lang in ("cflags", "cxxflags", "fflags"):
+            self.assertIn(f"_distro_extra_{lang} {prefix_map}", command)
         self.assertIn("common_option yes", command)
         self.assertIn("local_option yes", command)
         self.assertNotIn("_binary_payload w.ufdio", command)
@@ -133,7 +172,7 @@ class BuildRpm(unittest.TestCase):
         self.assertNotIn("debug_package %{nil}", command)
         self.assertNotIn("-ba", command)
         self.assertEqual(command[-1], "/build/SPECS/example.spec")
-        self.assertEqual(binds, [(topdir, "/build")])
+        self.assertEqual(binds, [(topdir, Path("/build"))])
         self.assertEqual(cwd, Path("/build/CHECKOUT"))
         self.assertEqual(list((topdir / "CHECKOUT").iterdir()), [])
         self.assertEqual((topdir / "SOURCES" / "auxiliary").read_text(), "packaging input\n")
@@ -147,14 +186,18 @@ class BuildRpm(unittest.TestCase):
         local_spec.write_text("Name: from-checkout\nSource1: helper\n")
         (packaging / "helper").write_text("checkout helper\n")
 
-        specification = self.specification(source, spec_file=local_spec)
+        specification = self.specification(source, in_place_spec="packaging/fedora/local.spec")
 
         def inspect(topdir: Path) -> None:
-            frozen = (topdir / "CHECKOUT" / "packaging" / "fedora" / "local.spec").read_text()
+            frozen = (topdir / "SPECS" / "local.spec").read_text()
             self.assertTrue(
                 frozen.startswith("%global autorelease 7%{?dist}\n%global autochangelog %{nil}\n")
             )
             self.assertIn("Name: from-checkout\n", frozen)
+            self.assertEqual(
+                (topdir / "CHECKOUT" / "packaging" / "fedora" / "local.spec").read_text(),
+                "Name: from-checkout\nSource1: helper\n",
+            )
             self.assertEqual(
                 (topdir / "CHECKOUT" / "packaging" / "fedora" / "helper").read_text(),
                 "checkout helper\n",
@@ -162,17 +205,95 @@ class BuildRpm(unittest.TestCase):
 
         command, cwd, _environment, topdir, _binds = self.invoke(specification, inspect)
 
-        self.assertEqual(command[-1], "/build/CHECKOUT/packaging/fedora/local.spec")
+        self.assertEqual(command[-1], "/build/SPECS/local.spec")
         self.assertIn("_sourcedir /build/CHECKOUT/packaging/fedora", command)
         self.assertEqual(cwd, Path("/build/CHECKOUT"))
         self.assertEqual(list((topdir / "CHECKOUT").iterdir()), [])
         self.assertFalse((topdir / "SOURCES" / "auxiliary").exists())
         self.assertEqual(local_spec.read_text(), "Name: from-checkout\nSource1: helper\n")
 
+    def test_a_declared_spec_in_the_source_tree_is_not_in_place(self) -> None:
+        # A source tree can be the project root, which also contains the declared spec. Without
+        # `in_place_spec`, the build must stage the declared spec and sources as for an archive build.
+        # Pass a source tree that contains the spec and check that rpmbuild takes the sources from
+        # SOURCES.
+        source = self.scratch / "checkout"
+        source.mkdir()
+        (source / "declared.spec").write_text("Name: declared\n")
+
+        command, cwd, _environment, topdir, _binds = self.invoke(
+            self.specification(source, spec_file=source / "declared.spec")
+        )
+
+        self.assertEqual(command[-1], "/build/SPECS/declared.spec")
+        self.assertFalse([argument for argument in command if argument.startswith("_sourcedir")])
+        self.assertEqual(cwd, Path("/build/CHECKOUT"))
+        self.assertEqual(sorted(path.name for path in (topdir / "SOURCES").iterdir()), ["auxiliary"])
+
+    def pinned_packaging(self) -> tuple[Path, Path]:
+        """Return a checkout and a dist-git tree with a spec, a patch and a directory of tests."""
+        source = self.scratch / "checkout"
+        source.mkdir()
+        packaging = self.project / "packaging"
+        (packaging / "tests").mkdir(parents=True)
+        (packaging / "example.spec").write_text("Name: pinned\nPatch0: fix.patch\n")
+        (packaging / "fix.patch").write_text("pinned patch\n")
+        (packaging / "tests" / "main.fmf").write_text("summary: test\n")
+        return source, packaging
+
+    def test_pinned_packaging_replaces_the_declared_spec_and_sources(self) -> None:
+        source, packaging = self.pinned_packaging()
+        specification = self.specification(
+            source, spec_file=packaging / "example.spec", sources=[packaging], strict_subpackages=False
+        )
+
+        command, _cwd, _environment, topdir, _binds = self.invoke(specification)
+
+        self.assertEqual(command[-1], "/build/SPECS/example.spec")
+        self.assertFalse([argument for argument in command if argument.startswith("_sourcedir")])
+        self.assertIn("Name: pinned\n", (topdir / "SPECS" / "example.spec").read_text())
+        self.assertEqual(
+            sorted(path.name for path in (topdir / "SOURCES").iterdir()), ["example.spec", "fix.patch"]
+        )
+        self.assertEqual((topdir / "SOURCES" / "fix.patch").read_text(), "pinned patch\n")
+
+    def produce(self, *names: str) -> Callable[[Path], None]:
+        def produce(topdir: Path) -> None:
+            built = topdir / "RPMS/x86_64"
+            built.mkdir(parents=True)
+            for name in names:
+                (built / f"{name}-1-7.test.x86_64.rpm").write_text(f"{name}\n")
+
+        return produce
+
+    def test_pinned_packaging_reports_a_subpackage_mismatch_without_failing(self) -> None:
+        source, packaging = self.pinned_packaging()
+        specification = self.specification(
+            source,
+            spec_file=packaging / "example.spec",
+            sources=[packaging],
+            strict_subpackages=False,
+            subpackages=["example", "example-imds"],
+        )
+
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.invoke(specification, self.produce("example", "example-ukify"))
+
+        self.assertIn("declared but not produced: ['example-imds']", stderr.getvalue())
+        self.assertIn("produced but not declared: ['example-ukify-1-7.test.x86_64.rpm']", stderr.getvalue())
+        subpackages = self.project / "subpackages-out"
+        self.assertEqual(sorted(path.name for path in subpackages.iterdir()), ["example.rpm"])
+        self.assertEqual((subpackages / "example.rpm").read_text(), "example\n")
+
+    def test_imported_packaging_fails_on_a_subpackage_mismatch(self) -> None:
+        specification = self.specification(None, subpackages=["example", "example-imds"])
+        with self.assertRaisesRegex(SystemExit, r"declared but not produced: \['example-imds'\]"):
+            self.invoke(specification, self.produce("example"))
+
     def test_spec_path_cannot_escape_the_source_tree(self) -> None:
         source = self.scratch / "checkout"
         source.mkdir()
-        spec = self.specification(source, spec_file=source / ".." / self.spec_file.name)
+        spec = self.specification(source, in_place_spec="../" + self.spec_file.name)
         with (
             contextlib.chdir(self.project),
             mock.patch.object(tempfile, "tempdir", str(self.scratch)),
@@ -184,9 +305,9 @@ class BuildRpm(unittest.TestCase):
     def test_missing_spec_has_a_useful_error(self) -> None:
         source = self.scratch / "checkout"
         source.mkdir()
-        for spec_file in (source / "missing.spec", self.scratch / "missing.spec"):
-            with self.subTest(spec_file=spec_file):
-                spec = self.specification(source, spec_file=spec_file)
+        for in_place_spec, spec_file in (("missing.spec", None), (None, self.scratch / "missing.spec")):
+            with self.subTest(in_place_spec=in_place_spec, spec_file=spec_file):
+                spec = self.specification(source, spec_file=spec_file, in_place_spec=in_place_spec)
                 case = tempfile.mkdtemp(dir=self.scratch)
                 with (
                     contextlib.chdir(self.project),
@@ -213,6 +334,7 @@ class BuildRpm(unittest.TestCase):
         build_dir = self.project / "incremental"
         build_dir.mkdir()
         (build_dir / "cached-object").write_text("keep\n")
+        (build_dir / build.MACROS_STAMP).write_text(hashlib.sha256(SHOWRC).hexdigest())
         out = self.project / "out"
         out.mkdir()
         (out / "stale.rpm").write_text("old\n")
@@ -233,7 +355,7 @@ class BuildRpm(unittest.TestCase):
         self.assertIn("_vpath_builddir /build/BUILD", command)
         self.assertIn("local_option yes", command)
         self.assertLess(command.index("debug_package %{nil}"), command.index("local_option yes"))
-        self.assertEqual(binds, [(topdir, "/build")])
+        self.assertEqual(binds, [(topdir, Path("/build"))])
         self.assertEqual((build_dir / "cached-object").read_text(), "keep\n")
         self.assertFalse((out / "stale.rpm").exists())
         self.assertFalse((subpackages / "stale.rpm").exists())
@@ -253,7 +375,32 @@ class BuildRpm(unittest.TestCase):
         self.assertIn("_vpath_builddir /build/BUILD", command)
         self.assertNotIn("local_option yes", command)
         self.assertIsNone(cwd)
-        self.assertEqual(binds, [(topdir, "/build")])
+        self.assertEqual(binds, [(topdir, Path("/build"))])
+
+    def test_changed_macros_empty_the_build_directory(self) -> None:
+        # A build system can keep the compiler flags of its first configure run in the build
+        # directory. When the digest of `rpmbuild --showrc` differs from the stamp in the build
+        # directory, or there is no stamp, the driver must empty the build directory before rpmbuild
+        # runs and record the new digest.
+        digest = hashlib.sha256(SHOWRC).hexdigest()
+        for stamp in ("stale digest", None):
+            with self.subTest(stamp=stamp):
+                build_dir = Path(tempfile.mkdtemp(dir=self.project))
+                (build_dir / "meson-private").mkdir()
+                (build_dir / "meson-private" / "coredata.dat").write_text("old flags\n")
+                if stamp is not None:
+                    (build_dir / build.MACROS_STAMP).write_text(stamp)
+
+                def inspect(topdir: Path) -> None:
+                    self.assertEqual(
+                        sorted(path.name for path in (topdir / "BUILD").iterdir()), [build.MACROS_STAMP]
+                    )
+
+                self.invoke(self.specification(build_dir=build_dir), inspect)
+                shutil.rmtree(self.scratch / "topdir", ignore_errors=True)
+
+                self.assertEqual([path.name for path in build_dir.iterdir()], [build.MACROS_STAMP])
+                self.assertEqual((build_dir / build.MACROS_STAMP).read_text(), digest)
 
     def test_source_writes_are_discarded_and_build_state_survives_failure(self) -> None:
         source = self.scratch / "checkout"
@@ -287,8 +434,8 @@ class BuildRpm(unittest.TestCase):
 
                 with (
                     contextlib.chdir(self.project),
-                    mock.patch.object(build.rootfs, "rootfs", return_value=contextlib.nullcontext()),
-                    mock.patch.object(build.subprocess, "run", side_effect=run),
+                    mock.patch.object(build.builder.rootfs, "rootfs", return_value=contextlib.nullcontext()),
+                    mock.patch.object(build.subprocess, "run", side_effect=answering_showrc(run)),
                     mock.patch.object(tempfile, "tempdir", str(case)),
                 ):
                     if isinstance(outcome, RuntimeError):
@@ -303,11 +450,11 @@ class BuildRpm(unittest.TestCase):
                 else:
                     self.assertEqual(list((topdir / "CHECKOUT").iterdir()), [])
 
-    def test_spec_symlink_cannot_write_outside_the_staged_checkout(self) -> None:
+    def test_spec_symlink_cannot_escape_the_staged_checkout(self) -> None:
         source = self.scratch / "checkout"
         source.mkdir()
         (source / "escape.spec").symlink_to(self.spec_file)
-        spec = self.specification(source, spec_file=source / "escape.spec")
+        spec = self.specification(source, in_place_spec="escape.spec")
         topdir = self.scratch / "topdir"
         with (
             contextlib.chdir(self.project),
@@ -318,67 +465,58 @@ class BuildRpm(unittest.TestCase):
         self.assertEqual(self.spec_file.read_text(), "Name: example\n")
         self.assertEqual(list((topdir / "CHECKOUT").iterdir()), [])
 
-    def test_capture_makes_build_trees_removable_after_unmount(self) -> None:
-        for persistent in (False, True):
-            for outcome in (0, 1, RuntimeError("rpmbuild interrupted")):
-                with self.subTest(persistent=persistent, outcome=outcome):
-                    case = Path(tempfile.mkdtemp(dir=self.scratch))
-                    topdir = case / "topdir"
-                    # The persistent build directory is an output, so it is in the project. rpmbuild
-                    # writes to it through its mount at topdir/BUILD while the project is read-only.
-                    build_dir = Path(tempfile.mkdtemp(dir=self.project)) / "state" if persistent else None
-                    directories = [topdir / "BUILDROOT" / "usr"]
-                    if build_dir is not None:
-                        directories.append(topdir / "BUILD" / "installed")
-                    # The build directory content is at `build_dir` again after the unmount.
-                    captured = list(directories)
-                    if build_dir is not None:
-                        captured[-1] = build_dir / "installed"
+    def test_escapes_names_in_the_persistent_build_directory(self) -> None:
+        # Buck stores the persistent build directory and can't store a name with a backslash. Let
+        # rpmbuild write such a name into BUILDROOT and into the persistent build directory, and check
+        # that only the build directory contains the escaped name afterwards, for every outcome of the
+        # build. A successful build must also remove topdir.
+        for outcome in (0, 1, RuntimeError("rpmbuild interrupted")):
+            with self.subTest(outcome=outcome):
+                case = Path(tempfile.mkdtemp(dir=self.scratch))
+                topdir = case / "topdir"
+                # The persistent build directory is an output, so it is in the project. rpmbuild writes to
+                # it through its mount at topdir/BUILD while the project is read-only.
+                build_dir = Path(tempfile.mkdtemp(dir=self.project)) / "state"
 
-                    def run(
-                        *_args: object,
-                        trees: list[Path] = directories,
-                        result: int | RuntimeError = outcome,
-                        **_kwargs: object,
-                    ) -> subprocess.CompletedProcess[str]:
-                        for directory in trees:
-                            directory.mkdir(parents=True)
-                            (directory / "payload").write_text("keep\n")
-                            directory.chmod(0o555)
-                        if isinstance(result, RuntimeError):
-                            raise result
-                        return subprocess.CompletedProcess([], result)
+                def run(
+                    *_args: object,
+                    top: Path = topdir,
+                    result: int | RuntimeError = outcome,
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    for directory in (top / "BUILDROOT", top / "BUILD"):
+                        directory.mkdir(parents=True, exist_ok=True)
+                        (directory / "back\\slash").write_text("keep\n")
+                    if isinstance(result, RuntimeError):
+                        raise result
+                    return subprocess.CompletedProcess([], result)
 
-                    @contextlib.contextmanager
-                    def mounted(trees: list[Path] = directories) -> Iterator[None]:
-                        try:
-                            yield
-                        finally:
-                            for directory in trees:
-                                self.assertEqual(directory.stat().st_mode & 0o777, 0o555)
-
-                    with (
-                        contextlib.chdir(self.project),
-                        mock.patch.object(build.rootfs, "rootfs", return_value=mounted()),
-                        mock.patch.object(build.subprocess, "run", side_effect=run),
-                        mock.patch.object(build.shutil, "rmtree") as remove,
-                        mock.patch.object(tempfile, "tempdir", str(case)),
-                    ):
-                        spec = self.specification(build_dir=build_dir)
-                        if isinstance(outcome, RuntimeError):
-                            with self.assertRaises(RuntimeError) as raised:
-                                build.build_rpm(spec)
-                            self.assertIs(raised.exception, outcome)
-                        else:
-                            self.assertEqual(build.build_rpm(spec), outcome)
-
-                    for directory in captured:
-                        self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
-                        self.assertEqual((directory / "payload").read_text(), "keep\n")
-                    if outcome == 0:
-                        remove.assert_called_once_with(topdir)
+                with (
+                    contextlib.chdir(self.project),
+                    mock.patch.object(build.builder.rootfs, "rootfs", return_value=contextlib.nullcontext()),
+                    # A persistent build reads the macros of the buildroot with rpm --showrc before rpmbuild.
+                    mock.patch.object(build.subprocess, "run", side_effect=answering_showrc(run)),
+                    mock.patch.object(build.builder.shutil, "rmtree") as remove,
+                    mock.patch.object(tempfile, "tempdir", str(case)),
+                ):
+                    spec = self.specification(build_dir=build_dir)
+                    if isinstance(outcome, RuntimeError):
+                        with self.assertRaises(RuntimeError) as raised:
+                            build.build_rpm(spec)
+                        self.assertIs(raised.exception, outcome)
                     else:
-                        remove.assert_not_called()
+                        self.assertEqual(build.build_rpm(spec), outcome)
+
+                # The build also records the macros of the buildroot in the persistent build directory.
+                self.assertEqual(
+                    sorted(path.name for path in build_dir.iterdir()),
+                    [".esc.back%5Cslash", build.MACROS_STAMP],
+                )
+                self.assertEqual([path.name for path in (topdir / "BUILDROOT").iterdir()], ["back\\slash"])
+                if outcome == 0:
+                    remove.assert_called_once_with(topdir)
+                else:
+                    remove.assert_not_called()
 
 
 if __name__ == "__main__":

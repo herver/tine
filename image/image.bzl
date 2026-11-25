@@ -1,15 +1,15 @@
 # SPDX-FileCopyrightText: Amutable GmbH <https://amutable.com/>
 # SPDX-License-Identifier: MPL-2.0
 
-"""Logical filesystem images built as ordered overlay deltas."""
+"""Logical filesystem images stored as complete snapshots and immutable blobs."""
 
-load("//:specs.bzl", "executable", "spec_args", "spec_argument")
-load("//box:runtime.bzl", "BoxInfo", "box_run")
+load("//:specs.bzl", "specs")
+load("//box:defs.bzl", "box")
 load("//distribution:defs.bzl", "distribution")
 load("//package:install.bzl", "resolve_packages")
 load("//package:manager.bzl", "PackageManagerInfo")
 load("//package:system.bzl", "PackageSystemInfo")
-load("//platforms:architecture.bzl", "ARCHITECTURES", "architecture")
+load("//platform:architecture.bzl", "architecture")
 load(":sign.bzl", "SigningAccess", "SigningKeyInfo", "external_signing_execution", "key_source_arguments", "merge_signing_access")
 
 ImageToolsInfo = provider(
@@ -19,13 +19,13 @@ ImageToolsInfo = provider(
         "artifacts": provider_field(Dependency),
         "boot": provider_field(Dependency),
         "convert": provider_field(Dependency),
-        "disk": provider_field(Dependency),
+        "ddi": provider_field(Dependency),
         "layer": provider_field(Dependency),
         "manifest": provider_field(Dependency),
+        "preload": provider_field(Dependency),
         "python": provider_field(Dependency),
         "sbom": provider_field(Dependency),
         "syft": provider_field(Dependency),
-        "sysext": provider_field(Dependency),
         "uki": provider_field(Dependency),
     },
 )
@@ -35,13 +35,13 @@ _TOOLS = [
     "artifacts",
     "boot",
     "convert",
-    "disk",
+    "ddi",
     "layer",
     "manifest",
+    "preload",
     "python",
     "sbom",
     "syft",
-    "sysext",
     "uki",
 ]
 
@@ -95,7 +95,7 @@ def check_version(what: str, value: str) -> str:
     if value == AUTO or value.startswith(AUTO_PREFIX):
         fail(
             "{}: version {!r} reached the build unresolved. Declare it on a rule that renders it ".format(what, value)
-            + "(rootfs_archive, sysext_image, initrd_image, bootable_disk_image) and not through a "
+            + "(archive, sysext, confext, extension, portable, initrd_image, disk) and not through a "
             + 'select(), or name the version outright; see "Image versioning" in images.md.',
         )
     return check_name(what, value, VERSION_PATTERN)
@@ -120,7 +120,7 @@ ImageSbomInfo = provider(
 )
 
 ImageInfo = provider(
-    doc = "A logical filesystem image represented by an ordered delta stack and lazy metadata.",
+    doc = "A logical filesystem image represented by snapshot stores and lazy metadata.",
     fields = {
         "box": provider_field(Dependency),
         # Accumulated install specs; they seed the local-packages closure of every derived layer
@@ -133,17 +133,14 @@ ImageInfo = provider(
         # Absent only when the image installs no packages and so has no package system.
         "pkgdb": provider_field(Artifact | None, default = None),
         "sbom": provider_field(ImageSbomInfo),
-        # Ownership is deliberately not represented: image outputs use uid/gid 0.
-        "tmpfiles": provider_field(list[str]),
     },
 )
 
 def _image_command(
     ctx: AnalysisContext,
     *,
-    box: Dependency,
+    box_dep: Dependency,
     layers: list[Artifact],
-    tmpfiles: list[str],
     exe: Dependency,
     driver: str,
     identifier: str | None,
@@ -151,16 +148,16 @@ def _image_command(
     signing_access: SigningAccess | None = None,
 ) -> cmd_args:
     return cmd_args(
-        box_run(
-            box = box[BoxInfo],
+        box.run(
+            box = box_dep[box.Info],
             exe = exe,
             ro_binds = signing_access.ro_binds if signing_access else {},
             setenv = signing_access.setenv if signing_access else {},
         ),
-        spec_args(
+        specs.args(
             ctx.actions,
             spec_path(identifier, driver),
-            {"lower": layers, "tmpfiles": tmpfiles} | spec,
+            {"lower": layers} | spec,
         ),
     )
 
@@ -176,19 +173,18 @@ def terminal_image_command(
 ) -> cmd_args:
     """Run a terminal driver against one finalized logical-image stack.
 
-    The stack and its deferred tmpfiles join the driver's own fields in one spec. `signing_access`
+    The stack joins the driver's own fields in one spec. `signing_access`
     grants the driver what an externally held signing key needs from the host.
     """
     return _image_command(
         ctx,
         signing_access = signing_access,
         driver = driver,
-        box = image.box,
+        box_dep = image.box,
         exe = exe,
         identifier = identifier,
         layers = image.layers,
         spec = spec,
-        tmpfiles = image.tmpfiles,
     )
 
 def pkgdb_paths(image: ImageInfo) -> list[str]:
@@ -265,13 +261,14 @@ SelectableArtifact = str | Artifact | Select
 
 # Operations replayed by the layer driver.
 
-def run(cmd: list[SelectableArtifact] | Select, env: dict[str, Selectable] = {}, chroot: bool | Select = False) -> LayerOperation:
+def _run(cmd: list[SelectableArtifact] | Select, env: dict[str, Selectable] = {}, chroot: bool | Select = False) -> LayerOperation:
     """Run `cmd` against the image, either with the box's tooling or the image's own.
 
     By default the box supplies the userspace and the image is mounted at /buildroot. With
-    `chroot`, the command runs inside the image instead, and the project is bind-mounted at a
+    `chroot`, the command runs inside the image instead, and the project is bind-mounted read-only at a
     fixed path which becomes the working directory, so an artifact argument resolves the same
-    either way and a script the repository owns can simply be run.
+    either way and a script the repository owns can simply be run. A chrooted command writes its outputs
+    to paths in the image because its project working directory is read-only.
 
     An argument names a build artifact by being one, or by spelling `$(location //target)` in a
     BUCK file. Buck's macro parser claims `$(...)`, so a shell substitution has to be written
@@ -279,7 +276,7 @@ def run(cmd: list[SelectableArtifact] | Select, env: dict[str, Selectable] = {},
     """
     return ("run", cmd, _environment(env), chroot)
 
-def python(cmd: list[SelectableArtifact], env: dict[str, Selectable] = {}, chroot: bool | Select = False) -> LayerOperation:
+def _python(cmd: list[SelectableArtifact], env: dict[str, Selectable] = {}, chroot: bool | Select = False) -> LayerOperation:
     """Run a python script against the image, with the interpreter Buck already pins.
 
     `chroot` picks the image's view exactly as it does for `run`: mounted at /buildroot by default,
@@ -298,23 +295,23 @@ def python(cmd: list[SelectableArtifact], env: dict[str, Selectable] = {}, chroo
 def _environment(env: dict[str, Selectable]) -> dict[str, Selectable]:
     return {name: env[name] for name in sorted(env)}
 
-def mkdir(path: Selectable) -> LayerOperation:
+def _mkdir(path: Selectable) -> LayerOperation:
     """Create a directory in the image."""
     return ("mkdir", path)
 
-def symlink(target: Selectable, path: Selectable) -> LayerOperation:
+def _symlink(target: Selectable, path: Selectable) -> LayerOperation:
     """Create a symlink at `path` pointing at `target`."""
     return ("symlink", target, path)
 
-def write_file(path: Selectable, content: Selectable = "") -> LayerOperation:
+def _write_file(path: Selectable, content: Selectable = "") -> LayerOperation:
     """Write a file at `path` in the image holding exactly `content`."""
     return ("write_file", path, content)
 
-def remove(path: Selectable) -> LayerOperation:
+def _remove(path: Selectable) -> LayerOperation:
     """Remove every image path matching an absolute glob pattern."""
     return ("remove", path)
 
-def copy(source: SelectableArtifact | None, destination: Selectable) -> LayerOperation:
+def _copy(source: SelectableArtifact | None, destination: Selectable) -> LayerOperation:
     """Copy a declared artifact to an absolute path in the image.
 
     A `select()` may resolve `source` to `None`, in which case nothing is copied: that is how a
@@ -322,7 +319,7 @@ def copy(source: SelectableArtifact | None, destination: Selectable) -> LayerOpe
     """
     return ("copy", source, destination)
 
-def install_from(target: str) -> LayerOperation:
+def _install_from(target: str) -> LayerOperation:
     """Install what an `image_install()` target needs and apply the operations it attaches."""
     return ("install_from", target)
 
@@ -346,15 +343,22 @@ def expand_install_from(ops: list[typing.Any]) -> (list[str], list[typing.Any]):
             expanded.append(operation)
     return packages, expanded
 
-def merge_os_release(fields: dict[str, str]) -> LayerOperation:
+def _merge_os_release(fields: dict[str, str]) -> LayerOperation:
     """Merge quoted KEY="value" assignments into the image's /usr/lib/os-release."""
     return ("os_release", fields)
 
-def depmod() -> LayerOperation:
-    """Rebuild the module indexes for every kernel the image installs, with the image's depmod."""
+def extension_release_operation(path: str, fields: dict[str, str], pin: bool) -> LayerOperation:
+    """Write the extension-release file `path` with `fields`.
+
+    With `pin`, the file also matches the os-release of the image below it (see layer.pin_release).
+    """
+    return ("extension_release", path, fields, pin)
+
+def _depmod() -> LayerOperation:
+    """Rebuild the module indexes for every kernel the image installs."""
     return ("depmod",)
 
-def hwdb(usr: bool = True, strict: bool = True) -> LayerOperation:
+def _hwdb(usr: bool = True, strict: bool = True) -> LayerOperation:
     """Compile the image's hwdb.d into the binary database udev reads.
 
     It lands in /usr, where the image ships it and nothing writable shadows it; `usr = False`
@@ -362,14 +366,22 @@ def hwdb(usr: bool = True, strict: bool = True) -> LayerOperation:
     """
     return ("hwdb", usr, strict)
 
-def locale_gen() -> LayerOperation:
-    """Generate the locales the image's /etc/locale.gen asks for, with its own locale-gen."""
+def _preset(vendor: bool = False) -> LayerOperation:
+    """Enable and disable the image's system and global user units as its preset policy says.
+
+    `vendor = True` writes the enablement symlinks below /usr instead of /etc, for an image that boots
+    with an empty /etc. It needs systemctl from systemd 263 or newer in the tools box.
+    """
+    return ("preset", vendor)
+
+def _locale_gen() -> LayerOperation:
+    """Generate the locales the image's /etc/locale.gen lists into the image's locale archive."""
     return ("locale_gen",)
 
 # Every generator, for the compositions: they declare a whole product rather than one layer, so they
 # generate the state its packages only describe instead of leaving that to their caller. Each is a
 # no-op on an image carrying none of what it acts on, so the same three fit every composition.
-_GENERATORS = [depmod(), hwdb(), locale_gen()]
+_GENERATORS = [_depmod(), _hwdb(), _locale_gen()]
 
 def generated(ops: list[LayerOperation], installs: list[str]) -> list[LayerOperation]:
     """Append the generators `ops` does not already place, which is what a composition ends with."""
@@ -390,10 +402,10 @@ def sign_systemd_boot(key: SigningKeyInfo, arch: str) -> list[LayerOperation]:
     Sign before anything seals /usr, e.g. a verity partition; architecture.md explains why the signed
     binary must live in the image's own /usr. The key material never enters the image.
     """
-    binary = "/buildroot/usr/lib/systemd/boot/efi/systemd-boot{}.efi".format(ARCHITECTURES[arch].efi)
+    binary = "/buildroot/usr/lib/systemd/boot/efi/systemd-boot{}.efi".format(architecture.ARCHITECTURES[arch].efi)
     return [
         # systemd-sbsign lives outside PATH in the box.
-        run(
+        _run(
             [
                 "/usr/lib/systemd/systemd-sbsign",
                 "sign",
@@ -410,7 +422,7 @@ def sign_systemd_boot(key: SigningKeyInfo, arch: str) -> list[LayerOperation]:
         ),
     ]
 
-def install_systemd_boot(key: SigningKeyInfo | None = None) -> list[LayerOperation]:
+def _install_systemd_boot(key: SigningKeyInfo | None = None) -> list[LayerOperation]:
     """Return operations that install systemd-boot into the image ESP staging paths.
 
     With a signing key, bootctl prefers the `.signed` binaries (see sign_systemd_boot) and
@@ -427,8 +439,8 @@ def install_systemd_boot(key: SigningKeyInfo | None = None) -> list[LayerOperati
             key.private_key,
         ] + key_source_arguments(key)
     return [
-        mkdir("/efi"),
-        run(
+        _mkdir("/efi"),
+        _run(
             [
                 "bootctl",
                 "install",
@@ -443,20 +455,37 @@ def install_systemd_boot(key: SigningKeyInfo | None = None) -> list[LayerOperati
                 "SYSTEMD_XBOOTLDR_PATH": "/boot",
             },
         ),
-        remove("/efi/loader/random-seed"),
+        _remove("/efi/loader/random-seed"),
     ]
+
+ops = struct(
+    run = _run,
+    python = _python,
+    install_from = _install_from,
+    mkdir = _mkdir,
+    symlink = _symlink,
+    write_file = _write_file,
+    remove = _remove,
+    copy = _copy,
+    merge_os_release = _merge_os_release,
+    install_systemd_boot = _install_systemd_boot,
+    depmod = _depmod,
+    hwdb = _hwdb,
+    locale_gen = _locale_gen,
+    preset = _preset,
+)
 
 def _encode_operation(operation: LayerOperation, python: Dependency) -> LayerOperation:
     if operation[0] not in ("run", "python"):
         return operation
 
     # -B: the script and its imports are project sources, which no build may write bytecode into.
-    prefix = [executable(python), "-B"] if operation[0] == "python" else []
+    prefix = [specs.executable(python), "-B"] if operation[0] == "python" else []
 
     # A box argument is a plain string, an artifact, or a resolved $(location) macro.
     return (
         "run",
-        prefix + [spec_argument(argument) for argument in operation[1]],
+        prefix + [specs.argument(argument) for argument in operation[1]],
         operation[2],
         operation[3],
     )
@@ -467,25 +496,24 @@ def _install_specs(
     available: dict[str, list[str]] | None,
 ) -> list[str]:
     """Resolve a layer's requested packages and symbolic sets into one deduplicated request."""
-    specs = list(packages)
+    requested = list(packages)
     for name in package_sets:
         if available == None:
             fail("image: package_sets requires an image with a package manager")
         members = available.get(name)
         if members == None:
             fail("image: unknown package set {!r}".format(name))
-        specs += members
-    for spec in specs:
+        requested += members
+    for spec in requested:
         if not spec:
             fail("image: package names must not be empty")
-    return sorted({spec: None for spec in specs})
+    return sorted({spec: None for spec in requested})
 
 def _declare_pkgdb(
     ctx: AnalysisContext,
     *,
-    box: Dependency,
+    box_dep: Dependency,
     layers: list[Artifact],
-    tmpfiles: list[str],
     package_manager: Dependency,
     identifier: str | None,
 ) -> Artifact:
@@ -494,12 +522,11 @@ def _declare_pkgdb(
     cmd = _image_command(
         ctx,
         driver = "pkgdb",
-        box = box,
+        box_dep = box_dep,
         exe = system.pkgdb,
         identifier = identifier,
         layers = layers,
         spec = {"out": out.as_output()},
-        tmpfiles = tmpfiles,
     )
     ctx.actions.run(cmd, category = "image_pkgdb", identifier = identifier or "pkgdb")
     return out
@@ -508,9 +535,8 @@ def _declare_manifest(
     ctx: AnalysisContext,
     *,
     tools: ImageToolsInfo,
-    box: Dependency,
+    box_dep: Dependency,
     layers: list[Artifact],
-    tmpfiles: list[str],
     identifier: str | None,
 ) -> Artifact:
     # The name the format reserves for itself, so the listing can be dropped beside a tree of the
@@ -519,12 +545,11 @@ def _declare_manifest(
     cmd = _image_command(
         ctx,
         driver = "manifest",
-        box = box,
+        box_dep = box_dep,
         exe = tools.manifest,
         identifier = identifier,
         layers = layers,
         spec = {"out": out.as_output()},
-        tmpfiles = tmpfiles,
     )
     ctx.actions.run(cmd, category = "image_manifest", identifier = identifier or "manifest")
     return out
@@ -533,9 +558,8 @@ def _declare_sbom(
     ctx: AnalysisContext,
     *,
     tools: ImageToolsInfo,
-    box: Dependency,
+    box_dep: Dependency,
     layers: list[Artifact],
-    tmpfiles: list[str],
     source_name: str,
     version: str,
     identifier: str | None,
@@ -545,7 +569,7 @@ def _declare_sbom(
     cmd = _image_command(
         ctx,
         driver = "sbom",
-        box = box,
+        box_dep = box_dep,
         exe = tools.sbom,
         identifier = identifier,
         layers = layers,
@@ -554,9 +578,8 @@ def _declare_sbom(
             "source_name": source_name,
             "source_version": version,
             "spdx": spdx.as_output(),
-            "syft": executable(tools.syft),
+            "syft": specs.executable(tools.syft),
         },
-        tmpfiles = tmpfiles,
     )
     ctx.actions.run(cmd, category = "image_sbom", identifier = identifier or "sbom")
 
@@ -572,9 +595,8 @@ def declare_image(
     package_sets: list[str] = [],
     identifier: str | None = None,
     parent: ImageInfo | None = None,
-    box: Dependency | None = None,
+    box_dep: Dependency | None = None,
     package_manager: Dependency | None = None,
-    tmpfiles: list[str] = [],
     install_docs: bool = True,
     install_langs: list[str] = [],
     source_name: str | None = None,
@@ -585,32 +607,22 @@ def declare_image(
 
     The layer installs `packages` and `package_sets` as one request before its operations run, so
     every operation sees the packages this layer adds. `keys` names the signing keys this layer's
-    operations use, so that the action can reach one held outside the build.
+    operations use, so that the action can reach one held outside the build. An initial image runs in
+    `box_dep`, and a derived image runs in the box of its parent.
     """
     # Every image rule's version reaches its layers through here, which makes this the one place
     # that has to catch one no declaration macro resolved.
     check_version("image version", version)
     if parent != None:
-        if box != None or package_manager != None:
-            fail("image: parent cannot be combined with box or package_manager")
-        box = parent.box
+        if package_manager != None:
+            fail("image: parent cannot be combined with package_manager")
+        box_dep = parent.box
         package_manager = parent.package_manager
         layers = parent.layers
-        tmpfiles = parent.tmpfiles + tmpfiles
         parent_install_specs = parent.install_specs
     else:
-        if package_manager != None:
-            manager_box = package_manager[PackageManagerInfo].box
-            if box != None and box.label != manager_box.label:
-                fail(
-                    "image box {} does not match package manager box {}".format(
-                        box.label,
-                        manager_box.label,
-                    )
-                )
-            box = manager_box
-        if box == None:
-            fail("image requires parent, package_manager, or box")
+        if box_dep == None:
+            fail("image: an image without a parent requires a box")
         layers = []
         parent_install_specs = []
 
@@ -629,6 +641,7 @@ def declare_image(
             closure = resolve_packages(
                 ctx,
                 package_manager,
+                box_dep,
                 install_specs,
                 layers,
                 identifier = identifier,
@@ -636,37 +649,35 @@ def declare_image(
             )
             package_manager_info = package_manager[PackageManagerInfo]
 
-        delta = declare_out(ctx, identifier, "delta", dir = True)
-        work = declare_out(ctx, identifier, "overlay.work", dir = True) if layers else None
+        snapshot = declare_out(ctx, identifier, "snapshot", dir = True)
         spec = {
             "install": None,
             "lower": layers,
             "operations": [_encode_operation(operation, tools.python) for operation in operations],
-            "out": delta.as_output(),
-            "work": work.as_output() if work != None else None,
+            "out": snapshot.as_output(),
         }
         if package_manager_info != None:
             system = package_manager_info.package_system[PackageSystemInfo]
             spec["install"] = {
                 "arch": architecture.spelling(package_manager_info.arch, system.arch_schema),
                 "docs": install_docs,
-                "installer": executable(system.install),
+                "installer": specs.executable(system.install),
                 "langs": install_langs,
                 "packages_dir": closure,
             }
         signing_access = merge_signing_access(keys)
         cmd = cmd_args(
-            box_run(
-                box = box[BoxInfo],
+            box.run(
+                box = box_dep[box.Info],
                 exe = tools.layer,
                 ro_binds = signing_access.ro_binds,
                 setenv = signing_access.setenv,
             ),
-            spec_args(ctx.actions, spec_path(identifier, "layer"), spec),
+            specs.args(ctx.actions, spec_path(identifier, "layer"), spec),
         )
         ctx.actions.run(cmd, category = "image", identifier = identifier or "layer", **external_signing_execution(signing_access))
 
-        layers = layers + [delta]
+        layers = layers + [snapshot]
         install_specs = parent_install_specs + install_specs
     else:
         install_specs = parent_install_specs
@@ -675,38 +686,57 @@ def declare_image(
     if package_manager != None:
         pkgdb = _declare_pkgdb(
             ctx,
-            box = box,
+            box_dep = box_dep,
             identifier = identifier,
             layers = layers,
             package_manager = package_manager,
-            tmpfiles = tmpfiles,
         )
     return ImageInfo(
-        box = box,
+        box = box_dep,
         install_specs = install_specs,
         layers = layers,
         manifest = _declare_manifest(
             ctx,
             tools = tools,
-            box = box,
+            box_dep = box_dep,
             identifier = identifier,
             layers = layers,
-            tmpfiles = tmpfiles,
         ),
         package_manager = package_manager,
         pkgdb = pkgdb,
         sbom = _declare_sbom(
             ctx,
             tools = tools,
-            box = box,
+            box_dep = box_dep,
             identifier = identifier,
             layers = layers,
             source_name = source_name or ctx.label.name,
-            tmpfiles = tmpfiles,
             version = version,
         ),
-        tmpfiles = tmpfiles,
     )
+
+def declare_stripped(
+    ctx: AnalysisContext,
+    *,
+    tools: ImageToolsInfo,
+    image: ImageInfo,
+    name: str,
+    identifier: str | None = None,
+    strip_pkgdb: bool = False,
+    strip_paths: list[str] = [],
+    operations: list[LayerOperation] = [],
+) -> ImageInfo:
+    """Return `image` with `operations` applied and the package database and `strip_paths` removed.
+
+    A terminal output reads the result. The changes are a layer of their own, which the image's
+    `[pkgdb]` and `[sbom]` subtargets don't see, and which only exists when there is something to
+    change. `name` tells the layer apart from the other layers that `identifier` declares.
+    """
+    removed = (pkgdb_paths(image) if strip_pkgdb else []) + strip_paths
+    operations = operations + [_remove("/" + path.lstrip("/")) for path in removed]
+    if not operations:
+        return image
+    return declare_image(ctx, tools = tools, ops = operations, parent = image, identifier = _path(identifier, name))
 
 IMAGE_OPERATION_ATTR = attrs.one_of(
     # A command takes attrs.arg() whether or not it chroots, so an artifact argument reads the
@@ -756,6 +786,10 @@ IMAGE_OPERATION_ATTR = attrs.one_of(
         attrs.bool(),
     ),
     attrs.tuple(attrs.enum(["locale_gen"])),
+    attrs.tuple(
+        attrs.enum(["preset"]),
+        attrs.bool(),
+    ),
 )
 
 # The layer attributes every rule that builds a logical image from operations shares.
@@ -784,19 +818,15 @@ IMAGE_ATTRS = {
         default = [],
         doc = "native packages to install before this layer's operations run",
     ),
-    "tmpfiles": attrs.list(
-        attrs.string(),
-        default = [],
-        doc = "deferred tmpfiles.d lines for paths, modes, and xattrs; ownership is ignored",
-    ),
     "version": attrs.string(default = "0", doc = "SBOM source version"),
+    "_box": distribution.TOOLS_BOX_ATTR,
 } | IMAGE_TOOLS_ATTR
 
 def _image_impl(ctx: AnalysisContext) -> list[Provider]:
     image = declare_image(
         ctx,
         tools = ctx.attrs._tools[ImageToolsInfo],
-        box = ctx.attrs.box,
+        box_dep = ctx.attrs._box,
         install_docs = ctx.attrs.install_docs,
         install_langs = ctx.attrs.install_langs,
         ops = ctx.attrs.ops,
@@ -804,7 +834,6 @@ def _image_impl(ctx: AnalysisContext) -> list[Provider]:
         package_sets = ctx.attrs.package_sets,
         packages = ctx.attrs.packages,
         parent = ctx.attrs.parent[ImageInfo] if ctx.attrs.parent != None else None,
-        tmpfiles = ctx.attrs.tmpfiles,
         version = ctx.attrs.version,
     )
     return image_providers(
@@ -817,11 +846,6 @@ _image = rule(
     supports_incoming_transition = True,
     attrs = IMAGE_ATTRS
     | {
-        "box": attrs.option(
-            attrs.exec_dep(providers = [BoxInfo]),
-            default = None,
-            doc = "the execution environment fixed for an initial image and all derived artifacts",
-        ),
         "package_manager": attrs.option(
             attrs.dep(providers = [PackageManagerInfo]),
             default = None,
@@ -845,12 +869,65 @@ def flatten_operations(ops: list[LayerOperationTree]) -> list[LayerOperation]:
             flattened.append(operation)
     return flattened
 
+def initial_package_manager(package_manager: str | Select | None, parent: str | Select | None, distro: str | None) -> str | Select | None:
+    """Return the package manager that an image declaration starts its image from.
+
+    An image that names no `package_manager` and no `parent` gets the package manager of its
+    distribution. An image with a `parent` gets None, because it uses the package manager of its parent.
+    """
+    if package_manager != None or parent != None:
+        return package_manager
+    return distribution.default_package_manager(distro)
+
 def layer(
     name: str,
     ops: list[LayerOperationTree] = [],
+    package_manager: str | Select | None = None,
+    parent: str | Select | None = None,
     distro: str | None = None,
     visibility: list[str] | None = None,
+    target_compatible_with: list[str] | Select | None = None,
     **kwargs,
 ) -> None:
-    """Create an initial image or apply one delta to a parent image."""
-    _image(name = name, ops = flatten_operations(ops), **(distribution.distributed(name, distro, visibility) | kwargs))
+    """Create an initial image or apply operations on top of a parent image."""
+    _image(
+        name = name,
+        ops = flatten_operations(ops),
+        package_manager = initial_package_manager(package_manager, parent, distro),
+        parent = parent,
+        **(distribution.distributed(name, distro, visibility, target_compatible_with) | kwargs),
+    )
+
+def _image_install_impl(ctx: AnalysisContext) -> list[Provider]:
+    from_targets, operations = expand_install_from(ctx.attrs.ops)
+
+    # A convenience view: building this target builds what it would copy into an image.
+    copies = {}
+    for operation in operations:
+        if operation[0] == "copy":
+            copies[operation[1].short_path] = operation[1]
+    return [
+        DefaultInfo(default_outputs = [copies[path] for path in sorted(copies)]),
+        ImageInstallInfo(
+            operations = operations,
+            packages = sorted({package: None for package in ctx.attrs.packages + from_targets}),
+        ),
+    ]
+
+_image_install = rule(
+    impl = _image_install_impl,
+    attrs = {
+        "ops": attrs.list(IMAGE_OPERATION_ATTR, default = [], doc = "operations an image applies to install this target"),
+        "packages": attrs.list(attrs.string(), default = [], doc = "native packages this target needs installed"),
+    },
+)
+
+def image_install(name: str, ops: list[LayerOperationTree] = [], packages: list[str] = [], **kwargs) -> None:
+    """Attach packages and install operations to a target for `image.ops.install_from()`.
+
+    An image installing this target adds its packages to its own install request, so a reusable
+    target declares what it needs rather than leaving it to every caller.
+    """
+    if not ops and not packages:
+        fail("image_install {}: declare the packages or operations that install it".format(name))
+    _image_install(name = name, ops = flatten_operations(ops), packages = packages, **(distribution.attrs() | kwargs))

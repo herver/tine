@@ -6,27 +6,41 @@ SPDX-License-Identifier: MPL-2.0
 # Building images
 
 How to declare, build, and run OS images. This is the user guide. The architecture behind it (the
-provider vocabulary, the delta layer model, and disk composition internals) is documented in
+provider vocabulary, image snapshots, and disk composition internals) is documented in
 [architecture.md](../design/architecture.md).
 
 ## Restrictions
 
-File permissions in built images are normalized: 0755 for directories and executables, 0644 for files.
-This deliberately breaks suid/sgid executables and the sticky bit: these need to be replaced with
-socket-activated services and other safer alternatives. `/tmp` and `/var/tmp` keep their `1777`, which is
-restored when the image is finalized. Nothing on a `/usr` partition ought to be a secret, and
-[`tmpfiles.d`](https://man7.org/linux/man-pages/man5/tmpfiles.d.5.html) handles permissions of files in
-writable directories such as `/etc` and `/var`.
+Images keep the modes that packages and operations set, except for the setuid and setgid bits, which tine
+clears. Every file in an image is owned by uid and gid 0, so a setgid `tty` binary would otherwise run with
+the root group. Replace suid and sgid executables with socket-activated services and other safer
+alternatives.
 
-If you must have files with different permissions in your image, the escape hatch is the `tmpfiles`
-attribute of an image or composition.
+`image.ops.copy` gives a copied file mode 0755 if it is executable and 0644 otherwise, and creates missing
+directories with mode 0755. git only stores the executable bit, so the image doesn't depend on the umask of
+your checkout. To give a file another mode, run `chmod` in an `image.ops.run()` operation.
+
+Image operations see the modes, modification times, user extended attributes and explicit hardlinks of their
+parent snapshot. Snapshots keep nanosecond timestamps, and capture clamps them to `SOURCE_DATE_EPOCH`. Cpio
+stores whole seconds and has no extended attributes.
+
+A layer that creates a character device with device number 0/0 fails to build, because overlayfs reads such
+a device as a deleted file.
+
+Image paths must satisfy [UAPI.16](https://uapi-group.org/specifications/specs/file_manifest/): normalized
+relative UTF-8 paths without control characters. The top-level names `Uapi16Manifest` and
+`Uapi16Manifest.*` are reserved. Backslashes and literal `.wh.*` and `.esc.*` names work without escaping.
+
+A layer that adds a program or shared library which would run on an executable stack fails to build: one
+whose `PT_GNU_STACK` program header is executable, or which has none on x86, where glibc then falls back
+to an executable stack.
 
 ## Concepts
 
-A **catalog** is a Buck package that declares which OS releases are available to build against. For each
-release it bundles the repository definitions, the release identity and its package sets, a package
-manager (the pinned solve environment that images start from), a buildroot for package builds, and a
-box. The default catalog is [`tine//catalog`](../catalog/BUCK) and currently declares these releases:
+A **catalog** is the Buck cell named `catalog`, which declares which OS releases are available to build
+against. For each release it bundles the repository definitions, the release identity and its package
+sets, a package manager (the pinned solve environment that images start from), a buildroot for package
+builds, and a box. tine's own catalog is [`catalog//`](../catalog/BUCK) and declares these releases:
 
 - `fedora.rawhide`: pinned to an rpmrepo compose snapshot, so packages never vanish underneath the pins
 - `arch.rolling`: pinned to a day in the Arch Linux Archive, whose dated trees serve databases that never
@@ -38,20 +52,93 @@ Every one of them is pinned to a mirror that publishes immutable snapshots, whic
 have to be buildable from a committed pin at all.
 
 Each release consists of targets named `<family>.<release>.<role>`, for example
-`tine//catalog:fedora.rawhide.package-manager` or `tine//catalog:arch.rolling.release`. The pins live
+`catalog//:fedora.rawhide.package-manager` or `catalog//:arch.rolling.release`. The pins live
 as committed snapshots under [`catalog/snapshot/`](../catalog/snapshot/): repository metadata in
 `snapshot/repo/*.<architecture>.json` and frozen box transactions in
 `snapshot/box/*.<architecture>.json`. Normal builds therefore never touch the network;
-`refresh-catalog --advance` (below) advances the pins. A project can instead declare its own `//catalog`
-package with the same macros. The naming scheme and the pinning mechanism are described in
-[architecture.md](../design/architecture.md).
+`refresh-catalog --advance` (below) advances the pins. The naming scheme and the pinning mechanism are
+described in [architecture.md](../design/architecture.md).
 
-A **box** is a pinned, reproducible execution environment that runs every build action. It supplies its
-package system's own tools, Python, core utilities, and the image assembly tools; these stay in the box
-and out of the built images. Both RPM releases share `tine//catalog:fedora.rawhide.box`, while
-`arch.rolling` and `debian.testing` have their own. A box's base release only records where its userspace
-came from: the Rawhide box also serves Fedora 44. How a box bootstraps itself is described in
-[architecture.md](../design/architecture.md).
+A project can declare its own catalog with the same macros. Point the `catalog` cell at its directory in
+`tine.toml`:
+
+```toml
+[buckconfig.cells]
+root = "."
+tine = "tine"
+catalog = "catalog"
+```
+
+Every `catalog//` label then resolves to the project's catalog, including the labels in tine's own
+targets, and the build does not use tine's catalog. If `tine.toml` declares no `catalog` cell, `bin/tine`
+points the cell at tine's catalog.
+
+tine's own boxes, such as its tools and the box that generates signing keys, build from the catalog's default
+release. A release has boxes only for the architectures it serves, so its images build only on a host of one
+of those architectures. Arch serves x86_64 only, so Arch images don't build on an arm64 host. Name the
+default release in the catalog's `BUCK` file, with the `<family>.<release>` prefix of any release the catalog
+declares:
+
+```Starlark
+load("@tine//distribution:defs.bzl", "distribution")
+
+distribution.default_release("debian.testing")
+```
+
+If the catalog's `releases.bzl` lists one release, that release is the default release. A catalog with
+one release in `releases.bzl` doesn't call `default_release()`. The build fails if it does.
+
+To build with the boxes of another release of the catalog, set `box` in the `tine` section of the
+project's `.buckconfig`, or pass it for one build:
+
+```sh
+tine buck build -c tine.box=arch.rolling //...
+```
+
+A tine box installs the packages it lists for the default release's family. A box that lists no packages
+for that family fails to build, and so does a box that lists a package the release does not contain.
+
+The catalog also lists the releases that images build for in `releases.bzl`, beside its `BUCK` file. See
+"Choosing a distribution" below.
+
+A **box** is a pinned, reproducible execution environment that runs every build action. Each release has a
+root box, which its release macro declares. `<family>.<release>.box`, such as `catalog//:fedora.rawhide.box`,
+contains the package system's own tools, Python and core utilities. It resolves and installs every other box
+of the release. `tine//distribution:tools.box` adds the image assembly tools and the VM stack on top of the
+root box of the release that the build chooses, and images build in it. The tools stay in the box and out of
+the built images. How a box bootstraps itself is described in [architecture.md](../design/architecture.md).
+
+The `settings.bzl` file of the `settings` cell defines a `SETTINGS` struct. Its `tools_box` field lists the
+packages and local repositories that the tools box installs in addition to its own. tine's own `settings`
+cell lists none. To add some, declare a `settings` cell of your own in `tine.toml`. Your project keeps
+tine's catalog:
+
+```toml
+[buckconfig.cells]
+root = "."
+tine = "tine"
+settings = "tine-settings"
+```
+
+Your `settings.bzl` only needs the fields that you change. To build images with a locally built systemd,
+list its repository in `tine-settings/settings.bzl`:
+
+```Starlark
+load("@tine//distribution:defs.bzl", "distribution")
+
+SETTINGS = struct(
+    tools_box = struct(
+        additional_repositories = distribution.select({
+            "DEFAULT": [],
+            "fedora": ["root//packages:systemd.repository"],
+        }),
+    ),
+)
+```
+
+The tools box prefers the packages of a local repository over those of its release (see
+[box.md](box.md#installing-locally-built-packages)). The repository has to be visible to
+`tine//distribution`. A repository is built for one distribution, so select it per distribution.
 
 ## Commands
 
@@ -64,10 +151,12 @@ tine buck run tine//tools:fmt
 tine buck run tine//tools:check
 ```
 
-`refresh-catalog` refreshes the default `tine//catalog` package. Pass another catalog package after `--`,
-for example `tine buck run tine//tools:refresh-catalog -- my_project//catalog`. `verify-catalog`
-performs the same generation and fails when the committed JSON differs. The pinning and refresh mechanism
-is described in [architecture.md](../design/architecture.md).
+`refresh-catalog` refreshes the `catalog//` cell, which is the project's catalog if it declares one. A
+project declares its releases in the root package of that cell, because tine fails to load a release declared
+anywhere else. To refresh the repositories and boxes of another package, pass it after `--`, for example
+`tine buck run tine//tools:refresh-catalog -- my_project//boxes`. `verify-catalog` performs the same
+generation and fails when the committed JSON differs. The pinning and refresh mechanism is described in
+[architecture.md](../design/architecture.md).
 
 ## Declaring an image
 
@@ -77,13 +166,15 @@ Everything below is re-exported from one facade, so a `BUCK` file needs a single
 load("@tine//image:defs.bzl", "image")
 ```
 
-The modules behind the facade (`image.bzl`, `compose.bzl`, and the `image_format` package) are
-implementation structure and may be rearranged; load them directly only from inside the cell.
+The modules behind the facade, such as `image.bzl` and `compose.bzl`, are implementation structure and
+may be rearranged; load them directly only from inside the cell.
 
-An initial image fixes one package manager for its whole lifetime; every derived image and terminal output
-inherits it and its box. Take a catalog package manager, optionally extend it with project repositories,
-and create the initial image. For example, a project can expose locally built packages without adding them
-to its OS release:
+An initial image fixes one package manager for its whole lifetime, and every derived image and terminal
+output inherits it. An image runs in the tools box of the release that the build chooses, or in the tools box
+of the catalog's default release when the build chooses none. An image that names the package manager of one
+release therefore also names that release's distribution. Take a catalog package manager, optionally extend
+it with project repositories, and create the initial image. For example, a project can expose locally built
+packages without adding them to its OS release:
 
 ```Starlark
 local_repository(
@@ -93,12 +184,13 @@ local_repository(
 
 package.manager(
     name = "project.package-manager",
-    base = "tine//catalog:fedora.rawhide.package-manager",
+    base = "catalog//:fedora.rawhide.package-manager",
     additional_repositories = [":project.repository"],
 )
 
 image.layer(
     name = "project.image",
+    distro = "catalog//:fedora.rawhide.distribution",
     package_manager = ":project.package-manager",
     packages = ["project"],
 )
@@ -106,7 +198,7 @@ image.layer(
 image.layer(
     name = "project-configured.image",
     parent = ":project.image",
-    ops = [image.run(["/usr/bin/project", "configure"], chroot = True)],
+    ops = [image.ops.run(["/usr/bin/project", "configure"], chroot = True)],
 )
 ```
 
@@ -115,7 +207,7 @@ A package manager may instead attach a branch's generated local-packages univers
 ```Starlark
 package.manager(
     name = "image.package-manager",
-    base = "tine//catalog:fedora.rawhide.package-manager",
+    base = "catalog//:fedora.rawhide.package-manager",
     local_packages = "//packages/fedora/rawhide:_local_packages",
 )
 ```
@@ -126,40 +218,46 @@ resolve upstream (details in [architecture.md](../design/architecture.md)).
 
 ## Images and operations
 
-`image.layer` has two construction modes. An initial image supplies `package_manager` or `box`; a derived
-image supplies `parent` and inherits that image's package manager and box. A call with operations applies one
-ordered operation sequence in one action and persists exactly one delta:
+Ordinary absolute symlinks in chrooted file operations resolve inside the image. Images and scripts must
+be trusted because procfs magic links can access paths outside the image.
+
+`image.layer` has two construction modes. An initial image takes `package_manager`, which defaults to the
+package manager of the distribution that the build chooses. A derived image takes `parent` and inherits the
+package manager of that image. A call with operations applies one ordered operation sequence in one action
+and persists exactly one snapshot:
 
 - `packages` and `package_sets` are rule attributes rather than operations: a layer installs them as one
   request before any of its operations run, so every operation sees what the layer adds. `package_sets`
   names symbolic sets the image's OS release supplies and `packages` names concrete ones; a layer may use
   both, and duplicates between them collapse.
-- `image.run([...])` executes a command against the image. By default the box supplies the userspace and
+- `image.ops.run([...])` executes a command against the image. By default the box supplies the userspace and
   the image is mounted at `/buildroot`; with `chroot = True` the command runs inside the image with its
   own binaries instead. Either takes an `env` argument that overlays variables on that command's
   environment. An argument names a build artifact by being one, or by spelling `$(location //target)` in
   a BUCK file, and it resolves the same in both modes: a chrooted command gets the project bind-mounted
-  at a fixed path under `/run`, which is also its working directory. Running a script the repository
-  owns is therefore just `image.run(["/usr/bin/bash", "$(location :setup.sh)"], chroot = True)`. Buck's macro
-  parser claims `$(...)`, so a shell substitution has to be written `\$(...)`; an unescaped one fails to
-  parse rather than silently reaching the shell.
-- `image.python([...])` runs a python script against the image without the image needing python: it is an
-  `image.run` of the relocatable interpreter Buck already pins for its own bootstrap, named through the
+  read-only at a fixed path under `/run`, which is also its working directory. Write generated files
+  to paths in the image rather than to the working directory. Running a script the repository
+  owns is therefore just `image.ops.run(["/usr/bin/bash", "$(location :setup.sh)"], chroot = True)`. Buck's
+  macro parser claims `$(...)`, so a shell substitution has to be written `\$(...)`; an unescaped one fails
+  to parse rather than silently reaching the shell.
+- `image.ops.python([...])` runs a python script against the image without the image needing python: it is an
+  `image.ops.run` of the relocatable interpreter Buck already pins for its own bootstrap, named through the
   project like any other artifact. It takes the same `env` and `chroot` arguments, so the script either
   sees the image
   at `/buildroot` or has it as its own root; in the chrooted case nothing of the interpreter reaches the
-  delta, because the project bind carrying it lives under `/run`.
-- `image.copy` introduces a declared Buck artifact at an absolute image path; `image.mkdir` and
-  `image.symlink` mutate the same root. `image.remove` treats its absolute path as a glob pattern,
+  snapshot, because the project bind carrying it lives under `/run`.
+- `image.ops.copy` introduces a declared Buck artifact at an absolute image path; `image.ops.mkdir` and
+  `image.ops.symlink` mutate the same root. `image.ops.remove` treats its absolute path as a glob pattern,
   including recursive `**`, and removes every matching file, symlink, or directory tree. A pattern that
   matches nothing does nothing.
-- `image.depmod()`, `image.hwdb()` and `image.locale_gen()` build the state installed packages only describe
-  (below).
-- `image.install_from` installs what another target needs and applies the operations it attaches (see below).
+- `image.ops.depmod()`, `image.ops.hwdb()`, `image.ops.locale_gen()` and `image.ops.preset()` build the state
+  installed packages only describe (below).
+- `image.ops.install_from` installs what another target needs and applies the operations it attaches (see
+  below).
 
 `image.layer()` recursively flattens operation lists, allowing reusable helpers to return ordered groups of
-operations; `image.rootfs_archive`, `image.sysext_image`, and `image.bootable_disk` accept the same nested
-groups. Materialize a complete logical image explicitly with `image.directory`.
+operations; `image.archive`, `image.sysext`, `image.confext`, `image.extension`, `image.portable`
+and `image.disk` accept the same nested groups. Export a complete logical image with `image.snapshot`.
 
 ### Generating what packages only describe
 
@@ -175,48 +273,64 @@ image.layer(
     package_manager = ":image.package-manager",
     package_sets = ["bootable"],
     ops = [
-        image.install_from(":project.install"),
-        image.depmod(),
-        image.hwdb(),
+        image.ops.install_from(":project.install"),
+        image.ops.depmod(),
+        image.ops.hwdb(),
     ],
 )
 ```
 
-- `image.depmod()` rebuilds `modules.dep` and its `.bin` indexes for every kernel the image installs, and
-  does nothing for an image that installs none. It runs the image's own `depmod`, because the tool
-  reads its search-order configuration from absolute paths that `--basedir` does not move, and writes
-  index files whose compatibility is its own kmod's business. An image with modules but no `depmod`
-  fails the build by name rather than shipping a stale index.
-- `image.hwdb(usr = True, strict = True)` compiles `hwdb.d` into the binary database udev actually reads. It
-  writes `/usr/lib/udev/hwdb.bin`, where the image ships it and nothing writable shadows it, and drops
+- `image.ops.depmod()` rebuilds `modules.dep` and its `.bin` indexes for every kernel the image installs, and
+  does nothing for an image that installs none. It runs the box's `depmod` with the image's `depmod.d`
+  configuration, so the image's search order applies. The box's `depmod` would look for an `external`
+  module directory, and for the target of an absolute symlink, in the box. A `depmod.d` file that lists an
+  `external` directory, or a module that is an absolute symlink, therefore fails the build.
+- `image.ops.hwdb(usr = True, strict = True)` compiles `hwdb.d` into the binary database udev actually reads.
+  It writes `/usr/lib/udev/hwdb.bin`, where the image ships it and nothing writable shadows it, and drops
   the `/etc` copy; `usr = False` writes that copy instead. `strict = False` accepts a source file the
   image cannot parse. An image with no `hwdb.d` is left alone.
-- `image.locale_gen()` runs the image's own `locale-gen` when `/etc/locale.gen` asks for something, which is
-  how Debian and Arch generate locales; a distribution that ships them as packages has no such file and
-  the operation does nothing.
+- `image.ops.locale_gen()` generates the locales that `/etc/locale.gen` lists into
+  `/usr/lib/locale/locale-archive`, which is how Debian and Arch generate locales. It does the work of the
+  distribution's `locale-gen` with the box's `localedef`, the image's locale sources and the image's
+  charmaps. A charset can be a charmap's alias, such as `LATIN1`. An entry without a charset, a locale or
+  charset that the image has no definition for, or a warning from `localedef` fails the build, where
+  `locale-gen` would skip the entry. A non-empty `/etc/locale.gen` replaces the archive, even when every
+  line in it is a comment. A distribution that installs locales as packages has no such file, and the
+  operation does nothing.
+- `image.ops.preset(vendor = False)` runs `systemctl preset-all` for the system units and again with
+  `--global` for the user units. The image then boots with its units enabled and disabled the way its preset
+  policy says. Without `vendor`, `systemctl` writes the symlinks into `/etc`. With `vendor = True`, it writes
+  them below `/usr/lib/systemd`, which is what the default `/usr`-only disk needs, because it boots with an
+  empty `/etc`. `vendor = True` needs `systemctl` from systemd 263 or newer in the box. It leaves the `/etc`
+  symlinks that package scriptlets write during the install in place, so use it only for an image that
+  does not include `/etc`. Units that a later layer installs are not preset, so place it in the last layer.
+  An image without `/usr/lib/systemd` is left alone. No composition adds it, so name it in `ops` to use it.
 
-`image.hwdb()` is the one that runs a box tool against the mounted image, exactly as `image.run()` does by
-default, so an image that installs no systemd of its own still gets a database; the other two must be
-the image's own. What they write is captured by the layer that runs them, so it is built once and
-cached rather than repeated by every terminal output.
+The generators run box tools against the mounted image, exactly as `image.ops.run()` does by default, so an
+image that installs no kmod or systemd of its own still gets its indexes and database. The box is the tools
+box of the image's release. It installs its packages from the release's repositories, so its tools match an
+image that installs kmod, systemd and glibc from those repositories. The `additional_repositories` and
+`local_packages` of a package manager do not reach the box: an image that installs kmod, systemd or glibc
+from them still gets the release's `depmod`, `systemd-hwdb` and `localedef`, unless `SETTINGS.tools_box`
+adds the same local repositories to the tools box. The layer that runs a generator captures what it writes,
+so it is built once and cached rather than repeated by every terminal output.
 
-`image.rootfs_archive`, `image.bootable_disk`'s root filesystem, and `image.initrd` end their operations
-with `image.depmod()`, `image.hwdb()` and `image.locale_gen()` at their defaults, because a composition
-declares a whole product rather than one layer: the three cover everything a package can leave described,
-and each does nothing on
-an image carrying none of it. They land on the layer the composition declares, so a composition handed a
-`parent` and given no operations or packages of its own declares no layer and places none; that parent is
-where they belong, after the operations whose packages they read. An initrd generates before it prunes, so
-it ships the compiled database rather than the sources it was compiled from. Naming a generator in `ops`
-overrides the composition's copy instead of adding a second, so `image.hwdb(usr = False)`, or an
-`image.depmod()` placed before the operations that strip modules, is taken exactly as written.
-`image.sysext_image` runs none of them: an extension merges onto a system it does not own, where a database
-built from the extension's own tree would
-shadow that system's while describing only what the extension carries.
+`image.archive`, `image.portable`, `image.disk`'s root filesystem, and `image.initrd` end their operations
+with `image.ops.depmod()`, `image.ops.hwdb()` and `image.ops.locale_gen()` at their defaults, because a
+composition declares a whole product rather than one layer: the three cover everything a package can leave
+described, and each does nothing on an image carrying none of it. They land on the layer the composition
+declares, so a composition handed a `parent` and given no operations or packages of its own declares no layer
+and places none; that parent is where they belong, after the operations whose packages they read. An initrd
+generates before it prunes, so it ships the compiled database rather than the sources it was compiled from.
+Naming a generator in `ops` overrides the composition's copy instead of adding a second, so
+`image.ops.hwdb(usr = False)`, or an `image.ops.depmod()` placed before the operations that strip modules, is
+taken exactly as written. The extension rules (`image.sysext`, `image.confext`, `image.extension`) run none
+of them. An extension merges onto a system it does not own. A database generated in the extension would
+replace the database of that system in the merged tree, and would go stale when that system changes.
 
 ### Declaring the initrd
 
-`image.bootable_disk` declares a conventional initrd for itself, so nothing is required to get one.
+A bootable `image.disk` declares a conventional initrd for itself, so nothing is required to get one.
 Declare an `image.initrd()` and pass it when you want to change what is in it or how it is packed:
 
 ```Starlark
@@ -224,11 +338,11 @@ image.initrd(
     name = "os.initrd",
     package_manager = ":image.package-manager",
     packages = ["cryptsetup"],
-    ops = [image.copy(":modprobe.conf", "/usr/lib/modprobe.d/local.conf")],
+    ops = [image.ops.copy(":modprobe.conf", "/usr/lib/modprobe.d/local.conf")],
     compression = "none",
 )
 
-image.bootable_disk(
+image.disk(
     name = "os",
     initrd = ":os.initrd",
     ...
@@ -242,28 +356,33 @@ initrd never reads) apply either way. `compression` picks how the cpio the UKI c
 it from the tree. `install_docs` and `install_langs` default the other way round from an OS image, since
 documentation and translations only cost an initrd boot memory.
 
+Every initrd can import system credentials, such as an SSH key, from a cloud's instance metadata service
+(IMDS). systemd's IMDS generator enables that (together with networkd to reach the service) on a cloud
+instance which it recognizes from the hardware database; `systemd.imds=` on the kernel command line
+overrides it.
+
 The target is an ordinary image: it builds on its own, publishes `[pkgdb]` and `[sbom]`, and one initrd can
 be shared by several disk images.
 
 ### Attaching install operations to a target
 
 How a project installs is a property of the project, not of each image carrying it. `image.install()`
-attaches packages and operations to a target, and an image applies both with one `image.install_from()`:
+attaches packages and operations to a target, and an image applies both with one `image.ops.install_from()`:
 
 ```Starlark
 image.install(
     name = "project.install",
     packages = ["glibc"],
     ops = [
-        image.copy(":project[project-cli]", "/usr/bin/project-cli"),
-        image.copy(":project.checkout[tmpfiles.d]", "/usr/lib/tmpfiles.d"),
+        image.ops.copy(":project[project-cli]", "/usr/bin/project-cli"),
+        image.ops.copy(":project.checkout[tmpfiles.d]", "/usr/lib/tmpfiles.d"),
     ],
 )
 
-image.bootable_disk(
+image.disk(
     name = "os",
     package_sets = ["bootable"],
-    ops = [image.install_from(":project.install")],
+    ops = [image.ops.install_from(":project.install")],
     ...
 )
 ```
@@ -272,7 +391,7 @@ A target declaring its own `packages` is what keeps every image carrying it from
 join the installing layer's own request, so two targets that both need packages compose without the
 caller merging anything. Any operation may be attached, not only copies, and the operations are spliced
 in place, so the image still decides where in its own order they land. An `image.install` target may
-itself `image.install_from()` another, which composes; a cycle is rejected by Buck as a target cycle.
+itself `image.ops.install_from()` another, which composes; a cycle is rejected by Buck as a target cycle.
 
 ### Installing a file a project ships as a template
 
@@ -287,7 +406,7 @@ image.substitute(
     replacements = {"@bindir@": "/usr/bin", "@port@": "555"},
 )
 
-image.copy(":project-http.service", "/usr/lib/systemd/system/project-http.service")
+image.ops.copy(":project-http.service", "/usr/lib/systemd/system/project-http.service")
 ```
 
 The output is named after the target. Each placeholder has to appear in the template, so a project
@@ -308,16 +427,18 @@ database whenever the image has a package manager. The same artifacts are expose
 ```
 
 The `version` attribute sets the SBOM source version and defaults to `"0"`. Merely building the image still
-produces only its latest delta. Selecting `[pkgdb]` runs the image's package system's capture driver;
+produces only its latest snapshot. Selecting `[pkgdb]` runs the image's package system's capture driver;
 selecting either nested SBOM format runs one shared scan of the completed stack.
 
-`[manifest]` is a [UAPI.16 File Manifest](https://uapi-group.org/specifications/): an RFC7464 JSON-SEQ
-listing of every path the assembled tree holds, with the type, mode, ownership and clamped mtime of each,
-a SHA256 over every regular file's contents, symlink targets carried inline, and one `inodeToken` per
-inode two names share. It answers what an image ships rather than what it was built from, so a consumer
-can compare the paths of two images against each other (a path in both a system extension and the /usr it
-merges onto shadows an OS file) or account for size per file. The artifact is named `Uapi16Manifest`,
-which is the name the format reserves, so it can be dropped beside a tree of the image it describes.
+The `[manifest]` of a logical image is a [UAPI.16 File
+Manifest](https://uapi-group.org/specifications/specs/file_manifest/): an RFC7464 JSON-SEQ listing of every
+path the assembled tree holds, with the type, mode, ownership, clamped mtime and user extended attributes of
+each, a SHA256 over every regular file's contents, symlink targets carried inline, and one `inodeToken` per
+inode two names share. Its first object describes the root directory and lists the `features` that the
+manifest records. It answers what an image ships rather than what it was built from, so a consumer can
+compare the paths of two images against each other (a path in both a system extension and the /usr it merges
+onto shadows an OS file) or account for size per file. The artifact is named `Uapi16Manifest`, which is the
+name the format reserves, so it can be dropped beside a tree of the image it describes.
 
 `image` also takes `install_langs`: keep translated files only for these languages, instead of all of them.
 Nothing matches a value that is not a language, so `install_langs = ["C.UTF-8"]` installs no translations
@@ -329,10 +450,8 @@ at all. `install_docs = False` likewise installs no documentation, keeping the l
 Logical images and terminal outputs are separate rule families. Terminal rules merge the layer stack only
 when needed:
 
-- `image.archive` writes deterministic tar or newc cpio archives, optionally zstd-compressed
-  (`compression = "zstd"`), and provides `image.ImageArchiveInfo`, which names the format alongside the
-  artifact;
-- `image.directory` materializes a Buck directory artifact and provides `image.ImageDirectoryInfo`;
+- `image.snapshot` stores a snapshot of the image and provides `image.ImageSnapshotInfo`. `buck run` on
+  the target exports the snapshot as a directory;
 - `image.uki` builds the unified kernel image for the image's single installed kernel from one or more cpio
   `image.ImageArchiveInfo` dependencies and provides `image.UkiInfo`, named `<image_id>_<version>_<arch>.efi`
   (defaults: target name and `0`; systemd architecture spelling, e.g. `x86-64`), the shape
@@ -340,46 +459,42 @@ when needed:
   own, holding the kernel modules `initrd_modules` selects, so that none of the initrds handed to it has
   to carry modules for the kernel in question (see "Kernel modules in the UKI"). Alternative kernel
   command lines are `image.uki_profile()` descriptors, which add boot profiles as separate sd-boot menu
-  entries, each appending its arguments to the base kernel command line. `splash` names the BMP image to
-  embed for the EFI stub to display while booting. With a `secure_boot_key`, the UKI and its embedded
-  kernel are signed
-  for Secure Boot. With a `sign_expected_pcr_key`, a signed expected-PCR 11 policy covers each profile;
-  set its `sign_expected_pcr` to false to opt out;
-- `image.repart` renders ordered Starlark partition definitions and uses offline `systemd-repart` to create a
-  GPT disk and independent partition artifacts in one `image.RepartInfo`; its disk field is absent for a
-  split-only invocation, `output_size` composes the disk with free space behind its partitions, and
-  `strip_pkgdb` leaves the package database out of them, and `mkfs_options` tunes the filesystems it
-  creates;
-- `image.disk_convert` re-encodes a raw disk with an explicitly selected box and provides
-  `image.DiskConversionInfo`;
+  entries, each appending its arguments to the base kernel command line. A profile's `fields` add further
+  `KEY=VALUE` lines to its `.profile` section, such as `PCRLOCK=yes` or `TOFU=`. `profile_fields` adds
+  such lines to every `.profile` section, including a section for the base profile, whose id is `main`. A
+  profile's own `fields` override them, for example `TOFU=` with an empty value to opt one profile out.
+  ukify only writes the section of the base profile into a UKI with further profiles, so `profile_fields`
+  needs `profiles`. `splash` names the BMP image to embed for the EFI stub to display while booting. With
+  a `secure_boot_key`, the UKI and its embedded kernel are signed for Secure Boot. With a
+  `sign_expected_pcr_key`, a signed expected-PCR 11 policy covers each profile; set its `sign_expected_pcr`
+  to false to opt out;
 - `image.bootable` selects a kernel and matching initrd from a logical image, exposed as `[uki]`, `[kernel]`,
-  and `[initrd]` subtargets;
-- `image.sysext` builds a systemd-sysext(8) DDI with `systemd-repart`, containing `/usr`, `/opt`, and
-  `extension-release.<name>`, and provides `image.SysextImageInfo`. The DDI is the file
-  `<extension>_<version>_<arch>.sysext.raw`, which is the name a systemd-sysupdate transfer matches, and
-  the same three values fill `SYSEXT_ID`, `SYSEXT_VERSION_ID`, `IMAGE_VERSION` and `ARCHITECTURE` in its
-  extension-release, so a caller states each of them once; `release` overrides any of them. With `base`,
-  only the delta layered above that
-  image is packaged, and the extension-release pins the base's `ID`/`VERSION_ID`; with `verity_key` (a
-  target providing `image.SigningKeyInfo`), the DDI carries a signature over its verity root hash, which
-  a host validates against the key's certificate in its `/usr/lib/verity.d/` (enforced only where the host's
-  sysext image policy says so, see "Example targets" below);
-- `image.vm` runs the raw image ephemerally with its explicitly selected box's `systemd-vmspawn`, QEMU,
-  and OVMF stack,
-  and binds all given `sysexts` DDIs into the guest at `/var/lib/extensions`, where systemd-sysext merges
-  them at boot. With `secure_boot`, vmspawn picks Secure Boot capable firmware without pre-enrolled keys,
-  so an image carrying `loader/keys/auto` enrollment files enrolls them on first boot and then boots with
-  Secure Boot enforced, and attaches a software TPM so the UKI's signed expected-PCR policy is measured.
+  and `[initrd]` subtargets, and `[cmdline]`, the base command line of the UKI, for a direct kernel boot;
+- `image.vm` runs the image's qcow2 (or raw) ephemerally, from its ESP or by a direct kernel boot, with the
+  `systemd-vmspawn`, QEMU and OVMF stack of the tools box
+  of the image's release, and binds the DDIs in `extensions` into the guest, where systemd merges them at
+  boot: a sysext from `/var/lib/extensions`, a confext from `/var/lib/confexts`, and a DDI of both classes
+  from both. Each must have the `system` scope. It binds the DDIs in `portables`, portable images and
+  extensions with the `portable` scope, at `/var/lib/portables`, where `portablectl attach` finds them by
+  name. Each DDI is named `<name>.raw` in the guest. With `secure_boot`, vmspawn picks Secure Boot capable
+  firmware without pre-enrolled keys, so an image carrying `loader/keys/auto` enrollment files enrolls them
+  on first boot and then boots with Secure Boot enforced, and attaches a software TPM so the UKI's signed
+  expected-PCR policy is measured. `tpm` overrides that either way: true attaches one without Secure
+  Boot, false leaves it out with Secure Boot. Unset and without Secure Boot, the guest has no TPM.
 
-`image.rootfs_archive` is the composition rule for building one logical image from operations and emitting an
-archive; `image.archive` remains the terminal rule for archiving an existing logical image.
-`image.sysext_image` is the equivalent composition for a system-extension DDI. Every composition takes
-`install_docs` and passes it to the image it builds.
+`image.archive` builds one logical image from operations and writes it as a deterministic tar or newc cpio
+archive, optionally zstd-compressed (`compression = "zstd"`). `image.sysext`, `image.confext` and
+`image.extension` are the compositions for extension DDIs (see "Extensions" below), and `image.portable` is
+the composition for portable service images (see "image.portable" below). `image.archive`, the extension
+rules, `image.portable` and `image.disk` start their image from `package_manager`, or add their
+operations on top of the image in `parent`. Without either, they start their image from the package manager
+of the distribution that the build chooses. Every composition takes `install_docs` and passes it to the image
+it builds.
 
 Each composition publishes one product target that also provides its logical filesystem as `image.ImageInfo`.
-`image.rootfs_archive` defaults to its archive and provides `image.ImageArchiveInfo`. `image.sysext_image`
-defaults to its DDI and provides `image.SysextImageInfo`. Both expose their supply-chain
-artifacts without conventionally named helper targets:
+`image.archive` defaults to its archive and provides `image.ImageArchiveInfo`, which names the format of the
+archive. An extension defaults to its DDI and provides `image.DdiInfo`. `image.archive` and the extension
+rules expose their supply-chain artifacts as subtargets:
 
 ```text
 //examples/image:demo
@@ -400,57 +515,176 @@ artifacts without conventionally named helper targets:
 The product targets provide `image.ImageSbomInfo` for typed consumers. Buck builds an optional artifact
 only when it is requested, so declaring these views costs nothing on a default build.
 
-### image.bootable_disk
+### Extensions
 
-`image.bootable_disk()` composes the initrd, versioned UKIs, the ESP, and a verity-protected
-`/usr` into a GPT disk. Most attributes parameterize the terminal rules described above.
+`image.sysext()` builds a system extension, which contains `/usr` and `/opt`. `image.confext()` builds a
+configuration extension, which contains `/etc`. `image.extension()` builds a DDI of either class or of
+both, named in `classes`:
+
+```Starlark
+image.sysext(
+    name = "debug-tools",
+    parent = ":appliance",
+    packages = ["strace", "gdb"],
+)
+
+image.confext(
+    name = "site-config",
+    parent = ":appliance",
+    ops = [image.ops.copy("chrony.conf", "/etc/chrony.conf")],
+)
+
+image.extension(
+    name = "webapp-cni",
+    parent = ":webapp",
+    classes = ["sysext", "confext"],
+    scope = ["portable"],
+    ops = [image.ops.copy("cni", "/")],
+)
+```
+
+With `parent`, the DDI contains only what the target adds on top of `parent`. `parent` can be any image
+except another extension. Without `parent`, the DDI contains the whole tree of the image. The DDI is an
+erofs root partition, its verity hash partition and, with `verity_key`, a signature over the verity root
+hash. A host validates the signature against the certificates in its `/usr/lib/verity.d/`, and enforces it
+only where its image policy says so (see "Example targets" below). The DDI contains no os-release and no
+package database.
+
+When the host and the extension come from different projects, sign the extension with
+`image.derived_signing_key()`. It derives an ECDSA P-256 pair from the target name, so every project that
+declares a key with the same name gets the same pair, and the host installs the certificate from its own
+declaration. Anyone who knows the name can compute the private key: use it for test images only. UEFI
+firmware only enrolls RSA certificates, so the key can't sign for Secure Boot.
+
+The rule writes one extension-release file per class:
+`/usr/lib/extension-release.d/extension-release.<name>` for a sysext and
+`/etc/extension-release.d/extension-release.<name>` for a confext. Each file contains:
+
+- `ID` and `VERSION_ID` from the os-release of `parent`. A parent without `VERSION_ID`, such as Arch
+  Linux, gives only `ID`. A parent that is an image build, such as an `image.disk`, also gives its
+  `IMAGE_ID` and `IMAGE_VERSION`, so the extension merges only onto that exact build. Without `parent`,
+  `ID=_any`, which matches any host.
+- `SYSEXT_SCOPE` or `CONFEXT_SCOPE`, from `scope`. The scope lists where systemd applies the extension.
+  `system` merges it on the host and `initrd` in the initrd. `portable` lets
+  `portablectl attach --extension` or `ExtensionImages=` add it on top of a portable service image. The
+  default is `["system"]`.
+- `SYSEXT_ID` or `CONFEXT_ID` with the target name, `SYSEXT_VERSION_ID` or `CONFEXT_VERSION_ID` with
+  `version`, and `ARCHITECTURE` from `arch`.
+- `EXTENSION_RELOAD_MANAGER=1`.
+
+`release` overrides any of these fields in every file, except the scope: set it with `scope`, which
+`image.vm` checks.
+
+The DDI is named `<name>_<version>_<arch>.sysext.raw`, `<name>_<version>_<arch>.confext.raw`, or
+`<name>_<version>_<arch>.raw` for both classes. A systemd-sysupdate transfer matches these names.
+systemd takes the image name from the file name up to the first `_` and looks up `extension-release.<name>`
+by it, so a target name containing `_` or `+` fails the build. A deployed DDI can drop the rest of its
+name, such as `debug-tools.raw`. With `arch = "_any"`, the DDI is named `<name>_<version>_all` and
+`ARCHITECTURE=_any` matches any host architecture.
+
+The target defaults to its DDI and provides `image.DdiInfo`, like `image.disk`, and
+`image.ExtensionInfo` with its classes and scope. `[roothash]` is the verity root hash, and
+`[disk-manifest]` lists the files the DDI contains, and `[manifest]` is the same listing. The rule
+publishes them with the DDI.
+
+### image.portable
+
+`image.portable()` builds a portable service image for `portablectl attach` and `RootImage=`. The DDI
+contains the whole tree of the image, including its os-release, in an erofs root partition with its
+verity hash partition and, with `verity_key`, a signature over the verity root hash. Extensions for it
+are `image.extension()` targets with `parent` set to the portable image and `scope = ["portable"]`:
+
+```Starlark
+image.portable(
+    name = "webapp",
+    package_manager = ":image.package-manager",
+    packages = ["bash", "coreutils", "python3"],
+    ops = [
+        image.ops.copy("webapp.service", "/usr/lib/systemd/system/webapp.service"),
+        # webapp.service sets StateDirectory=webapp.
+        image.ops.mkdir("/var/lib/webapp"),
+    ],
+)
+
+image.extension(
+    name = "webapp-config",
+    parent = ":webapp",
+    classes = ["confext"],
+    scope = ["portable"],
+    ops = [image.ops.copy("webapp.conf", "/etc/webapp/webapp.conf")],
+)
+```
+
+systemd cannot create a mount point on the read-only root partition, so every path that systemd binds
+into the service must exist in the image. The portable profiles bind `/etc/machine-id` and
+`/etc/resolv.conf` from the host, and the rule adds an empty file at each path. An operation in `ops` that
+writes `/etc/machine-id` or `/etc/resolv.conf` replaces the empty file. `StateDirectory=`, `CacheDirectory=`
+and `LogsDirectory=` bind directories under `/var` from the host. Create the directories for the service's
+settings with `image.ops.mkdir()`, as in the example above. A tmpfiles.d snippet in the image cannot create
+the directories, because systemd-tmpfiles cannot write to the read-only root partition at run time. [Portable
+Services](https://systemd.io/PORTABLE_SERVICES/) lists what else an image needs, such as `/proc` and
+`/tmp`, which the base package of a distribution installs. Like `image.archive`, the rule runs the
+generators (see "Generating what packages only describe").
+
+The DDI is named `<name>_<version>_<arch>.raw`. portablectl takes the image name from the file name up to the
+first `_`, and attaches the units whose names start with that image name: `webapp.service`,
+`webapp-worker.service` or `webapp@.service`. The target defaults to its DDI and provides `image.DdiInfo`,
+with the same `[roothash]`, `[disk-manifest]` and `[manifest]` subtargets as an extension. It takes an
+optional `package_manager` or `parent`, the operations and packages of any composition, and `version`,
+`arch`, `seed` and `verity_key`.
+
+### image.disk
+
+`image.disk()` composes the partitions in `definitions` into a GPT disk. A bootable disk also contains
+systemd-boot, the initrd and versioned UKIs in its ESP. Most attributes parameterize the terminal rules
+described above.
 
 Required attributes:
 
-- `package_manager` (target label): See "Declaring an image" above.
-- `ops` (operation list) and `tmpfiles` (list of tmpfiles.d lines): Build the root filesystem layer;
-  passed on to `image.layer`.
+- `ops` (operation list): Build the root filesystem layer; passed on to `image.layer`.
 - `definitions` (list of `image.partition()` descriptors): Partition layout; `image.DEFAULT_ROOT_PARTITIONS`,
   `image.DEFAULT_USR_VERITY_PARTITIONS`, and `image.DEFAULT_SIGNED_USR_VERITY_PARTITIONS` are reusable
-  conventional layouts; it must contain system and ESP partitions; passed on to `image.repart()`.
+  conventional layouts; a bootable disk needs system and ESP partitions. A partition label can't contain
+  `%`, because repart would expand it as a specifier from the build box rather than from the image.
 
 Optional attributes:
 
-- `disk_seed` (string): Seeds stable partition UUIDs; passed on to `image.repart()`.
-- `verity_key` (target providing `image.SigningKeyInfo`): Signs the verity signature partition; passed on to
-  `image.repart()`.
+- `bootable` (bool): Makes the disk boot. It defaults to whether `definitions` contain an ESP partition, and
+  `True` without one fails the build. A disk that does not boot refuses `initrd`, `profiles`, `splash`,
+  `cmdline`, `initrd_modules`, `secure_boot_key` and `sign_expected_pcr_key`.
+- `disk_seed` (string): Seeds stable partition UUIDs.
+- `verity_key` (target providing `image.SigningKeyInfo`): Signs the verity signature partition.
 - `secure_boot_key` (target providing `image.SigningKeyInfo`): Signs the UKIs and systemd-boot; see "Secure
   Boot signing" below.
-- `output_size` (size string such as `"20G"`): Ships the disk at this size instead of at the size its
-  partitions need, so an installed system finds room past them and does not have to resize its medium
-  before first boot; passed on to `image.repart()`. The partitions keep the sizes their definitions ask
-  for, and the composed file is enlarged behind the last one, so the added room costs nothing on disk and,
-  as with `image.vm`'s `grow`, sits past the GPT backup header until something rewrites the table. A size
-  the
-  partitions do not fit in fails the build.
+- `virtual_size` (size string such as `"20G"`): The size of a virtual disk (`[qcow2]` or `[vmdk]`). A
+  system booted from it, including `image.vm`, can claim the extra space during first boot, e.g. for a
+  root partition. The raw image stays at the size of its partitions. The extra space sits past the GPT
+  backup header until something rewrites the table. A size the partitions do not fit in fails the build.
 - `mkfs_options` (dict of filesystem to option list, default `{}`): Options `mkfs` is given when
-  creating a partition of that filesystem, passed on to `image.repart()`, which hands each list to
+  creating a partition of that filesystem. The disk hands each list to
   `systemd-repart` as `SYSTEMD_REPART_MKFS_OPTIONS_<FSTYPE>`. Naming a filesystem the disk never formats
   fails the build rather than going nowhere, and an option holding whitespace is refused because repart
   splits the variable on it. This is where a disk's compression is really decided: an `image.partition()`'s
   `compression` only picks the algorithm, so an erofs partition left at the defaults comes out
-  substantially larger than one built the way `image.sysext` builds its own, which is
+  substantially larger than one built the way the extension rules build their own, which is
   `["-zzstd,level=3", "-C524288", "-Efragments,ztailpacking,dedupe"]`. `["--invariant"]` for vfat makes an
   ESP byte-stable across rebuilds, which `mkfs.fat` otherwise is not, because it stamps the volume label
   entry with the wall clock even under `SOURCE_DATE_EPOCH`.
 - `strip_pkgdb` (bool, default `False`): Leaves the package database out of the system partitions, for a
-  system that ships without its package manager and never resolves a package again; passed on to
-  `image.repart()`. The logical image keeps it, so `[pkgdb]` still captures the database and `[sbom]` still
-  reports every installed package rather than what a binary scan can guess. The ESP carries no database
-  either way.
+  system that ships without its package manager and never resolves a package again. The logical image keeps
+  it, so `[pkgdb]` still captures the database and `[sbom]` still reports every installed package rather than
+  what a binary scan can guess. The ESP carries no database either way.
 - `sign_expected_pcr_key` (target providing `image.SigningKeyInfo`): Seals the expected-PCR policy;
   without one the policy is not sealed. See "Secure Boot signing" below.
+- `package_manager` (target label): The package manager the disk starts its image from. See "Declaring an
+  image" above. Without `package_manager` and `parent`, the disk uses the package manager of the
+  distribution that the build chooses.
 - `parent` (target label providing `image.ImageInfo`): The logical image the disk extends, instead of the
-  `package_manager` it would otherwise start one from; exactly one of the two is required. This is what
-  lets something else build on the same content the disk boots: an `image.sysext_image()` whose `base` is
-  that image extends what the disk carries, and the disk can then ship the resulting DDI through
-  `esp_files`,
-  where making the extension's base the disk itself would be a dependency cycle. A disk extending a parent
+  `package_manager` it would otherwise start one from. A disk can't have both. This is what
+  lets something else build on the same content the disk boots: an `image.sysext()` whose `parent` is
+  that image extends the content of the disk, and the disk can then copy the resulting DDI to `/boot`
+  with `image.ops.copy()` in `ops`, where making the extension's parent the disk itself would be a
+  dependency cycle. A disk extending a parent
   declares its own `initrd`, because the conventional one is declared from a package manager it no longer
   names, and the parent places the generators below itself, because only a composition places them for a
   caller.
@@ -466,12 +700,15 @@ Optional attributes:
   `image.DEFAULT_INITRD_MODULES`; see "Kernel modules in the UKI"; passed on to `image.uki()`.
 - `profiles` (`image.uki_profile()` descriptor list): Alternative sd-boot menu entries, passed on to
   `image.uki()`.
+- `profile_fields` (string dict): `KEY=VALUE` lines of every `.profile` section, the base profile
+  included, passed on to `image.uki()`.
 - `splash` (source target or absolute image path): BMP image embedded in the UKI and displayed by the EFI
   stub while booting; passed on to `image.uki()`. An absolute path names a file the image ships, so one
   declaration can pick each distribution's own logo:
 
   ```starlark
   splash = distribution.select({
+      "DEFAULT": None,
       "arch": "/usr/share/systemd/bootctl/splash-arch.bmp",
       "debian": "splash.bmp",
   }),
@@ -480,8 +717,6 @@ Optional attributes:
   Either way the file must be a BMP; the build fails on any other format, and on an image path the
   image does not ship.
 - `arch` (string): Architecture; defaults to the one the image is built for; passed on to `image.uki()`.
-- `esp_files` (dict): Map from an absolute image path (under `/boot` or `/efi`, the trees the ESP
-  partition carries) to a source target copied onto the ESP.
 - `install_docs` (boolean): Passed to the root filesystem layer only; an `image.initrd()` carries its
   own, defaulting to no documentation.
 - `image_id` (string): The image identity, stamped into the image's os-release as `IMAGE_ID`.
@@ -510,9 +745,11 @@ views and supply-chain artifacts are lazy subtargets:
 //examples/image:boot-demo
 ├── [uki]
 │   └── [modules]
-├── [directory]
+├── [snapshot]
 ├── [qcow2]
 ├── [raw.zst]
+├── [vmdk]
+├── [ami]
 ├── [manifest]
 ├── [pkgdb]
 ├── [sbom]
@@ -527,6 +764,7 @@ views and supply-chain artifacts are lazy subtargets:
 ├── [boot]
 │   ├── [kernel]
 │   ├── [initrd]
+│   ├── [cmdline]
 │   └── [uki]
 ├── [roothash]
 └── [partitions]
@@ -536,30 +774,35 @@ views and supply-chain artifacts are lazy subtargets:
 
 The disk and its re-encodings are files named `<image_id>_<version>_<arch>.<ext>`, so they keep the image
 identity when copied out of the build, exactly matching the UKI's `<image_id>_<version>_<arch>.efi`.
-The `[qcow2]` and `[raw.zst]` subtargets re-encode the raw disk into a compact qcow2 or a compressed raw on
-demand, each publishing one `image.DiskConversionInfo`; the encodings are reachable only through those
-subtargets, because one result cannot carry the same provider type twice. The target has no aggregate
-bootable-image provider: it returns `image.ImageInfo`, `image.RepartInfo`, `image.InitrdInfo`,
-`image.ImageDirectoryInfo`,
-`image.UkiInfo`, and `image.PublishedInfo` independently.
+The `[qcow2]`, `[raw.zst]` and `[vmdk]` subtargets re-encode the raw disk into a compact qcow2, a compressed
+raw, or a compressed (streamOptimized) VMDK for VMware and cloud importers on demand, each publishing one
+`image.DiskConversionInfo`; the encodings are reachable only through those
+subtargets, because one result cannot carry the same provider type twice. `[ami]` publishes the parameters
+an Amazon Machine Image of the raw disk is registered with, see [aws.md](aws.md). The target has no aggregate
+bootable-image provider: it returns `image.ImageInfo`, `image.DdiInfo`, `image.InitrdInfo`,
+`image.ImageSnapshotInfo`, `image.UkiInfo`, and `image.PublishedInfo` independently. A disk that does not
+boot has no `[uki]`, `[initrd]`, `[boot]` or `[ami]` subtargets, returns no `image.InitrdInfo` or
+`image.UkiInfo`, and publishes no UKI, kernel or initrd.
 
 `image.PublishedInfo` is what a target contributes to a release, keyed by the name it is published under:
 for a disk the raw image, the UKI, the kernel and the initrd, plus the partitions, and for an
-`image.sysext_image` its DDI. Each rule names what it builds, so anything gathering a release reads those
-names instead of composing names of its own. A partition is the exception and travels as a typed
-`PartitionInfo`: its name contains the
-type and UUID repart assigned, so it exists only after the build, and a consumer reads it back out of the
-metadata written beside the partition. The ESP is not published: what it carries is transferred by other
-means, and no update writes the partition back. `[qcow2]` and `[raw.zst]` publish themselves rather than
-travelling in the disk's own set, so gathering a release does not build every encoding of it. So do the
-metadata views: `[sbom]` publishes both formats and `[pkgdb]` one file named after the format its package
-system keeps the database in, each named after the image they describe, and for a disk `[initrd][sbom]`
-covers what only early boot has.
+extension its DDI. Each rule names what it builds, so anything gathering a release reads those
+names instead of composing names of its own. Each name maps to an `image.PublishedFile`, which holds the
+artifact, its kind and its optional subkind. The provider's required `image` field names the image they
+belong to, and its optional `version` field gives the version of that image. The release's description
+below lists the kind, subkind, image and version of every file. A partition is the exception and travels
+as a typed `PartitionInfo`: its name contains the type and UUID repart assigned, so it exists only after
+the build, and a consumer reads it back out of the metadata written beside the partition. The ESP is not
+published: what it carries is transferred by other means, and no update writes the partition back. The format
+subtargets publish themselves rather than travelling in the disk's own set, so gathering a release does not
+build every encoding of it. So do the metadata views: `[sbom]` publishes both formats and `[pkgdb]` one file
+named after the format its package system keeps the database in, each named after the image they describe,
+and for a disk `[initrd][sbom]` covers what only early boot has.
 A scanner then reads a release without unpacking anything in it, and a release that lists no view builds
 none.
 
-`image.artifacts` gathers those contributions into one directory of symlinks, which is a release as a
-consumer sees it:
+`image.artifacts` copies those contributions into one directory, which is a release as a consumer sees
+it:
 
 ```Starlark
 image.artifacts(
@@ -569,9 +812,14 @@ image.artifacts(
 ```
 
 ```text
+artifacts_x86-64.json
+demo-ext_0_x86-64.sysext.Uapi16Manifest
 demo-ext_0_x86-64.sysext.raw
+demo-ext_0_x86-64.sysext.roothash
+image_0_x86-64.Uapi16Manifest
 image_0_x86-64.cdx.json
 image_0_x86-64.efi
+image_0_x86-64.esp.Uapi16Manifest
 image_0_x86-64.initrd
 image_0_x86-64.pkgdb.sqlite
 image_0_x86-64.qcow2
@@ -580,23 +828,120 @@ image_0_x86-64.spdx.json
 image_0_x86-64.usr-x86-64.0a72787674a137eaabf7aa97c82a72ee.raw
 image_0_x86-64.usr-x86-64-verity.94dcef64374b73274b88fe1a9ff45b31.raw
 image_0_x86-64.usr-x86-64-verity-sig.cb66a98640e5450aa028a8bf473ac0ea.raw
+image_0_x86-64.usr.Uapi16Manifest
 image_0_x86-64.vmlinuz
 ```
 
-The rule decides no name: it unions what each target published and reads a partition's name back from the
-metadata beside it, which is why it assembles the directory from a dynamic action. Two targets publishing
-one name is an error rather than a silent overwrite. The `usr` and `usr-verity` UUIDs above are the two
-halves of that build's verity root hash, and `%M_@v_%a.usr-%a.@u.raw` in a transfer is how
-systemd-sysupdate reads one back to give the partition it writes the UUID dissection pairs them by.
-`image.RepartInfo` contains the optional `image.RootHashInfo` when verity is enabled. The completed
+The rule decides no name of a built file: it unions what each target published and reads a partition's name
+back from the metadata beside it, which is why it assembles the directory from a dynamic action. The only
+name it adds is its description's, see below. Two targets publishing one name is an error rather than a
+silent overwrite. The `usr` and `usr-verity` UUIDs above are the two halves of that build's verity root hash,
+and `%M_@v_%a.usr-%a.@u.raw` in a transfer is how systemd-sysupdate reads one back to give the partition it
+writes the UUID dissection pairs them by.
+
+The release carries a description of its files, `artifacts_<arch>.json`. The `arch` in its name and in its
+top-level `arch` key is the architecture the release is built for, spelled as systemd does, as in `x86-64`
+or `arm64`. It is part of the name so that the releases of several architectures can share one directory.
+The `files` key maps each published name to an entry with these fields:
+
+- `kind`: This says what kind of file it is, and the optional `subkind` refines it. A consumer that does not
+  care about the `subkind` matches on the `kind` alone. These are the kinds and their subkinds:
+  - `disk` with the format as its subkind, `raw`, `qcow2`, `raw.zst` or `vmdk`.
+  - `partition` with the type its definition gives as its subkind, such as `usr`, `usr-verity`,
+    `usr-verity-sig` or `root`.
+  - `uki`, `kernel` and `initrd`, which have no subkind.
+  - `extension` with its classes as its subkind, `sysext`, `confext` or `sysext+confext`.
+  - `portable`, which has no subkind.
+  - `roothash` is the verity root hash file of an extension or a portable image and has no subkind.
+  - `sbom` with the format as its subkind, `spdx` or `cyclonedx`.
+  - `pkgdb` with the package system as its subkind, `rpm`, `deb` or `pacman`.
+  - `listing` with the subkind `uapi16manifest`.
+  - `ami` is the [AMI](aws.md) registration parameters and has no subkind.
+- `image`: This names the image the file belongs to. All files of one image share this value, so a consumer
+  can find the usr partition that goes with a UKI, or the SBOM that describes an extension, without parsing
+  names. For a disk it is the prefix the disk's files are published under, `image_0_x86-64` above. For an
+  extension or a portable image it is the DDI's file name without `.raw`, `demo-ext_0_x86-64.sysext`
+  above, so that a sysext and a confext of one name are two images. The initrd's SBOM and package database
+  describe the initrd rather than the disk, so they form an image of their own named `<prefix>.initrd`. The
+  initrd file itself stays in the disk's image.
+- `root_hash`: This is the verity root hash of the partition verity protects in a disk, or of an extension
+  or a portable image. Other files have no `root_hash`.
+- `version`: This is the version of the image the file belongs to, the same string as in the file's name:
+  `0` above, or a version rendered from git such as `0.0.0^573-160c7ddc0-d`. All files of one image share
+  it. Each image declares its own version, so two images in one release can have different versions. A
+  file whose `image.PublishedInfo` gives no version has no `version`.
+
+A consumer can match on these fields rather than file names. The excerpt below also gathers
+`:image[initrd][sbom]`. [`quarry.release`](quarry.md) reads them to describe a release for quarry.
+
+```json
+{
+  "arch": "x86-64",
+  "files": {
+    "demo-ext_0_x86-64.sysext.raw": {
+      "image": "demo-ext_0_x86-64.sysext",
+      "kind": "extension",
+      "root_hash": "…",
+      "subkind": "sysext",
+      "version": "0"
+    },
+    "image_0_x86-64.cdx.json": {
+      "image": "image_0_x86-64",
+      "kind": "sbom",
+      "subkind": "cyclonedx",
+      "version": "0"
+    },
+    "image_0_x86-64.efi": {
+      "image": "image_0_x86-64",
+      "kind": "uki",
+      "version": "0"
+    },
+    "image_0_x86-64.initrd.spdx.json": {
+      "image": "image_0_x86-64.initrd",
+      "kind": "sbom",
+      "subkind": "spdx",
+      "version": "0"
+    },
+    "image_0_x86-64.usr-x86-64.0a72787674a137eaabf7aa97c82a72ee.raw": {
+      "image": "image_0_x86-64",
+      "kind": "partition",
+      "root_hash": "0a72787674a137eaabf7aa97c82a72ee94dcef64374b73274b88fe1a9ff45b31",
+      "subkind": "usr",
+      "version": "0"
+    }
+  }
+}
+```
+
+`image.DdiInfo` contains the optional `image.RootHashInfo` when verity is enabled. The completed
 `image.ImageInfo` includes the ESP layer, so another image can use the bootable image as its parent without
 relying on a generated
 helper label. The same `image.InitrdInfo`, containing its logical `image.ImageInfo` and derived
 `image.ImageArchiveInfo`, is the sole typed provider published by `[initrd]`. Merely carrying an artifact
 in a provider does not build it;
 optional actions run only when a consumer uses the artifact or a user selects its subtarget.
-`[directory]` has the same representability limit as `image.directory`: it fails when the completed tree
-contains a path, such as a systemd-escaped unit name, that Buck directory artifacts cannot store.
+`[snapshot]` contains a UAPI.16 manifest and content blobs. `buck run` on it exports the snapshot as a
+directory that keeps modes, times, user extended attributes, symlinks and hardlinks.
+
+Export requires read access to `/proc/sys/kernel/overflowuid`. Keep the stored manifest and blobs
+immutable while exporting. The destination must not exist. Its parent must be owned by you or root. A parent
+with group or other write permissions must have the sticky bit, as `/var/tmp` does. Use a parent owned by you
+if Buck runs in a user namespace that does not map its owner's uid. The exporter rejects a parent owned by
+the overflow uid, which is how a user namespace shows an owner that it does not map. The exporter creates a
+private user namespace when needed; uid/gid zero then maps to your host uid/gid. Device nodes require
+permission to create them on the destination filesystem.
+
+```sh
+tine buck run 'tine//examples/image:boot-demo.fedora[snapshot]' -- /var/tmp/tine-image-export/root
+```
+
+The stored manifest remains authoritative if you copy the Buck artifact elsewhere; copying an exported
+directory with a tool that drops metadata requires exporting it again from the stored snapshot.
+
+The `[manifest]` of an archive, initrd, extension, portable or disk replaces the listing of the logical
+image. It describes the terminal contents, including package-database removal. A disk that only imports
+verity partitions without a listing keeps the `[manifest]` of the logical image. `[pkgdb]` and `[sbom]`
+describe the installed package set.
 
 `[boot]` is what the disk boots, as files: the `bootable` rule run against the composition's own ESP, so a
 direct kernel boot or a publisher needs no second target pointing back at it. Its `[kernel]` and `[initrd]`
@@ -613,6 +958,87 @@ boot is not exposed the way the same package in the running system is. The union
 everything in the UKI, provided the image keeps the kernel package installed in its own tree, which is where
 the UKI's kernel and modules come from.
 
+### image.ddi_preloaded_disk
+
+`image.ddi_preloaded_disk()` adds extension and portable service DDIs to the ESP of an already built
+disk. It keeps all existing signatures intact, and fails if any file on the ESP already exists.
+
+```Starlark
+image.ddi_preloaded_disk(
+    name = "appliance",
+    base = ":base-os",
+    extensions = [":debug-tools", ":site-config"],
+    portables = [":webapp", ":webapp-config"],
+)
+```
+
+- `base` (target providing `image.DdiInfo`): The disk (raw or zstd-compressed), such as an
+  `image.disk()`, another `image.ddi_preloaded_disk()`, or an `image.imported_disk()` (see below).
+  It needs exactly one ESP partition, with room for the DDIs.
+- `extensions` (list of extension targets): Each must have the `system` scope. A DDI goes to
+  `/extensions/<name>.raw.v/<name>_<version>_<arch>.raw` on the ESP, regardless of its classes.
+- `portables` (list of portable images and extensions with the `portable` scope): A DDI goes to
+  `/portables/<name>.raw.v/<name>_<version>_<arch>.raw` on the ESP.
+- `virtual_size` (size string such as `"20G"`): Same as for `image.disk()`. It defaults to the base's.
+
+These paths are compatible with `systemd-sysupdate` transfer files and `systemd-vpick` versioning,
+so that updates replace the preloaded extensions.
+
+Nothing currently merges or attaches the DDIs at boot: systemd does not look for extensions and
+portable images in the ESP. Booting/instantiation needs to do that with creating symlinks to `/run`
+or `/var`, followed by `systemd-{conf,sys}ext refresh` (as `systemd-tmpfiles-setup.service` runs
+after the initial confext/sysext merge). For portable services, call `portablectl attach` as usual.
+
+The target defaults to the disk as `<name>.raw.zst`, and offers `[qcow2]` and `[vmdk]` subtargets.
+It can be booted by `image.vm`.
+
+### External disks as a base
+
+`image.imported_disk()` declares a base disk for preloading from a disk that was built elsewhere,
+such as a published release of an OS. `disk` is its `.raw` or `.raw.zst`, and the optional `ami` its
+`.ami.json`, which the target provides as `[ami]`, plus optionally a `virtual_size`. Pin each file in the
+project's `tine.lock.json`, and download it with [`http.file()`](http.md#declaring-a-download):
+
+```json
+{
+  "os-disk": {
+    "url": "https://releases.example.com",
+    "release": "1.2",
+    "platforms": {
+      "x86_64": {"artifact": "os_1.2_x86-64.raw.zst", "sha256": "…", "size": 382105381}
+    }
+  },
+  "os-ami": {
+    "url": "https://releases.example.com",
+    "release": "1.2",
+    "platforms": {
+      "x86_64": {"artifact": "os_1.2_x86-64.ami.json", "sha256": "…", "size": 1414}
+    }
+  }
+}
+```
+
+`tine bump` fills in `sha256` and `size`, and with a `releases` index moves the pins to the newest
+release, see [The pin](http.md#the-pin).
+
+```Starlark
+load("//:tine.lock.json", pins = "value")
+load("@tine//http:defs.bzl", "http")
+
+http.file(name = "os.raw.zst", spec = pins["os-disk"])
+
+http.file(name = "os.ami.json", spec = pins["os-ami"])
+
+image.imported_disk(
+    name = "os",
+    disk = ":os.raw.zst",
+    ami = ":os.ami.json",
+    virtual_size = "20G",
+)
+```
+
+Then `image.ddi_preloaded_disk()` takes `:os` as a `base =`, see above.
+
 ### Kernel modules in the UKI
 
 A UKI carries the kernel, the initrds it was built from, and one further initrd the `image.uki` rule
@@ -620,7 +1046,7 @@ assembles for that kernel alone, holding kernel modules. `initrd_modules` select
 image's own `/usr/lib/modules/<kver>`, and the build adds what they depend on and the firmware they ask for.
 This
 initrd is appended after the ones passed in, so no initrd has to be built for a particular kernel: an
-image given to `image.bootable_disk` as `initrd` needs no kernel modules of its own, and gets the ones
+image given to `image.disk` as `initrd` needs no kernel modules of its own, and gets the ones
 selected here.
 
 The default is `image.DEFAULT_INITRD_MODULES`, exported from `//image:defs.bzl`. It is a core set rather than
@@ -634,7 +1060,7 @@ filesystem reached over the network, or any device whose driver needs firmware. 
 through one of those has to name it:
 
 ```Starlark
-image.bootable_disk(
+image.disk(
     # The core set, plus a controller this appliance boots from, minus a filesystem it never mounts.
     initrd_modules = image.DEFAULT_INITRD_MODULES + ["mpt3sas", "-btrfs"],
 )
@@ -722,7 +1148,7 @@ An image asks for that version with `version = "auto"`, or names its own base wi
 `version = "auto:<base>"` and takes only what tells one build of that base from the next:
 
 ```Starlark
-image.bootable_disk(
+image.disk(
     name = "demo",
     definitions = image.DEFAULT_SIGNED_USR_VERITY_PARTITIONS,
     version = "auto:1.4.2",
@@ -749,11 +1175,11 @@ version a tag itself names can be, since two builds of a declared base have to s
 `":"` is not a character a version accepts, so neither spelling can collide with one meant literally.
 
 Every image macro resolves it as it declares the target, so the components are read where the image is
-declared and only the packages that declare one re-read them when the version moves. `image.bootable_disk`
+declared and only the packages that declare one re-read them when the version moves. `image.disk`
 renders the hash against its own longest label and hands the result to the initrd it declares, so a disk
 and its initrd carry one version rather than each rendering its own; an image whose version reaches no
-partition label (`image.rootfs_archive`, `image.sysext_image`, `image.initrd`) has all 36 characters to
-itself and keeps the full 12.
+partition label (`image.archive`, the extensions, `image.portable`, `image.initrd`) has all 36
+characters to itself and keeps the full 12.
 
 Three things are errors rather than fallbacks, because an unversioned or stale build published under a
 version that promises something else is worse than a build that stops:
@@ -764,7 +1190,7 @@ version that promises something else is worse than a build that stops:
   or declare a shorter base.
 - Either `"auto"` spelling with no components in configuration. `bin/tine` writes the reason it had none
   into that block (see below), and the message points there.
-- A sentinel that reaches the build unresolved: `image.layer()`, `image.uki()` and `image.sysext()` render
+- A sentinel that reaches the build unresolved: `image.layer()` and `image.uki()` render
   nothing, and a `select()` cannot be read where the rendering happens, so `"auto"` reaching either would
   otherwise name partitions and files `auto`.
 
@@ -796,7 +1222,7 @@ A version that changes rebuilds only the artifacts that embed it, never package 
 
 ## Secure Boot signing
 
-`image.bootable_disk()` accepts a `secure_boot_key`, which names a target providing
+`image.disk()` accepts a `secure_boot_key`, which names a target providing
 `image.SigningKeyInfo` (the private key and its certificate). It signs the UKIs and the systemd-boot
 binaries with `systemd-sbsign`, and `bootctl` places `loader/keys/auto/{PK,KEK,db}.auth` enrollment variables
 on the ESP: firmware in setup mode
@@ -820,7 +1246,8 @@ finds it after an OS update; [architecture.md](../design/architecture.md) explai
 Development images can source a key in two ways:
 
 - `image.generate_signing_key()` mints a pair at build time with `ukify genkey`, into buck-out; see
-  `//examples/image-secureboot`. Nothing is committed and no manual step is needed. Every workspace, and
+  `//examples/image-secureboot`. Nothing is committed and no manual step is needed. Rebuilds reuse the pair,
+  also after a change to the box, and the build never uploads it to a cache. Every workspace, and
   every build after `buck clean`, mints a different key, so all signed artifacts rebuild and each
   workspace's images enroll a different certificate.
 - `image.pem_signing_key()` adopts PEM files committed in the consuming project. Stable inputs keep the whole
@@ -833,11 +1260,11 @@ and the build reaches it over a socket without ever seeing the key material. See
 
 ## Running the image in a VM
 
-Runtime and execution policy live on the `image.vm` target, not in the disk provider: its explicit `box`
-supplies the VM stack, its `autologin` option provisions a locked root password and runtime `login.noauth`,
-and arbitrary non-secret system credentials configure settings such as first-boot locale and timezone.
-`cpus` sets the number of virtual CPUs, and `ram` sets the guest memory to a systemd size such as `"4G"`;
-both are passed directly to vmspawn.
+Runtime and execution policy live on the `image.vm` target, not in the disk provider: the tools box of the
+image's release supplies the VM stack, its `autologin` option provisions a locked root password and runtime
+`login.noauth`, and arbitrary non-secret system credentials configure settings such as first-boot locale and
+timezone. `cpus` sets the number of virtual CPUs, and `ram` sets the guest memory to a systemd size such as
+`"4G"`; both are passed directly to vmspawn.
 
 `cmdline_extra` appends kernel command line arguments to the ones the image already boots with, for
 settings a run needs and the image should not carry: `["systemd.firstboot=headless"]` keeps a first boot
@@ -847,11 +1274,34 @@ which is where it takes extra kernel command line arguments, so it picks how to 
 image takes its command line from its own UKI, and vmspawn writes them as the SMBIOS OEM strings the stub
 and the boot loader read (`io.systemd.stub.kernel-cmdline-extra` and its `boot` counterpart).
 
-`grow` enlarges the disk file to a given size before boot (vmspawn's `--grow-image`), which is how an
-ephemeral guest is given room the built partitions do not occupy; the guest claims that room itself, for
-example with `systemd-repart`. vmspawn grows the built artifact in place, and the added space sits past the
-GPT backup header until something rewrites the table. Use it to give a guest more room than the shipped
-disk carries; a disk that should always carry that room sets `output_size` on the image instead.
+The guest boots the image's `[qcow2]`, so it sees a disk of the image's `virtual_size` and claims the room
+past the built partitions itself, for example with `systemd-repart`. `grow` gives it a larger disk than
+that (vmspawn's `--grow-image`): vmspawn creates the ephemeral overlay at that size, and the qcow2 stays
+untouched. `image_format = "raw"` hands it the raw disk instead, which has no room past the partitions.
+
+By default the firmware boots the image from its ESP. `linux` and `initrd` boot a kernel directly instead,
+vmspawn's `--linux` and `--initrd`, and take any file; a bootable disk's `[boot][kernel]` and
+`[boot][initrd]` are the ones its UKI carries. Unlike the UKI, a bare kernel brings no command line of its
+own, so `cmdline_file` names the file to read it from when the VM starts, usually the disk's
+`[boot][cmdline]`: it carries the root hash, which is only known once the image is built. `cmdline_extra`
+follows it.
+
+```Starlark
+image.vm(
+    name = "os-direct-vm",
+    image = ":os",
+    linux = ":os[boot][kernel]",
+    initrd = ":os[boot][initrd]",
+    cmdline_file = ":os[boot][cmdline]",
+)
+```
+
+`coco` runs the guest as a confidential VM, vmspawn's `--coco=`, for instance `"sev-snp"` or `"tdx"`; vmspawn
+checks what that needs of the host and of the rest of the command line, such as a direct kernel boot for
+SEV-SNP. `vmspawn_args` passes any other vmspawn option. They follow everything tine passes, so one that
+vmspawn takes the last value of, such as `--console=` or `--tpm=`, overrides tine's. The only options tine
+always passes are `--image`, `--image-format`, `--ephemeral`, which keeps the guest from writing the build
+output, and the defaults `--console=native`, `--kvm=yes` and `--network-user-mode`.
 
 ```sh
 tine buck run //examples/image:boot-demo-vm.fedora
@@ -871,16 +1321,31 @@ tine buck build //examples/image:boot-demo.fedora
 tine buck build '//examples/image:boot-demo.fedora[uki]'
 tine buck build '//examples/image:boot-demo.fedora[partitions][usr]'
 tine buck build //examples/image:demo-ext.fedora
+tine buck build //examples/image:demo-portable.fedora
 ```
 
-These validate package installation and commands sharing one delta, incremental layering, archive packing,
+These validate package installation and commands sharing one layer, incremental layering, archive packing,
 versioned UKI creation, semantic boot-artifact extraction, ESP-layer assembly, and disk composition.
-`demo-ext` is a system-extension DDI on top of `boot-demo`. Running `boot-demo-vm` validates the interactive
-VM runner; it exposes `demo-ext` under `/var/lib/extensions` in the guest, which validates the sysext merge
-at boot.
+`demo-ext` is a system extension and `demo-confext` a configuration extension on top of `boot-demo`.
+`demo-portable` is a portable service image, and `demo-portable-ext` an extension for it. Running
+`boot-demo-vm` validates the interactive VM runner. `boot-demo-vm-smoke` boots `boot-demo`, merges
+`demo-ext` and `demo-confext` at boot, and attaches the two portable DDIs with
+`portablectl attach --extension demo-portable-ext demo-portable`. `boot-demo-preloaded` is `boot-demo`
+with these four DDIs on its ESP. `boot-demo-preloaded-vm-smoke` boots it, activates the DDIs from the ESP,
+and checks that they merge and attach. `boot-demo-imported` imports the `[raw.zst]` and `[ami]` of
+`boot-demo` the way a project that builds on a release would, and `imported-disk-test` checks that
+preloading it gives the same disk.
+
+A host that merges a confext or attaches a portable image needs two things, which `boot-demo` provides:
+
+- systemd-confext mounts `/etc` read-only unless configured otherwise. A host that writes `/etc` at
+  boot needs a `confext.conf.d` drop-in with `Mutable=`, or login fails with "PAM failure, aborting"
+  once a confext is merged. `boot-demo` uses `Mutable=ephemeral`.
+- Only Arch's systemd package contains portablectl. Debian and Fedora install it with
+  `systemd-container`.
 
 The signed variant lives in `//examples/image-secureboot`: its `demo-ext` signs the verity root hash with a
-generated key, the image ships that key's certificate in `/usr/lib/verity.d/` and a
+derived key, the image ships that key's certificate in `/usr/lib/verity.d/` and a
 `/usr/lib/systemd/sysext.conf` whose `ImagePolicy` grants `signed` only, and its `vm-smoke` proves both
 directions — the signed extension merges, and the unsigned `demo-ext-unsigned` DDI is refused. Without such
 a policy the signature is decorative: systemd-sysext's default policy merges unsigned images, and falls back
@@ -904,52 +1369,126 @@ pacman or dpkg, and nothing is written twice.
 An image's distribution is a configuration its target carries, so one declaration serves every
 distribution the catalog offers. An image rule names itself once per distribution its package
 serves, so declaring `boot-demo` also declares `boot-demo.fedora`, `boot-demo.arch` and
-`boot-demo.debian` with nothing further to write. A rule tine does not own says so itself:
+`boot-demo.debian` with nothing further to write. For any other rule, such as a prelude `command_alias`,
+you declare the aliases yourself:
 
 ```Starlark
+command_alias(
+    name = "boot-demo-qemu",
+    exe = ":run-qemu",
+    args = ["$(location :boot-demo)"],
+    target_compatible_with = distribution.compatibility(),
+)
+
 distribution.alias(
-    name = "boot-demo-vm-smoke.fedora",
-    actual = ":boot-demo-vm-smoke",
-    distro = "//catalog:<family>.<release>.distribution",
+    name = "boot-demo-qemu.fedora",
+    actual = ":boot-demo-qemu",
+    distro = "catalog//:<family>.<release>.distribution",
 )
 ```
+
+If the target has constraints of its own, also pass them to the alias as `compatible_with`. Otherwise
+building `//...` for an architecture the target doesn't support fails instead of skipping the alias. An
+image rule passes its `target_compatible_with` to its aliases itself.
 
 An image can also name its own distribution instead of being aliased into one:
 
 ```Starlark
-image.bootable_disk(
+image.disk(
     name = "appliance",
-    distro = "//catalog:<family>.<release>.distribution",
+    distro = "catalog//:<family>.<release>.distribution",
     package_sets = ["bootable"],
     ...
 )
 ```
 
-Either way the package manager comes from a `select()` on that distribution, and the package names come
+Either way the image gets the package manager of that distribution, and the package names come
 from the release's package sets, so moving an image between distributions changes neither its operations
 nor the rules underneath. The mechanism is described in
 [architecture.md](../design/architecture.md#selecting-a-distribution).
 
-The examples deliberately have no default. `//examples/image:boot-demo` is declared for no distribution
+The repository sets no default. `//examples/image:boot-demo` is declared for no distribution
 in particular, so building it by that name fails as incompatible and `//examples/image/...` skips it;
-`:boot-demo.fedora`, `:boot-demo.arch` and `:boot-demo.debian` are what build. A default would make
-whichever distribution it named the only one anybody builds, and the others would rot. A package gets
-that behaviour by saying once, in its `PACKAGE` file, which distributions its images serve:
+`:boot-demo.fedora`, `:boot-demo.arch` and `:boot-demo.debian` are what build. A default in the
+repository would make whichever distribution it named the only one anybody builds, and the others would
+rot. Your own checkout can set a default with the `distribution` key of the `tine` buckconfig section.
+
+Every package gets that behaviour for the releases that the catalog lists in `catalog//:releases.bzl`:
+
+```Starlark
+RELEASES = {
+    "arch": "arch.rolling",
+    "debian": "debian.testing",
+    "fedora": "fedora.rawhide",
+}
+```
+
+Each key is the suffix of the alias that every image gets for that release. The key `fedora` declares
+`:boot-demo.fedora` beside `:boot-demo`. Each value is the `<family>.<release>` prefix of a release in the
+catalog. A project with its own catalog lists the releases of that catalog in its own `releases.bzl`.
+
+If `releases.bzl` lists one release, images build for that release by their own names and get no aliases.
+For a project that builds for Fedora rawhide only, `releases.bzl` lists that one release, and
+`:boot-demo` builds a Fedora rawhide image:
+
+```Starlark
+RELEASES = {
+    "fedora": "fedora.rawhide",
+}
+```
+
+An image that names neither `package_manager` nor `parent` uses the package manager of the release that a
+build chooses:
+
+```Starlark
+image.archive(
+    name = "demo",
+    packages = ["bash"],
+    format = "tar",
+)
+```
+
+`distribution.package_manager()` returns that package manager. To add repositories of your own, pass it as
+the `base` of a `package.manager()`, and pass the result as the image's `package_manager`.
+
+A package that builds for other releases, or needs more per release, declares its own table in its
+`PACKAGE` file. Each entry's `release` names a release of the catalog. `package_manager` defaults to the
+release's package manager. Everything else is whatever the package needs to know per distribution, read
+back with `distribution.for_package()`:
 
 ```Starlark
 load("@tine//distribution:defs.bzl", "distribution")
 
 distribution.set_for_package({
-    "<name>": {
-        "distribution": "//catalog:<family>.<release>.distribution",
-        "package_manager": "//catalog:<family>.<release>.package-manager",
-    },
+    "fedora": {"release": "fedora.rawhide"},
+    "fedora-43": {"release": "fedora.43", "package_manager": "//:fedora-43.package-manager"},
 })
 ```
 
-Only the `distribution` key is tine's business. Everything beside it is whatever the package needs
-to know per distribution, read back with `distribution.for_package()`, so a BUCK file selects its
-package manager and names its aliases from the same table and one place adds a distribution.
+An empty table, `distribution.set_for_package({})`, declares no distribution. The package's images then
+build by their own names, from whichever package manager they name. An image in such a package that names
+neither `package_manager` nor `parent` has no package manager and can't install packages.
+
+A key of `distribution.select()` is a family (`arch`, `debian` or `fedora`), a release of the catalog such as
+`fedora.43`, or `DEFAULT`. A family key matches every release of that family. Buck picks a release key over
+the key of its family, and `DEFAULT` matches where no other key does. Buck fails to configure a target that
+matches no key. The names in a package's table name its aliases, such as `:boot-demo.fedora-43`, and no
+select reads them. A release key names the distribution in the root package of the catalog cell, and tine
+fails to load a distribution declared anywhere else.
+
+To build an image for some of the package's distributions only, make it incompatible with the others. The
+aliases for the others remain, and a build of the package skips them:
+
+```Starlark
+image.disk(
+    name = "fedora-only",
+    # ...
+    target_compatible_with = distribution.select({
+        "DEFAULT": select_incompatible("fedora-only builds for Fedora only"),
+        "fedora": [],
+    }),
+)
+```
 
 Every image rule then defaults its `target_compatible_with` to them, so no target repeats it and none
 can forget it: a target that is itself unconstrained while its image is incompatible is an error
@@ -960,50 +1499,58 @@ asks with `distribution.compatibility()`.
 Building one of those targets without choosing says so by name:
 
 ```text
-tine//examples/image:boot-demo is incompatible with tine//platforms:default
+tine//examples/image:boot-demo is incompatible with tine//platform:default
     (tine//distribution:no-distribution-chosen unsatisfied)
 ```
 
-A distribution is also a platform, so a developer who builds one of them all day can name it as the
-default for unqualified targets in `.buckconfig.local`, below the block `bin/tine` generates there,
-which is git-ignored and belongs to the checkout rather than the repository:
+If you build one distribution all day, set the `distribution` key of the `tine` section to the name of
+its alias. Put it in `.buckconfig.local`, below the block that `bin/tine` generates there. git ignores
+that file, so the setting applies to your checkout only:
 
 ```ini
-[parser]
-target_platform_detector_spec = target:tine//...->//catalog:<family>.<release>.distribution
+[tine]
+distribution = arch
 ```
 
-That platform is the base one plus the distribution's constraint, so choosing a distribution does not
-drop the cpu and os the base platform carries. Nothing in the repository sets it: an unqualified target
-means "no distribution chosen" everywhere except a checkout that has said otherwise.
+`//examples/image:boot-demo` then builds what `:boot-demo.arch` builds, and the build shares its outputs
+with the alias. The aliases still build their own distributions. A package whose table has no entry of
+that name still fails to build a target by its own name. To set the key for one build, pass
+`-c tine.distribution=arch`.
+
+With the key set, `buck test` runs a test of that distribution by its own name only. The test's alias
+for that distribution still builds, but `buck test` of the alias runs no test.
 
 A consuming project adds `//packages/fedora/rawhide:zlib-ng`, which validates package import,
-package-manager selection, buildroot assembly and RPM collection (packages with `buildroot_deps`
+package-manager selection, buildroot assembly and RPM collection (packages with `buildroot_packages`
 additionally exercise local-package preference), and `//examples/image-local-packages:image`, which builds
 an image from those packages. Neither target exists in this repository.
 
 ## Updating pinned tools
 
-`bump` refreshes the pinned tool releases against their upstream GitHub releases.
+`bump` refreshes the pinned tool releases against their upstream GitHub releases. A pin with a `url`
+moves to the newest release in the index that its `releases` names.
 
 Update one or more pinned tools by name (`buck2`, `starlark-fmt`, `python3`, `ruff`, `ty`, `syft`,
-`cargo-auditable`):
+`cargo-auditable`, `seaweedfs`, `go`, `gh`):
 
 ```sh
-tine buck run tine//tools:bump -- --tool ruff --tool ty
+tine bump --tool ruff --tool ty
 ```
 
 Update all tools:
 
 ```sh
-tine buck run tine//tools:bump -- --all
+tine bump --all
 ```
 
-Each tool is resolved to its latest upstream release and its `url` and `sha256` are rewritten in place.
-Add `--commit` to record the result as a git commit whose message itemizes each update.
+Each tool is resolved to its latest upstream release, and its `release`, `artifact`, `sha256` and `size`
+are rewritten in place. For a pin with a `url`, `bump` downloads each new artifact to compute its digest and
+size. The pattern of the `go` pin matches only Go 1.27 releases. Change the pattern to move the pin to
+another minor version. Add `--commit` to record the result as a git commit whose message itemizes each
+update.
 
 Buck2 is declared like the rest, and `starlark-fmt` ships from the same fork release, so one run keeps
 the two on one tag. `bin/tine` fetches Buck2 itself, Buck2 then fetches the rest.
 
-python3 minor version stays pinned in pyproject.toml; updating to a new minor release stays a deliberate
-manual change.
+`bump` keeps `python3` on the minor version that `python-version` in `ty.toml` sets. Moving to a new minor
+version is a deliberate change to `ty.toml`.

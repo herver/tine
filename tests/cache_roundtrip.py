@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import cast
 
 import cache_shim
-from util import buck_output, fail, nested_buck
+from util import buck2_argv, buck_output, fail
 
 import seaweed
 
@@ -47,7 +47,7 @@ SERVED = {
 ACTION = re.compile(r"(?P<target>\S+) \(\S+\) \((?P<category>\w+)\)")
 ISOLATION = "cache-roundtrip"
 # The platform whose executor decides whether Buck offers the shim an upload at all.
-PLATFORM = "tine//platforms:default"
+PLATFORM = "tine//platform:default"
 BUCKET = "tine-cache"
 # `tine.LOCAL_SETTINGS`, which this cannot import without dragging the whole launcher in.
 LOCAL_SETTINGS = "tine.local.toml"
@@ -135,7 +135,9 @@ class RoundTrip:
 
     def build(self) -> None:
         """Build every target named in SERVED."""
-        self.tine("build", *SERVED)
+        # The Go and Rust examples build once per distribution. Without a chosen distribution, Buck
+        # finds the examples incompatible and fails the build.
+        self.tine("build", "-c", "tine.distribution=fedora", *SERVED)
 
     def check_uploads(self, allowed: bool) -> None:
         """Fail unless Buck's executor offers uploads exactly when the shim takes them.
@@ -207,8 +209,7 @@ def main() -> None:
     parser.add_argument("--weed", type=Path, required=True, help="the SeaweedFS binary")
     arguments = parser.parse_args()
 
-    buck = nested_buck()
-    root = Path(buck_output(buck, "root", "--kind", "project"))
+    root = Path(buck_output("root", "--kind", "project"))
     if (root / LOCAL_SETTINGS).exists():
         fail(f"{root / LOCAL_SETTINGS} exists, and this writes one of its own; move it away first")
 
@@ -218,7 +219,7 @@ def main() -> None:
         stack.callback(weed.close)
         # Create CA/leaf keys. No settings yet, so no shim is started.
         subprocess.run(
-            [buck, "-v", "0", "run", "tine//remote_cache:test-ca", "--", str(scratch)], check=True
+            [*buck2_argv("-v", "0", "run", "tine//remote_cache:test-ca"), "--", str(scratch)], check=True
         )
         run = RoundTrip(root, scratch, weed)
         stack.callback(run.teardown)

@@ -4,7 +4,7 @@
 """Small, strict readers for Debian's Deb822 metadata."""
 
 import io
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, NamedTuple, cast
@@ -33,16 +33,26 @@ def package_index(directory: Path, what: str) -> Path:
     The index is at the path that the mirror serves it under. A mirror serves one index in several
     compressions, but a materialized repository must hold exactly one file.
     """
-    served = f"{SUITES}/*/{index_directory('*', '*')}"
-    found = [path for name in INDEX_NAMES for path in directory.glob(f"{served}/{name}")]
+    if (directory / SUITES).is_dir():
+        served = f"{SUITES}/*/{index_directory('*', '*')}/"
+        found = [path for name in INDEX_NAMES for path in directory.glob(f"{served}/{name}")]
+    else:
+        found = [path for name in INDEX_NAMES for path in directory.glob(name)]
     if len(found) != 1:
         util.fail(f"{what}: expected exactly one Packages stream in {directory}, found {len(found)}")
     return found[0]
 
 
 def suite_directory(index: Path) -> Path:
-    """Return the suite directory of an index that `package_index()` found."""
-    return index.parents[2]
+    """Return the suite directory of an index that `package_index()` found.
+
+    For a flat repository, returns the repo root.
+    """
+    if index.parents[3].name == SUITES:
+        return index.parents[2]
+    else:
+        # If there is no "dists", assume the repository is flat.
+        return index.parents[0]
 
 
 def stanzas(source: Iterable[str]) -> Iterator[dict[str, str]]:
@@ -119,7 +129,7 @@ class Package(NamedTuple):
 
 
 @contextmanager
-def open_text(path: Path) -> Iterator[Iterable[str]]:
+def open_text(path: Path) -> Generator[Iterable[str]]:
     """Open a Deb822 file as text, and detect its compression from its first bytes.
 
     A byte that is not UTF-8 raises while the caller iterates inside the `with` block. This function

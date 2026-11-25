@@ -1,0 +1,7 @@
+{
+  "fedora": {
+    "url": "examples/package/rpm/hello-packaging.bundle",
+    "branch": "rawhide",
+    "commit": "ff16cc891d9bb222407e3edc73566a2eff00a570"
+  }
+}

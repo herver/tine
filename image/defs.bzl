@@ -7,73 +7,53 @@ Load the `image` namespace from here; the modules behind it are implementation s
 rearranged.
 """
 
+load("//kmod:initrd_modules.toml", _INITRD_MODULES = "value")
 load(
-    "//image_format:archive.bzl",
+    ":archive.bzl",
     "COMPRESSIONS",
     "ImageArchiveInfo",
-    "ImageDirectoryInfo",
-    "image_archive",
-    "image_directory",
+    "ImageSnapshotInfo",
+    "image_snapshot",
 )
-load("//image_format:boot.bzl", "bootable")
+load(":boot.bzl", "UkiInfo", "bootable", "uki", "uki_profile")
 load(
-    "//image_format:disk.bzl",
+    ":compose.bzl",
+    "InitrdInfo",
+    "archive",
+    "confext",
+    "disk",
+    "extension",
+    "initrd_image",
+    "portable",
+    "sysext",
+)
+load(
+    ":ddi.bzl",
     "DEFAULT_ROOT_PARTITIONS",
     "DEFAULT_SIGNED_USR_VERITY_PARTITIONS",
     "DEFAULT_USR_VERITY_PARTITIONS",
     "DISK_FORMATS",
+    "DdiInfo",
     "DiskConversionInfo",
-    "RepartInfo",
     "RootHashInfo",
-    "disk_convert",
-    "format_partition_labels",
     "partition",
-    "repart",
 )
-load(
-    "//image_format:sysext.bzl",
-    "SysextImageInfo",
-    "image_sysext",
-)
-load(
-    "//image_format:uki.bzl",
-    "UkiInfo",
-    "uki",
-    "uki_profile",
-)
-load(
-    ":compose.bzl",
-    "bootable_disk_image",
-    "rootfs_archive",
-    "sysext_image",
-)
+load(":extension.bzl", "ExtensionInfo")
 load(
     ":image.bzl",
     "ImageInfo",
     "ImageInstallInfo",
     "ImageSbomInfo",
-    "copy",
-    "depmod",
-    "hwdb",
-    "install_from",
-    "install_systemd_boot",
+    "image_install",
     "layer",
-    "locale_gen",
-    "merge_os_release",
-    "mkdir",
-    "python",
-    "remove",
-    "run",
-    "symlink",
-    "write_file",
+    "ops",
 )
-load(":initrd.bzl", "InitrdInfo", "initrd_image")
-load(":initrd_modules.toml", _INITRD_MODULES = "value")
-load(":install.bzl", "image_install")
-load(":publish.bzl", "PublishedInfo", "image_artifacts")
+load(":preload.bzl", "ddi_preloaded_disk", "imported_disk")
+load(":publish.bzl", "PublishedFile", "PublishedInfo", "image_artifacts")
 load(
     ":sign.bzl",
     "SigningKeyInfo",
+    "derived_signing_key",
     "generate_signing_key",
     "pem_signing_key",
     "pkcs11_signing_key",
@@ -83,34 +63,18 @@ load(":version.bzl", "resolve_version")
 load(":vm.bzl", "image_vm")
 
 image = struct(
-    # Logical images and their operations.
+    # Logical images and the operations that build them.
     layer = layer,
-    run = run,
-    python = python,
-    install_from = install_from,
-    mkdir = mkdir,
-    symlink = symlink,
-    write_file = write_file,
-    remove = remove,
-    copy = copy,
-    merge_os_release = merge_os_release,
-    install_systemd_boot = install_systemd_boot,
-    depmod = depmod,
-    hwdb = hwdb,
-    locale_gen = locale_gen,
+    ops = ops,
     # Terminal outputs.
-    archive = image_archive,
-    directory = image_directory,
-    sysext = image_sysext,
+    snapshot = image_snapshot,
     uki = uki,
     uki_profile = uki_profile,
     resolve_version = resolve_version,
     bootable = bootable,
-    repart = repart,
     partition = partition,
-    format_partition_labels = format_partition_labels,
-    disk_convert = disk_convert,
     vm = image_vm,
+    derived_signing_key = derived_signing_key,
     generate_signing_key = generate_signing_key,
     install = image_install,
     substitute = substitute,
@@ -118,9 +82,14 @@ image = struct(
     pkcs11_signing_key = pkcs11_signing_key,
     SigningKeyInfo = SigningKeyInfo,
     # Compositions.
-    rootfs_archive = rootfs_archive,
-    sysext_image = sysext_image,
-    bootable_disk = bootable_disk_image,
+    archive = archive,
+    sysext = sysext,
+    confext = confext,
+    extension = extension,
+    portable = portable,
+    disk = disk,
+    ddi_preloaded_disk = ddi_preloaded_disk,
+    imported_disk = imported_disk,
     artifacts = image_artifacts,
     initrd = initrd_image,
     # The core kernel modules a UKI carries unless a target says otherwise; extend it with `+`.
@@ -136,12 +105,14 @@ image = struct(
     ImageInstallInfo = ImageInstallInfo,
     ImageSbomInfo = ImageSbomInfo,
     ImageArchiveInfo = ImageArchiveInfo,
-    ImageDirectoryInfo = ImageDirectoryInfo,
-    SysextImageInfo = SysextImageInfo,
+    ImageSnapshotInfo = ImageSnapshotInfo,
+    ExtensionInfo = ExtensionInfo,
     UkiInfo = UkiInfo,
-    RepartInfo = RepartInfo,
+    DdiInfo = DdiInfo,
     RootHashInfo = RootHashInfo,
     DiskConversionInfo = DiskConversionInfo,
     InitrdInfo = InitrdInfo,
     PublishedInfo = PublishedInfo,
+    # The record PublishedInfo keys by published name.
+    PublishedFile = PublishedFile,
 )

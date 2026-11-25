@@ -27,8 +27,30 @@ def decode(data: bytes) -> list[dict[str, Any]]:
 
 
 objects = decode(Path(sys.argv[1]).read_bytes())
-root, files = objects[0], objects[1:]
-assert root == {"mediaType": "application/vnd.uapi.16.manifest"}, f"bad root object: {root}"
+assert objects[-1] == {"mediaType": "application/vnd.uapi.16.trailer"}, "missing trailer"
+root, files = objects[0], objects[1:-1]
+# The manifest of an archive comes from a snapshot, whose root object also holds the metadata of the
+# root directory. Fedora's filesystem package installs the root directory with mode 0555.
+expected_root = {
+    "mediaType": "application/vnd.uapi.16.manifest",
+    "type": "dir",
+    "mode": 0o555,
+    "uid": 0,
+    "gid": 0,
+    "features": [
+        "device",
+        "gid",
+        "hardlink",
+        "mode",
+        "mtime",
+        "sha256",
+        "size",
+        "symlink",
+        "uid",
+        "user-xattr",
+    ],
+}
+assert {key: root.get(key) for key in expected_root} == expected_root and "name" not in root, root
 assert files, "the manifest lists no files at all"
 
 names = [obj["name"] for obj in files]

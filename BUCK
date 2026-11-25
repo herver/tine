@@ -4,8 +4,7 @@
 """Shared tine Python support, and the toolchain Buck2 looks up as `toolchains//`."""
 
 load("@prelude//toolchains:python.bzl", "python_bootstrap_toolchain")
-load("//box:test.bzl", "box_python_test")
-load("//python:defs.bzl", "tine_python_library")
+load("//python:defs.bzl", "python")
 
 # Declared here rather than in a `toolchains` cell of its own: Buck2 forbids nesting a cell inside an
 # external cell, so declaring it here is what lets a consuming project pull tine in as one.
@@ -21,15 +20,6 @@ export_file(
     visibility = ["PUBLIC"],
 )
 
-# bump rewrites tine.lock.json in the source tree. The default mode copies the file to buck-out, and
-# bump would rewrite the copy.
-export_file(
-    name = "tine.lock.json",
-    src = "tine.lock.json",
-    mode = "reference",
-    visibility = ["//tools/..."],
-)
-
 export_file(
     name = "buckconfig",
     src = ".buckconfig",
@@ -37,20 +27,20 @@ export_file(
     visibility = ["//bin/..."],
 )
 
-tine_python_library(
+python.library(
     name = "util",
     srcs = ["util.py"],
     visibility = ["PUBLIC"],
 )
 
-box_python_test(
+python.test(
     name = "test",
     box = "//tools:dev.box",
     srcs = ["util_test.py"],
     deps = [":util"],
 )
 
-tine_python_library(
+python.library(
     name = "specs",
     srcs = ["specs.py"],
     visibility = ["PUBLIC"],

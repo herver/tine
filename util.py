@@ -5,6 +5,7 @@
 
 import bz2
 import errno
+import fcntl
 import gzip
 import http.client
 import io
@@ -18,7 +19,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, NoReturn, TextIO, cast
@@ -141,13 +142,16 @@ def compress_zstd(src: Path, out: Path) -> None:
         shutil.copyfileobj(source, sink)
 
 
-def urlopen(url: str, *, agent: str) -> http.client.HTTPResponse:
+def urlopen(url: str, *, agent: str, timeout: float | None = None) -> http.client.HTTPResponse:
     """Open one URL, naming the tool that asks.
 
-    CDN bot filters (e.g. Cloudflare's) reject Python's default Python-urllib agent.
+    CDN bot filters (e.g. Cloudflare's) reject Python's default Python-urllib agent. `timeout` bounds
+    each blocking socket operation, not the whole transfer.
     """
     request = urllib.request.Request(url, headers={"User-Agent": agent})
-    return cast(http.client.HTTPResponse, urllib.request.urlopen(request))
+    if timeout is None:
+        return cast(http.client.HTTPResponse, urllib.request.urlopen(request))
+    return cast(http.client.HTTPResponse, urllib.request.urlopen(request, timeout=timeout))
 
 
 def with_retries[T](what: str, operation: Callable[[], T]) -> T:
@@ -201,53 +205,68 @@ def clone_file(src: Path, dst: Path, allow_link: bool = False) -> None:
             if error.errno not in _LINK_FALLBACK_ERRNOS:
                 raise
     with open(src, "rb") as source, open(dst, "wb") as destination:
-        copy_range(destination.fileno(), 0, source.fileno(), 0, os.fstat(source.fileno()).st_size)
+        size = os.fstat(source.fileno()).st_size
+        os.ftruncate(destination.fileno(), size)
+        # copy_range() writes zeros for the holes of a sparse file when the filesystem can't clone
+        # it. Copy only the data segments, so the copy keeps the holes.
+        offset = 0
+        while offset < size:
+            try:
+                start = os.lseek(source.fileno(), offset, os.SEEK_DATA)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+                break
+            end = os.lseek(source.fileno(), start, os.SEEK_HOLE)
+            copy_range(destination.fileno(), start, source.fileno(), start, end - start)
+            offset = end
     shutil.copymode(src, dst)
 
 
-def take_binaries(built: Path, binaries: dict[str, str], *, tool: str, where: str) -> None:
-    """Copy each declared binary out of a build tree.
-
-    A name the build did not produce is a fatal error. `tool` prefixes that failure and `where`
-    names the tree in it, both in the terms of the ecosystem the calling driver builds for.
-    """
-    missing = [name for name in binaries if not (built / name).is_file()]
-    if missing:
-        # Everything executable in there, which after an earlier build of the same project may name
-        # more than this one produced.
-        found = sorted(
-            entry.name for entry in built.iterdir() if entry.is_file() and os.access(entry, os.X_OK)
-        )
-        fail(f"{tool}: no {', '.join(missing)} in {where}, which holds: {', '.join(found)}")
-    for name, out in binaries.items():
-        # Replace, never rewrite: buck does not clear a kept action's outputs, and whatever consumed
-        # the previous binary may hold a hard link to it.
-        Path(out).unlink(missing_ok=True)
-        clone_file(built / name, Path(out))
+def reflink(src: Path, dst: Path) -> bool:
+    """Clone src to dst, and return False instead of copying bytes when the filesystem cannot clone src."""
+    with open(src, "rb") as source, open(dst, "wb") as destination:
+        try:
+            fcntl.ioctl(destination.fileno(), fcntl.FICLONE, source.fileno())
+        except OSError as error:
+            if error.errno in _COPY_FALLBACK_ERRNOS | {errno.EACCES, errno.EBADF, errno.ENOTTY, errno.EPERM}:
+                return False
+            raise
+    return True
 
 
-def remove_path(path: Path, with_parents: bool = False) -> None:
+def named_files(source: Path, name: str) -> list[Path]:
+    """Find files called `name` under `source`, and return their paths relative to `source`."""
+    found: list[Path] = []
+    for directory, _, files in source.walk():
+        if name in files:
+            found.append((directory / name).relative_to(source))
+    return sorted(found)
+
+
+def remove_previous_binaries(out: Path) -> None:
+    """Remove the binaries that an earlier run left in `out`."""
+    # Buck keeps the output directory of an incremental build between runs. A binary that the build no
+    # longer declares would otherwise stay in `out`. A consumer can also hold a hard link to a binary of
+    # the last run, and a copy to the same path would write into the consumer's file.
+    for previous in out.iterdir():
+        previous.unlink()
+
+
+def remove_path(path: Path) -> None:
     """Remove a file, symlink, or whole directory tree, if it is there at all.
 
     shutil.rmtree only handles real directories: it raises on files, on symlinks even when
-    they point at a directory, and on a missing path. With `with_parents`, also take the
-    directories the removal leaves empty, up to the first one still in use.
+    they point at a directory, and on a missing path.
     """
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
     elif path.is_symlink() or path.exists():
         path.unlink()
-    if not with_parents:
-        return
-    for parent in path.parents:
-        # `parent.parent` stops the walk at the filesystem root.
-        if parent == parent.parent or not parent.is_dir() or any(parent.iterdir()):
-            break
-        parent.rmdir()
 
 
 @contextmanager
-def atomic_text_writer(path: Path) -> Iterator[TextIO]:
+def atomic_text_writer(path: Path) -> Generator[TextIO]:
     """Yield a UTF-8 stream and atomically replace its destination on success."""
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
@@ -264,7 +283,7 @@ def atomic_text_writer(path: Path) -> Iterator[TextIO]:
 
 
 @contextmanager
-def text_destination(path: Path) -> Iterator[TextIO]:
+def text_destination(path: Path) -> Generator[TextIO]:
     """Yield a UTF-8 stream for a path, or for stdout when the caller named `-`.
 
     A driver published as a run target is asked for its output by a caller that has nowhere to put
@@ -311,30 +330,33 @@ def write_if_changed(path: Path, text: str) -> None:
         fail(f"cannot write {path}: {error}")
 
 
-def nested_buck() -> str:
-    """The Buck a tool running under Buck has to nest.
+def buck2_argv(*args: str) -> list[str]:
+    """Build an argv for invoking our pinned Buck2.
 
-    `tine` exports the Buck2 it resolved, so a nested command runs that one and not the wrapper:
-    refreshing configuration under a command already holding it deadlocks.
+    `tine` exports the Buck2 it resolved as `BUCK2_BINARY`. Running a driver outside tine is
+    unsupported, so the variable is hard requirement.
+
+    Every invocation is daemon-less. Buck ignores the flag for a command that never starts a daemon,
+    so we can add it unconditionally.
     """
-    return os.environ.get("BUCK2_BINARY", "buck")
+    return [os.environ["BUCK2_BINARY"], "--no-buckd", *args]
 
 
-def buck_output(buck: str, *args: str) -> str:
+def buck_output(*args: str) -> str:
     """One nested Buck command, its stdout stripped."""
 
     # `-v 0` mutes Buck's own chatter on success
     return subprocess.run(
-        [buck, "-v", "0", *args], check=True, stdout=subprocess.PIPE, text=True
+        buck2_argv("-v", "0", *args), check=True, stdout=subprocess.PIPE, text=True
     ).stdout.strip()
 
 
-def package_directory(buck: str, package: str) -> Path:
+def package_directory(package: str) -> Path:
     """Where a `cell//path` package label lives on disk, asked of Buck rather than assumed."""
     cell, separator, path = package.partition("//")
     if not separator or not cell or ":" in package or "..." in package:
         fail(f"expected a cell-relative package label, got {package!r}")
-    return Path(buck_output(buck, "audit", "cell", cell, "--paths-only")) / path
+    return Path(buck_output("audit", "cell", cell, "--paths-only")) / path
 
 
 def _record_paths(directory: Path, pathspec: str, how: list[str], message: str | None) -> bool:

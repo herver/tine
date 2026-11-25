@@ -5,16 +5,48 @@
 
 load("@tine//box:defs.bzl", "box")
 load("@tine//git:defs.bzl", "git")
+load("@tine//image:defs.bzl", "image")
+load("@tine//package:defs.bzl", "package")
 load("@tine//package_system/rpm:defs.bzl", "rpm")
 
-_BUILDROOT = "tine//catalog:fedora.rawhide.buildroot"
+_DISTRO = "catalog//:fedora.rawhide.distribution"
+
+_BUILDROOT = "catalog//:fedora.rawhide.buildroot"
+
+# The checks query the packages with rpm. The root box of the buildroot's release contains rpm, and the dev
+# box contains it only when it builds from a Fedora release.
+_CHECK_BOX = "catalog//:fedora.rawhide.box"
 
 git.checkout(name = "hello.source")
+
+# rpm.branch() derives buildroot_packages from the BuildRequires of every architecture. A package can then
+# have buildroot_packages and no build_requires on the architecture that it builds for.
+rpm.package(
+    name = "hello-buildroot-packages",
+    distro = _DISTRO,
+    package = "hello",
+    spec = "hello/hello.spec",
+    buildroot = _BUILDROOT,
+    buildroot_packages = [":hello-archive"],
+    release = "1",
+    source_date_epoch = 1754006400,
+    subpackages = ["hello"],
+)
+
+box.sh_test(
+    name = "hello-buildroot-packages-test",
+    distro = _DISTRO,
+    labels = ["image"],
+    box = _CHECK_BOX,
+    script = 'python3 "$@"',
+    args = ["$(source hello_archive_check.py)", "$(location :hello-buildroot-packages)"],
+)
 
 # The archive path runs %prep and emits both binary and source RPMs. It exists separately from the
 # source-tree fixture to check release and dev compression through real RPM headers.
 rpm.package(
     name = "hello-archive",
+    distro = _DISTRO,
     package = "hello",
     spec = "hello/hello.spec",
     buildroot = _BUILDROOT,
@@ -25,19 +57,42 @@ rpm.package(
 
 box.sh_test(
     name = "hello-archive-test",
+    distro = _DISTRO,
     labels = ["image"],
-    box = "@tine//tools:dev.box",
+    box = _CHECK_BOX,
     script = 'python3 "$@"',
     args = ["$(source hello_archive_check.py)", "$(location :hello-archive)"],
+)
+
+rpm.package(
+    name = "hello-parse-helper",
+    distro = _DISTRO,
+    package = "hello",
+    spec = "hello/hello.spec",
+    build_requires = ["jq"],
+    buildroot = _BUILDROOT,
+    release = "1",
+    rpmbuild_options = ["--define=version_override %(jq -nr '\"1\"')"],
+    source_date_epoch = 1754006400,
+    subpackages = ["hello"],
+)
+
+box.sh_test(
+    name = "hello-parse-helper-test",
+    distro = _DISTRO,
+    labels = ["image"],
+    box = _CHECK_BOX,
+    script = 'python3 "$@"',
+    args = ["$(source hello_archive_check.py)", "$(location :hello-parse-helper)"],
 )
 
 # The explicit override keeps this source-tree fixture in dev mode without depending on the
 # user's root config.
 rpm.package(
     name = "hello-dev",
+    distro = _DISTRO,
     package = "hello",
     buildroot = _BUILDROOT,
-    build_requires = ["gcc"],
     dev = True,
     in_place_spec = "rpm/hello.spec",
     release = "1",
@@ -48,8 +103,9 @@ rpm.package(
 
 box.sh_test(
     name = "hello-dev-test",
+    distro = _DISTRO,
     labels = ["image"],
-    box = "@tine//tools:dev.box",
+    box = _CHECK_BOX,
     script = 'python3 "$@"',
     args = [
         "$(source hello_dev_check.py)",
@@ -62,9 +118,9 @@ box.sh_test(
 # Like the archive build, and unlike the two dev builds, it reaches the shared cache.
 rpm.package(
     name = "hello-tree",
+    distro = _DISTRO,
     package = "hello",
     buildroot = _BUILDROOT,
-    build_requires = ["gcc"],
     in_place_spec = "rpm/hello.spec",
     release = "1",
     source_date_epoch = 1754006400,
@@ -74,11 +130,136 @@ rpm.package(
 
 box.sh_test(
     name = "hello-tree-test",
+    distro = _DISTRO,
     labels = ["image"],
-    box = "@tine//tools:dev.box",
+    box = _CHECK_BOX,
     script = 'python3 "$@"',
     args = [
         "$(source hello_tree_check.py)",
         "$(location :hello-tree)",
     ],
+)
+
+# hello-meson builds the same checkout with meson. ninja runs the compiler in the meson build directory, and
+# the compiler then records the real path of the checkout. The test checks that the debugsource package still
+# contains hello.c.
+rpm.package(
+    name = "hello-meson",
+    distro = _DISTRO,
+    package = "hello",
+    buildroot = _BUILDROOT,
+    in_place_spec = "rpm/hello-meson.spec",
+    release = "1",
+    source_date_epoch = 1754006400,
+    source_tree = ":hello.source",
+    subpackages = ["hello"],
+)
+
+box.sh_test(
+    name = "hello-meson-test",
+    distro = _DISTRO,
+    labels = ["image"],
+    box = _CHECK_BOX,
+    script = 'rpm -qpl "$1"/hello-debugsource-*.rpm | grep -E "/hello\\.c$" > /dev/null',
+    args = ["$(location :hello-meson)"],
+)
+
+# hello-pinned builds the same checkout with the spec and sources of the dist-git commit that
+# rpm/packaging.json pins for fedora. The pin names a bundle in the project, so the fetch needs no network.
+# The pinned spec doesn't produce hello-imported-only. The build reports the missing subpackage and doesn't
+# fail.
+rpm.package(
+    name = "hello-pinned",
+    distro = _DISTRO,
+    package = "hello",
+    buildroot = _BUILDROOT,
+    in_place_packaging = "rpm/packaging.json",
+    in_place_packaging_distro = "fedora",
+    release = "1",
+    source_date_epoch = 1754006400,
+    source_tree = ":hello.source",
+    subpackages = ["hello", "hello-imported-only"],
+)
+
+box.sh_test(
+    name = "hello-pinned-test",
+    distro = _DISTRO,
+    labels = ["image"],
+    box = _CHECK_BOX,
+    script = 'python3 "$@"',
+    args = [
+        "$(source hello_pinned_check.py)",
+        "$(location :hello-pinned)",
+        "$(location :hello-pinned[hello])",
+    ],
+)
+
+# A derived package manager adds the locally built hello to the release's repositories. Fedora's
+# repositories contain a newer hello. The solver picks the local hello only if the derived package manager
+# gives the local repository its priority.
+package.local_repository(
+    name = "hello.repository",
+    packages = [":hello-archive"],
+)
+
+package.manager(
+    name = "hello.package-manager",
+    base = "catalog//:fedora.rawhide.package-manager",
+    additional_repositories = [":hello.repository"],
+)
+
+image.layer(
+    name = "hello-image.layer",
+    distro = _DISTRO,
+    package_manager = ":hello.package-manager",
+    packages = ["hello"],
+)
+
+image.archive(
+    name = "hello-image",
+    distro = _DISTRO,
+    format = "tar",
+    parent = ":hello-image.layer",
+)
+
+box.sh_test(
+    name = "hello-image-test",
+    labels = ["image"],
+    box = "@tine//tools:dev.box",
+    script = 'tar -tf "$1" | grep -E "^(\\./)?usr/share/tine-package/archive$" > /dev/null',
+    args = ["$(location :hello-image)"],
+    distro = _DISTRO,
+)
+
+# A box prefers the locally built hello over Fedora's newer one, like the derived package manager above.
+box.new(
+    name = "hello.box",
+    additional_repositories = [":hello.repository"],
+    packages = ["hello"],
+    release = "catalog//:fedora.rawhide.release",
+)
+
+box.sh_test(
+    name = "hello-box-test",
+    distro = _DISTRO,
+    labels = ["image"],
+    box = ":hello.box",
+    script = "test -e /usr/share/tine-package/archive",
+)
+
+# A child box installs from the local repositories of its parent, so it is a layer over the parent and
+# keeps the local hello.
+box.new(
+    name = "hello-child.box",
+    packages = ["jq"],
+    parent = ":hello.box",
+    release = "catalog//:fedora.rawhide.release",
+)
+
+box.sh_test(
+    name = "hello-child-box-test",
+    distro = _DISTRO,
+    labels = ["image"],
+    box = ":hello-child.box",
+    script = "test -e /usr/share/tine-package/archive && jq --version",
 )

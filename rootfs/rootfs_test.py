@@ -5,14 +5,18 @@
 
 import errno
 import os
+import stat
 import tempfile
 import unittest
-from contextlib import chdir, nullcontext
+from contextlib import ExitStack, chdir, nullcontext
 from pathlib import Path
 from typing import override
 from unittest import mock
 
 import rootfs
+import storage
+import uapi16
+from isolation import Bind
 
 
 class TestSourceOverlay(unittest.TestCase):
@@ -40,15 +44,23 @@ class TestSourceOverlay(unittest.TestCase):
         (self.source / "escaping-dangling-link").symlink_to(self.scratch / "absent")
         (self.source / "empty").mkdir()
         (self.source / "readonly").mkdir(mode=0o555)
-        for name in (".wh.original", ".wh..wh..opq", ".esc.literal"):
-            (self.source / name).write_text(name, encoding="utf-8")
         # overlayfs takes the mode and the times of the mount root from the upper directory. The
         # setgid bit and the old timestamp make the test fail if the root has the mode and the
         # times of a fresh upper directory.
         self.source.chmod(0o2750)
         os.utime(self.source, ns=(1234567890123456789, 1234567890123456789))
 
-    def test_preserves_the_tree_without_decoding_image_markers(self) -> None:
+    def test_an_invalid_overlay_has_a_possible_locked_mount_hint(self) -> None:
+        failure = OSError(errno.EINVAL, "fsconfig create: Invalid argument")
+        with (
+            mock.patch.object(rootfs.Overlay, "__enter__", side_effect=failure),
+            self.assertRaises(OSError) as raised,
+            rootfs.source_overlay(self.source, self.scratch / "target"),
+        ):
+            pass
+        self.assertIn("Locked mounts below the source can cause EINVAL", "".join(raised.exception.__notes__))
+
+    def test_preserves_the_tree(self) -> None:
         with chdir(self.project), rootfs.source_overlay(Path("input"), self.scratch / "build/src") as tree:
             original = {path.relative_to(self.source) for path in self.source.rglob("*")}
             self.assertEqual({path.relative_to(tree) for path in tree.rglob("*")}, original)
@@ -68,9 +80,67 @@ class TestSourceOverlay(unittest.TestCase):
             self.assertEqual((tree / "absolute-link").read_text(encoding="utf-8"), "outside")
             self.assertEqual((tree / "directory-link/file").read_text(encoding="utf-8"), "original")
             self.assertEqual((tree / "data/relative-link").read_text(encoding="utf-8"), "original")
-            upper = next(self.scratch.glob("source.*/upper"))
+            upper = next(self.scratch.glob("source.*/0/upper"))
             self.assertEqual(list(upper.iterdir()), [])
         self.assertEqual(list(self.scratch.glob("source.*")), [])
+
+    def test_hides_the_buck_output_directory_that_contains_the_scratch_directory(self) -> None:
+        # When the source is the project root, it contains Buck's output directory, and the overlay's
+        # upper and work directories are in the scratch directory below it. Put the scratch directory
+        # in the project's buck-out, overlay the project, and check that the overlay shows an empty
+        # buck-out and that a walk of the whole overlay succeeds.
+        scratch_path = Path("buck-out/v2/tmp/action")
+        temporary = self.project / scratch_path / "var-tmp"
+        temporary.mkdir(parents=True)
+        (self.project / "buck-out/v2/output").write_text("output", encoding="utf-8")
+        with (
+            mock.patch.dict(os.environ, {"BUCK_SCRATCH_PATH": str(scratch_path), "TMPDIR": str(temporary)}),
+            chdir(self.project),
+            rootfs.source_overlay(Path("."), self.scratch / "target") as tree,
+        ):
+            self.assertEqual(list((tree / "buck-out").iterdir()), [])
+            self.assertEqual((tree / "input/data/file").read_text(encoding="utf-8"), "original")
+
+            # Path.walk() raises errors that rglob() would drop, such as ELOOP.
+            def fail(error: OSError) -> None:
+                raise error
+
+            self.assertTrue(list(tree.walk(on_error=fail)))
+
+    def test_shows_the_mounts_below_the_source_and_discards_writes_into_them(self) -> None:
+        # `tine mount` binds a checkout over a directory of the project, and rpmbuild builds the project
+        # in place.
+        mounted, nested = self.scratch / "mounted", self.scratch / "nested"
+        (mounted / "inner").mkdir(parents=True)
+        (mounted / "file").write_text("mounted", encoding="utf-8")
+        nested.mkdir()
+        (nested / "file").write_text("nested", encoding="utf-8")
+        (self.source / "data/covered").mkdir()
+        (self.source / "data/covered/file").write_text("covered", encoding="utf-8")
+        target = self.scratch / "target"
+        with ExitStack() as stack:
+            stack.enter_context(Bind(mounted, self.source / "data/covered")).mount()
+            stack.enter_context(Bind(nested, self.source / "data/covered/inner")).mount()
+            tree = stack.enter_context(rootfs.source_overlay(self.source, target))
+            self.assertEqual((tree / "data/covered/file").read_text(encoding="utf-8"), "mounted")
+            self.assertEqual((tree / "data/covered/inner/file").read_text(encoding="utf-8"), "nested")
+            (tree / "data/covered/file").write_text("changed", encoding="utf-8")
+            (tree / "data/covered/inner/file").unlink()
+            (tree / "data/covered/inner/generated").touch()
+        self.assertEqual((mounted / "file").read_text(encoding="utf-8"), "mounted")
+        self.assertEqual(sorted(path.name for path in nested.iterdir()), ["file"])
+        self.assertEqual((self.source / "data/covered/file").read_text(encoding="utf-8"), "covered")
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(list(self.scratch.glob("source.*")), [])
+
+    def test_shows_the_file_that_a_file_mount_below_the_source_covers(self) -> None:
+        mounted = self.scratch / "mounted"
+        mounted.write_text("mounted", encoding="utf-8")
+        target = self.scratch / "target"
+        with ExitStack() as stack:
+            stack.enter_context(Bind(mounted, self.source / "data/file")).mount()
+            tree = stack.enter_context(rootfs.source_overlay(self.source, target))
+            self.assertEqual((tree / "data/file").read_text(encoding="utf-8"), "original")
 
     def test_renaming_a_source_directory_fails_like_a_container(self) -> None:
         # The docstring of `source_overlay()` states that rename(2) of a directory fails with EXDEV.
@@ -95,7 +165,7 @@ class TestSourceOverlay(unittest.TestCase):
                 upper = self.scratch
                 with raises:
                     with rootfs.source_overlay(self.source, target) as tree:
-                        upper = next(self.scratch.glob("source.*/upper"))
+                        upper = next(self.scratch.glob("source.*/0/upper"))
                         self.assertFalse((tree / "generated").exists())
                         (tree / "data/file").chmod(0o600)
                         (tree / "data/relative-link").write_text("changed", encoding="utf-8")
@@ -139,7 +209,7 @@ class TestBuildrootScratch(unittest.TestCase):
             mock.patch.dict(os.environ),
         ):
             os.environ.pop("BUCK_SCRATCH_PATH", None)
-            with rootfs.rootfs(scratch / "target", lowers=[lower], apivfs=True) as tree:
+            with rootfs.rootfs(scratch / "target", bind=lower, apivfs=True) as tree:
                 (tree / "var/tmp/staged").write_text("staged", encoding="utf-8")
                 self.assertTrue((tree / "var/tmp").is_mount())
                 self.assertEqual(list(scratch.glob("var-tmp.*")), [])
@@ -158,12 +228,40 @@ class TestBuildrootScratch(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, environment),
             mock.patch.object(tempfile, "tempdir", None),
-            rootfs.rootfs(scratch / "target", lowers=[lower], apivfs=True) as tree,
+            rootfs.rootfs(scratch / "target", bind=lower, apivfs=True) as tree,
         ):
             (tree / "var/tmp/staged").write_text("staged", encoding="utf-8")
             backing = next(scratch.glob("var-tmp.*"))
             self.assertEqual((backing / "staged").read_text(encoding="utf-8"), "staged")
             self.assertEqual(backing.stat().st_mode & 0o7777, 0o1777)
+
+
+class TestMountPoints(unittest.TestCase):
+    def test_an_absolute_symlink_in_a_layer_resolves_inside_the_root(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mount-test.", dir="/var/tmp")))
+        outside = scratch / "outside"
+        outside.mkdir()
+        lower = scratch / "lower"
+        (lower / outside.relative_to("/")).mkdir(parents=True)
+        # In the image, /run names the copy of `outside` inside the image. On the host, the same path
+        # is `outside`.
+        (lower / "run").symlink_to(outside)
+        for apivfs in (False, True):
+            with (
+                self.subTest(apivfs=apivfs),
+                rootfs.rootfs(
+                    scratch / "target",
+                    bind=lower,
+                    binds=[] if apivfs else [(scratch, "/run/project")],
+                    apivfs=apivfs,
+                ) as tree,
+            ):
+                # The bind of `scratch` is on the same filesystem as the root, so is_mount() can't detect
+                # it. `scratch` contains `lower`, and the root doesn't.
+                if not apivfs:
+                    self.assertTrue((tree / outside.relative_to("/") / "project/lower").is_dir())
+                self.assertFalse(outside.is_mount())
+                self.assertFalse((outside / "project").exists())
 
 
 class TestReadonlyProject(unittest.TestCase):
@@ -173,6 +271,11 @@ class TestReadonlyProject(unittest.TestCase):
         self.project = self.root / "project"
         (self.project / "src").mkdir(parents=True)
         (self.project / "input").write_text("input", encoding="utf-8")
+
+    def test_a_missing_project_is_not_created(self) -> None:
+        with self.assertRaises(FileNotFoundError), rootfs.readonly_project(self.root / "missing", {}):
+            self.fail("a missing project must not be created")
+        self.assertFalse((self.root / "missing").exists())
 
     def test_only_the_outputs_stay_writable(self) -> None:
         # The build drivers pass two outputs. The path of a kept output has several components, so
@@ -189,7 +292,7 @@ class TestReadonlyProject(unittest.TestCase):
                 raises = self.assertRaises(RuntimeError) if fail else nullcontext()
                 with raises:
                     with rootfs.readonly_project(self.project, outputs):
-                        # The writes are checked before the working directory. Without the chdir()
+                        # The writes are checked before the working directory. Without the fchdir()
                         # in `readonly_project()`, a relative path resolves through the writable
                         # mount underneath. The write checks then fail too, and not only the check
                         # of the working directory.
@@ -241,6 +344,16 @@ class TestReadonlyProject(unittest.TestCase):
                 self.assertFalse((self.root / "out").exists())
                 self.assertFalse((self.root / "mounted").is_mount())
 
+    def test_a_symlink_outside_the_project_is_left_alone(self) -> None:
+        # The output path names a symlink, but only through the symlink `store` out of `project`.
+        (self.root / "elsewhere/gen").mkdir(parents=True)
+        (self.root / "elsewhere/gen/out").symlink_to("target")
+        (self.project / "store").symlink_to(self.root / "elsewhere")
+        with chdir(self.project), self.assertRaises(ValueError):
+            with rootfs.readonly_project(self.project, {Path("store/gen/out"): self.root / "mounted"}):
+                pass
+        self.assertTrue((self.root / "elsewhere/gen/out").is_symlink())
+
     def test_two_outputs_sharing_a_mount_point_are_refused(self) -> None:
         mounted = self.root / "mounted"
         with chdir(self.project), self.assertRaises(ValueError):
@@ -286,6 +399,65 @@ class TestCaptureOnExit(unittest.TestCase):
             rootfs.capture_on_exit("output"),
         ):
             pass
+
+
+class TestCapture(unittest.TestCase):
+    def test_escapes_backslashes_in_read_only_directories(self) -> None:
+        # Buck can't store a name with a backslash, and renaming it needs write access to its directory.
+        # Capture a tree with a read-only directory that contains such a name, and check that the name is
+        # escaped.
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            tree = Path(directory)
+            (tree / "readonly").mkdir()
+            (tree / "readonly/back\\slash").write_text("kept")
+            (tree / "readonly").chmod(0o555)
+
+            rootfs.capture(tree)
+
+            self.assertEqual((tree / "readonly").stat().st_mode & 0o777, 0o755)
+            self.assertEqual([path.name for path in (tree / "readonly").iterdir()], [".esc.back%5Cslash"])
+
+
+class TestWriteBuckTree(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/var/tmp")))
+        self.tree = self.scratch / "tree"
+        self.tree.mkdir()
+        self.store = self.scratch / "store"
+
+    def test_buck_tree_contains_only_what_buck_stores(self) -> None:
+        # A box layer directory must contain only regular files, directories and symlinks with modes
+        # that Buck stores. Capture a tree with a hardlink, an extended attribute, a private directory
+        # and a name containing a backslash. The Buck tree must contain separate files with normalized
+        # modes, no extended attributes and the escaped name.
+        (self.tree / "a").write_text("identical")
+        (self.tree / "a").chmod(0o640)
+        (self.tree / "b").write_text("identical")
+        (self.tree / "b").chmod(0o755)
+        os.link(self.tree / "a", self.tree / "linked")
+        os.setxattr(self.tree / "a", "user.example", b"value")
+        (self.tree / "private").mkdir(mode=0o700)
+        (self.tree / "back\\slash").write_text("escaped")
+        (self.tree / "link").symlink_to("a")
+        storage.capture(storage.Root(self.tree), self.store, epoch=0)
+        out = self.scratch / "out"
+        rootfs.write_buck_tree(uapi16.Snapshot([self.store]), out)
+        self.assertEqual(stat.S_IMODE((out / "a").stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE((out / "b").stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((out / "private").stat().st_mode), 0o755)
+        self.assertFalse((out / "a").samefile(out / "linked"))
+        self.assertEqual((out / "linked").read_text(), "identical")
+        self.assertEqual(os.listxattr(out / "a"), [])
+        self.assertEqual((out / ".esc.back%5Cslash").read_text(), "escaped")
+        self.assertEqual(os.readlink(out / "link"), "a")
+
+    def test_buck_tree_rejects_special_files(self) -> None:
+        # Buck cannot store a FIFO. Writing the Buck tree of a snapshot that contains one must fail.
+        os.mkfifo(self.tree / "fifo")
+        storage.capture(storage.Root(self.tree), self.store, epoch=0)
+        with self.assertRaises(SystemExit):
+            rootfs.write_buck_tree(uapi16.Snapshot([self.store]), self.scratch / "out")
 
 
 if __name__ == "__main__":

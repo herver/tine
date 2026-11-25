@@ -89,6 +89,7 @@ class DistroConfig(TypedDict):
 class BranchProperties(TypedDict):
     buildroot: NotRequired[str]  # override the default //buildroots/<distro>:<branch> (overlay branches)
     buildroot_only_packages: NotRequired[list[str]]
+    in_place_packaging: NotRequired[dict[str, str]]  # package -> checkout-relative file of per-distro pins
     in_place_rpmbuild_options: NotRequired[dict[str, list[str]]]
     in_place_specs: NotRequired[dict[str, str]]
     seed_only_packages: NotRequired[list[str]]  # source packages; see packages.md
@@ -172,8 +173,8 @@ class SrcpkgMetadata(TypedDict):
     # a noarch rpm appears under every build arch that produces it
     binaries: dict[Arch, dict[str, BinaryMetadata]]
     sources: list[SourceMetadata]
-    # Build projection folded in on the main branch (see project_build_fields); absent on the
-    # pristine upstream-rpm mirror. These are what rpm_package_json reads that it can't derive itself.
+    # project_build_fields() adds version, release, dist and source_date_epoch on the main branch
+    # only. rpm.branch reads them because it can't derive them from the other fields.
     version: NotRequired[str]
     release: NotRequired[str]
     dist: NotRequired[str]
@@ -1345,10 +1346,9 @@ def native_dist(rel: str) -> str:
 
 
 # --- build-system projection (main branch only) -------------------------------------------
-# replay() folds a build projection into each package's <pkg>.json and regenerates the per-branch
-# BUCK, in every replayed commit. The projected fields are main-only -- never on the pristine
-# upstream-rpm mirror. buck2 loads the .json natively and hands it to rpm_package_json; the rule lives in
-# the consuming buck project's `tine` cell, distributions via its `distributions` cell alias.
+# replay() adds the build fields to each package's <pkg>.json and regenerates the branch BUCK in
+# every replayed commit. The upstream-rpm mirror must match upstream, so it never gets the build
+# fields. Buck loads each .json as a value, and the branch BUCK passes the values to rpm.branch.
 
 
 def build_version(meta: SrcpkgMetadata) -> str:
@@ -1401,7 +1401,7 @@ def regenerate_buck(branchdir: Path) -> None:
 
     The buck2 package is the branch directory; each <pkg>/ subdir is a plain source tree (no
     nested BUCK), so the pristine dist-git checkouts stay untouched. buck2 loads each <pkg>.json
-    natively (as its `value`) and the branch hands them all to `rpm_branch`, which validates each
+    natively (as its `value`) and the branch hands them all to `rpm.branch`, which validates each
     and derives per-package build metadata (incl. the self-hosting buildroot deps) in buck — the
     importer emits only data, never resolution logic. All packages in a branch share one
     package buildroot, `//buildroots/<distro>:<branch>` by default (a cell-relative alias package
@@ -1417,7 +1417,7 @@ def regenerate_buck(branchdir: Path) -> None:
         local_loads[BRANCH_PROPERTIES] = f'load(":{BRANCH_PROPERTIES}", _properties = "value")'
 
     # all loads have to come first in Starlark; the local ones sorted by file name, like the formatter
-    loads = ['load("@tine//package_system/rpm:generated.bzl", "rpm_branch")']
+    loads = ['load("@tine//package_system/rpm:defs.bzl", "rpm")']
     loads += [local_loads[name] for name in sorted(local_loads)]
     # Add a stub for branches without _properties.json to keep the rest of the file
     # in the same shape
@@ -1429,10 +1429,12 @@ def regenerate_buck(branchdir: Path) -> None:
     lines += [
         "}",
         "",
-        "rpm_branch(",
+        "rpm.branch(",
         "    packages = PACKAGES,",
         f'    buildroot = _properties.get("buildroot", "//buildroots/{distro}:{branch}"),',
         '    buildroot_only_packages = _properties.get("buildroot_only_packages", []),',
+        f'    distro = "{distro}",',
+        '    in_place_packaging = _properties.get("in_place_packaging", {}),',
         '    in_place_rpmbuild_options = _properties.get("in_place_rpmbuild_options", {}),',
         '    in_place_specs = _properties.get("in_place_specs", {}),',
         '    seed_only_packages = _properties.get("seed_only_packages", []),',

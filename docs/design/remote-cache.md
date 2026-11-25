@@ -42,8 +42,12 @@ what main built. But it can overwrite it through an action that reads something 
 declare: another file in the checkout, the network, or even the clock. Such an action produces a
 different output under an unchanged key, and a builder running the branch signs and publishes it under
 the key main uses. tine's sandbox removes the host and the network from what an action can read, but
-binds the whole checkout, so an undeclared project file is not caught; the guarantee rests on every rule
-declaring what it reads. Readers cannot cause any of this, since they never write.
+binds the whole checkout, so an undeclared project file is not caught. A source build also reads the
+files in its source directory that Buck ignores. Buck ignores VCS metadata such as `.git` and every
+tracked file listed in `[project] ignore`, and a fresh clone still contains them. The guarantee therefore
+requires that every rule declares what it reads, that the builder builds from a fresh clone, and that no
+build reads VCS metadata or a file listed in `[project] ignore`. Readers cannot cause any of this, since
+they never write.
 
 So a builder with a write key builds trusted branches, and pull requests only after review. Pull requests
 from anyone can be built on a builder without a write key: a malicious branch then costs compute, not the
@@ -225,8 +229,10 @@ write to the store if it configures an authority.
 One process holds the store at a time, and the store is disposable.
 
 The one gap of the eager fetch: Buck2 may ask for an output by digest in a later build, and if its bundle
-has left the bucket by then, that build fails with Buck2's "expired in the RE CAS" error; `buck2 clean`
-recovers. Rarer than with per-output storage, not gone.
+has left the bucket by then, that build fails with Buck2's "expired in the RE CAS" error; `buck clean`
+recovers. Rarer than with per-output storage, not gone. A hit checks the outputs it names by size rather
+than reading them all, so an output rewritten in the store at its own size is found only when Buck2 reads
+it, and is fetched from its bundle then, with the same gap.
 
 See `remote_cache/store.py` and its comments for details.
 
@@ -319,10 +325,11 @@ command and the platform properties. That probe is the *only* way it decides whe
 it may upload; it ignores the `update_enabled` capability which a RE-API server sends.
 A shim that refuses uploading would cause `WARN ... Cache upload for <digest> failed` noise on readers
 (i.e. developer builds). To avoid that, tell Buck2 via configuration: `tine` writes `[tine] cache-uploads`
-from the `[cache]` settings, and `platforms/defs.bzl` gates the executor's `allow_cache_uploads` on it.
+from the `[cache]` settings, and `platform/defs.bzl` gates the executor's `allow_cache_uploads` on it.
 
 Buck2 fails an action outright when the cache it was configured with does not answer, rather than
-treating it as a miss. So `tine buck` brings the shim up through a Buck with `--no-remote-cache`.
+treating it as a miss. So `tine buck` builds the shim with `--no-remote-cache`, in the foreground so that
+a first box build lists its actions, and then starts the built shim in the background.
 
 ## Running it
 
